@@ -6,6 +6,7 @@
 #include "led.h"
 #include "lcd.h"
 #include "lcd_init.h"
+#include "ws2812_control.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
@@ -291,6 +292,63 @@ static void battery_monitor_task(void *pvParameters)
 }
 
 /**
+ * @brief UART命令处理任务
+ */
+static void uart_command_task(void *pvParameters)
+{
+    ESP_LOGI(TAG, "UART command task started");
+    
+    uint8_t data[UART_BUF_SIZE];
+    char command_buffer[256];
+    int command_pos = 0;
+    
+    while (1) {
+        int len = uart_read_bytes(UART_NUM_1, data, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
+        
+        if (len > 0) {
+            data[len] = '\0';
+            
+            for (int i = 0; i < len; i++) {
+                char c = (char)data[i];
+                
+                if (c == '\r' || c == '\n') {
+                    if (command_pos > 0) {
+                        command_buffer[command_pos] = '\0';
+                        
+                        // 处理WS2812命令
+                        if (strncmp(command_buffer, "WS2812:", 7) == 0) {
+                            esp_err_t ret = ws2812_handle_uart_command(command_buffer + 7);
+                            if (ret == ESP_OK) {
+                                uart_write_bytes(UART_NUM_1, "OK\r\n", 4);
+                            } else {
+                                uart_write_bytes(UART_NUM_1, "ERROR\r\n", 7);
+                            }
+                        }
+                        // 处理其他命令
+                        else if (strcmp(command_buffer, "BATTERY") == 0) {
+                            send_battery_info_via_uart();
+                        }
+                        else if (strcmp(command_buffer, "WS2812:HELP") == 0) {
+                            ws2812_handle_uart_command("HELP");
+                        }
+                        else {
+                            ESP_LOGW(TAG, "Unknown command: %s", command_buffer);
+                            uart_write_bytes(UART_NUM_1, "UNKNOWN_COMMAND\r\n", 17);
+                        }
+                        
+                        command_pos = 0;
+                    }
+                } else if (command_pos < sizeof(command_buffer) - 1) {
+                    command_buffer[command_pos++] = c;
+                }
+            }
+        }
+        
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+/**
  * @brief LVGL显示刷新任务
  */
 static void lvgl_tick_task(void *pvParameters)
@@ -333,6 +391,9 @@ void app_main(void)
     // 初始化UART1
     uart1_init();
     
+    // 初始化WS2812
+    ESP_ERROR_CHECK(ws2812_init());
+    
     // 初始化LVGL
     lv_init();
     
@@ -359,9 +420,17 @@ void app_main(void)
     // 创建电池监控任务
     xTaskCreate(battery_monitor_task, "battery_monitor", 4096, NULL, 2, NULL);
     
+    // 创建UART命令处理任务
+    xTaskCreate(uart_command_task, "uart_command", 4096, NULL, 2, NULL);
+    
+    // 创建WS2812控制任务
+    xTaskCreate(ws2812_task, "ws2812", 4096, NULL, 2, NULL);
+    
     ESP_LOGI(TAG, "All tasks created successfully");
     ESP_LOGI(TAG, "Battery Monitor System Ready!");
     ESP_LOGI(TAG, "UART1 Communication: TX Pin=%d, RX Pin=%d, Baud=%d", 
              UART1_TXD_PIN, UART1_RXD_PIN, UART1_BAUD_RATE);
+    ESP_LOGI(TAG, "WS2812 LED Strip: GPIO Pin=%d, LED Count=%d", 
+             WS2812_GPIO_PIN, WS2812_LED_COUNT);
 }
   

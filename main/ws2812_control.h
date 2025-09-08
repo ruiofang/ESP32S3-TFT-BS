@@ -3,11 +3,13 @@
 
 #include "esp_err.h"
 #include <stdint.h>
+#include <stdbool.h>
 
-// WS2812配置
-#define WS2812_GPIO_PIN         19          // WS2812数据引脚
-#define WS2812_LED_COUNT        160          // LED数量，可根据实际情况调整
-#define WS2812_RMT_CHANNEL      0           // RMT通道
+// WS2812配置 - 4通道支持
+#define WS2812_CHANNEL_COUNT    4           // 支持4个通道
+#define WS2812_GPIO_PINS        {18, 19, 20, 21}  // 4个通道的GPIO引脚
+#define WS2812_LED_COUNT        160         // 每个通道的LED数量
+#define WS2812_BROADCAST_ID     255         // 广播ID，控制所有通道
 
 // 灯光效果模式
 typedef enum {
@@ -37,54 +39,82 @@ typedef struct {
     uint8_t brightness;         // 亮度 (0-255)
 } ws2812_config_t;
 
+// 通道配置结构体
+typedef struct {
+    uint8_t channel_id;         // 通道ID (0-3)
+    bool enabled;               // 通道是否启用
+    ws2812_config_t config;     // 通道配置
+} ws2812_channel_t;
+
 /**
- * @brief 初始化WS2812
+ * @brief 初始化WS2812多通道系统
  * @return ESP_OK成功，其他值失败
  */
 esp_err_t ws2812_init(void);
 
 /**
- * @brief 设置灯光模式
+ * @brief 设置指定通道的灯光模式
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
  * @param mode 灯光模式
  * @return ESP_OK成功，其他值失败
  */
-esp_err_t ws2812_set_mode(ws2812_mode_t mode);
+esp_err_t ws2812_set_mode(uint8_t channel_id, ws2812_mode_t mode);
 
 /**
- * @brief 设置静态颜色
+ * @brief 设置指定通道的静态颜色
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
  * @param r 红色分量 (0-255)
  * @param g 绿色分量 (0-255)
  * @param b 蓝色分量 (0-255)
  * @return ESP_OK成功，其他值失败
  */
-esp_err_t ws2812_set_color(uint8_t r, uint8_t g, uint8_t b);
+esp_err_t ws2812_set_color(uint8_t channel_id, uint8_t r, uint8_t g, uint8_t b);
 
 /**
- * @brief 设置亮度
+ * @brief 设置指定通道的亮度
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
  * @param brightness 亮度 (0-255)
  * @return ESP_OK成功，其他值失败
  */
-esp_err_t ws2812_set_brightness(uint8_t brightness);
+esp_err_t ws2812_set_brightness(uint8_t channel_id, uint8_t brightness);
 
 /**
- * @brief 设置效果速度
+ * @brief 设置指定通道的效果速度
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
  * @param speed 速度，单位ms
  * @return ESP_OK成功，其他值失败
  */
-esp_err_t ws2812_set_speed(uint32_t speed);
+esp_err_t ws2812_set_speed(uint8_t channel_id, uint32_t speed);
+
+/**
+ * @brief 启用或禁用指定通道
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
+ * @param enabled true启用，false禁用
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_set_channel_enabled(uint8_t channel_id, bool enabled);
 
 /**
  * @brief 设置自动循环模式每个效果的持续时间
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
  * @param duration 持续时间，单位ms (1000-60000)
  * @return ESP_OK成功，其他值失败
  */
-esp_err_t ws2812_set_cycle_duration(uint32_t duration);
+esp_err_t ws2812_set_cycle_duration(uint8_t channel_id, uint32_t duration);
 
 /**
- * @brief 获取当前配置
- * @return 当前WS2812配置
+ * @brief 获取指定通道的当前配置
+ * @param channel_id 通道ID (0-3)
+ * @return 指定通道的WS2812配置，如果通道无效返回默认配置
  */
-ws2812_config_t ws2812_get_config(void);
+ws2812_channel_t ws2812_get_channel_config(uint8_t channel_id);
+
+/**
+ * @brief 获取所有通道的配置
+ * @param configs 用于存储配置的数组，必须至少有WS2812_CHANNEL_COUNT个元素
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_get_all_configs(ws2812_channel_t configs[WS2812_CHANNEL_COUNT]);
 
 /**
  * @brief WS2812控制任务
@@ -93,10 +123,22 @@ ws2812_config_t ws2812_get_config(void);
 void ws2812_task(void *pvParameters);
 
 /**
- * @brief 处理串口命令
- * @param command 命令字符串
+ * @brief 处理JSON格式的控制命令
+ * @param json_command JSON格式的命令字符串
+ * @return ESP_OK成功，其他值失败
+ * 
+ * JSON命令格式示例:
+ * - 控制单个通道: {"channel": 0, "mode": 1, "color": {"r": 255, "g": 0, "b": 0}, "brightness": 128, "speed": 100}
+ * - 广播控制: {"channel": 255, "mode": 2, "brightness": 200}
+ * - 启用/禁用通道: {"channel": 1, "enabled": false}
+ * - 查询状态: {"action": "status"}
+ */
+esp_err_t ws2812_handle_json_command(const char *json_command);
+
+/**
+ * @brief 测试所有通道功能
  * @return ESP_OK成功，其他值失败
  */
-esp_err_t ws2812_handle_uart_command(const char *command);
+esp_err_t ws2812_test_all_channels(void);
 
 #endif // WS2812_CONTROL_H

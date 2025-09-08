@@ -7,7 +7,7 @@
 
 
 /* 引脚定义 */
-#define LED_GPIO_PIN    GPIO_NUM_1  /* LED连接的GPIO端口 */
+#define LED_GPIO_PIN    GPIO_NUM_9  /* LED连接的GPIO端口 */
 
 /* 引脚的输出的电平状态 */
 enum GPIO_OUTPUT_STATE

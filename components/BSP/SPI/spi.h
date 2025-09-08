@@ -6,9 +6,9 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 
-#define BSP_SPI_MOSI_GPIO_PIN GPIO_NUM_13
+#define BSP_SPI_MOSI_GPIO_PIN GPIO_NUM_15
 #define BSP_SPI_CLK_GPIO_PIN GPIO_NUM_14
-#define BSP_SPI_CS_GPIO_PIN GPIO_NUM_10
+#define BSP_SPI_CS_GPIO_PIN GPIO_NUM_11
 
 #define BSP_CS_Set() gpio_set_level(BSP_SPI_CS_GPIO_PIN,1)
 #define BSP_CS_Clr() gpio_set_level(BSP_SPI_CS_GPIO_PIN,0)

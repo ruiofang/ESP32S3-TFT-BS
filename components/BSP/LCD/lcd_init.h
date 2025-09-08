@@ -30,8 +30,8 @@
 
 /* ???????? */
 #define LCD_RES_GPIO_PIN GPIO_NUM_12
-#define LCD_DC_GPIO_PIN GPIO_NUM_11
-#define LCD_BLK_GPIO_PIN GPIO_NUM_9
+#define LCD_DC_GPIO_PIN GPIO_NUM_13
+#define LCD_BLK_GPIO_PIN GPIO_NUM_10
 
 /* ?????????? */
 #define LCD_RES_Set() gpio_set_level(LCD_RES_GPIO_PIN, 1)

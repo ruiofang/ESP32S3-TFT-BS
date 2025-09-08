@@ -21,8 +21,8 @@
 
 // UART1 配置
 #define UART_NUM_1          UART_NUM_1
-#define UART1_TXD_PIN       17
-#define UART1_RXD_PIN       18
+#define UART1_TXD_PIN       16
+#define UART1_RXD_PIN       17
 #define UART1_BAUD_RATE     115200
 #define UART_BUF_SIZE       1024
 
@@ -299,8 +299,10 @@ static void uart_command_task(void *pvParameters)
     ESP_LOGI(TAG, "UART command task started");
     
     uint8_t data[UART_BUF_SIZE];
-    char command_buffer[256];
+    char command_buffer[512]; // 增加缓冲区大小以支持较长的JSON
     int command_pos = 0;
+    int json_brace_count = 0;
+    bool in_json = false;
     
     while (1) {
         int len = uart_read_bytes(UART_NUM_1, data, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
@@ -311,35 +313,100 @@ static void uart_command_task(void *pvParameters)
             for (int i = 0; i < len; i++) {
                 char c = (char)data[i];
                 
-                if (c == '\r' || c == '\n') {
-                    if (command_pos > 0) {
+                // 处理JSON检测逻辑
+                if (c == '{') {
+                    if (!in_json) {
+                        // 开始新的JSON命令
+                        in_json = true;
+                        json_brace_count = 1;
+                        command_pos = 0;
+                        command_buffer[command_pos++] = c;
+                    } else {
+                        // JSON内部的嵌套大括号
+                        json_brace_count++;
+                        if (command_pos < sizeof(command_buffer) - 1) {
+                            command_buffer[command_pos++] = c;
+                        }
+                    }
+                } else if (c == '}' && in_json) {
+                    if (command_pos < sizeof(command_buffer) - 1) {
+                        command_buffer[command_pos++] = c;
+                    }
+                    json_brace_count--;
+                    
+                    // JSON对象完成
+                    if (json_brace_count == 0) {
                         command_buffer[command_pos] = '\0';
+                        ESP_LOGI(TAG, "Received JSON command: %s", command_buffer);
                         
-                        // 处理WS2812命令
-                        if (strncmp(command_buffer, "WS2812:", 7) == 0) {
-                            esp_err_t ret = ws2812_handle_uart_command(command_buffer + 7);
-                            if (ret == ESP_OK) {
-                                uart_write_bytes(UART_NUM_1, "OK\r\n", 4);
-                            } else {
-                                uart_write_bytes(UART_NUM_1, "ERROR\r\n", 7);
-                            }
-                        }
-                        // 处理其他命令
-                        else if (strcmp(command_buffer, "BATTERY") == 0) {
-                            send_battery_info_via_uart();
-                        }
-                        else if (strcmp(command_buffer, "WS2812:HELP") == 0) {
-                            ws2812_handle_uart_command("HELP");
-                        }
-                        else {
-                            ESP_LOGW(TAG, "Unknown command: %s", command_buffer);
-                            uart_write_bytes(UART_NUM_1, "UNKNOWN_COMMAND\r\n", 17);
+                        esp_err_t ret = ws2812_handle_json_command(command_buffer);
+                        if (ret == ESP_OK) {
+                            uart_write_bytes(UART_NUM_1, "OK\r\n", 4);
+                        } else {
+                            uart_write_bytes(UART_NUM_1, "ERROR\r\n", 7);
                         }
                         
+                        // 重置状态
+                        in_json = false;
                         command_pos = 0;
                     }
-                } else if (command_pos < sizeof(command_buffer) - 1) {
-                    command_buffer[command_pos++] = c;
+                } else if (in_json) {
+                    // JSON内部的其他字符
+                    if (command_pos < sizeof(command_buffer) - 1) {
+                        command_buffer[command_pos++] = c;
+                    }
+                } else {
+                    // 非JSON命令处理（传统命令）
+                    if (c == '\r' || c == '\n') {
+                        if (command_pos > 0) {
+                            command_buffer[command_pos] = '\0';
+                            
+                            // 处理传统命令
+                            if (strncmp(command_buffer, "JSON:", 5) == 0) {
+                                esp_err_t ret = ws2812_handle_json_command(command_buffer + 5);
+                                if (ret == ESP_OK) {
+                                    uart_write_bytes(UART_NUM_1, "OK\r\n", 4);
+                                } else {
+                                    uart_write_bytes(UART_NUM_1, "ERROR\r\n", 7);
+                                }
+                            }
+                            else if (strcmp(command_buffer, "BATTERY") == 0) {
+                                send_battery_info_via_uart();
+                            }
+                            else if (strcmp(command_buffer, "WS2812:TEST") == 0) {
+                                ESP_LOGI(TAG, "Starting WS2812 channel test...");
+                                esp_err_t ret = ws2812_test_all_channels();
+                                if (ret == ESP_OK) {
+                                    uart_write_bytes(UART_NUM_1, "TEST_COMPLETED\r\n", 16);
+                                } else {
+                                    uart_write_bytes(UART_NUM_1, "TEST_FAILED\r\n", 13);
+                                }
+                            }
+                            else if (strcmp(command_buffer, "HELP") == 0) {
+                                // 显示帮助信息
+                                ESP_LOGI(TAG, "=== Available Commands ===");
+                                ESP_LOGI(TAG, "JSON Commands for WS2812:");
+                                ESP_LOGI(TAG, "  {\"channel\": 0, \"mode\": 1, \"color\": {\"r\": 255, \"g\": 0, \"b\": 0}}");
+                                ESP_LOGI(TAG, "  {\"channel\": 255, \"brightness\": 128}");
+                                ESP_LOGI(TAG, "  {\"channel\": 1, \"enabled\": false}");
+                                ESP_LOGI(TAG, "  {\"action\": \"status\"}");
+                                ESP_LOGI(TAG, "Other Commands:");
+                                ESP_LOGI(TAG, "  BATTERY - Show battery status");
+                                ESP_LOGI(TAG, "  WS2812:TEST - Test all WS2812 channels");
+                                ESP_LOGI(TAG, "  HELP - Show this help");
+                                ESP_LOGI(TAG, "Channels: 0-3 (GPIO 18-21), Broadcast ID: 255");
+                                uart_write_bytes(UART_NUM_1, "HELP_DISPLAYED\r\n", 16);
+                            }
+                            else {
+                                ESP_LOGW(TAG, "Unknown command: %s", command_buffer);
+                                uart_write_bytes(UART_NUM_1, "UNKNOWN_COMMAND\r\n", 17);
+                            }
+                            
+                            command_pos = 0;
+                        }
+                    } else if (command_pos < sizeof(command_buffer) - 1) {
+                        command_buffer[command_pos++] = c;
+                    }
                 }
             }
         }
@@ -387,13 +454,16 @@ void app_main(void)
         ret = nvs_flash_init();
     }
     ESP_ERROR_CHECK(ret);
-    
+
+     // 初始化WS2812
+    ESP_ERROR_CHECK(ws2812_init());
+
     // 初始化UART1
     uart1_init();
-    
-    // 初始化WS2812
-    ESP_ERROR_CHECK(ws2812_init());
-    
+
+    // 初始化LED
+    led_init();
+
     // 初始化LVGL
     lv_init();
     
@@ -430,7 +500,11 @@ void app_main(void)
     ESP_LOGI(TAG, "Battery Monitor System Ready!");
     ESP_LOGI(TAG, "UART1 Communication: TX Pin=%d, RX Pin=%d, Baud=%d", 
              UART1_TXD_PIN, UART1_RXD_PIN, UART1_BAUD_RATE);
-    ESP_LOGI(TAG, "WS2812 LED Strip: GPIO Pin=%d, LED Count=%d", 
-             WS2812_GPIO_PIN, WS2812_LED_COUNT);
+    ESP_LOGI(TAG, "WS2812 Multi-Channel System: %d channels on GPIO 18-21, %d LEDs per channel", 
+             WS2812_CHANNEL_COUNT, WS2812_LED_COUNT);
+    ESP_LOGI(TAG, "Command formats:");
+    ESP_LOGI(TAG, "  Legacy: WS2812:MODE:1 (broadcasts to all channels)");
+    ESP_LOGI(TAG, "  JSON: {\"channel\": 0, \"mode\": 1, \"color\": {\"r\": 255, \"g\": 0, \"b\": 0}}");
+    ESP_LOGI(TAG, "  Direct JSON: {\"channel\": 255, \"brightness\": 128} (no prefix needed)");
 }
   

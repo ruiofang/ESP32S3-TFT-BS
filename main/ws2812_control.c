@@ -6,11 +6,18 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "Lib/cJSON/cJSON.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
 
 static const char *TAG = "WS2812_CONTROL";
+
+// NVS存储相关定义
+#define WS2812_NVS_NAMESPACE "ws2812_cfg"
+#define WS2812_NVS_KEY_PREFIX "ch_"
+#define WS2812_CONFIG_VERSION 1
 
 // GPIO引脚定义
 static const int ws2812_gpio_pins[WS2812_CHANNEL_COUNT] = WS2812_GPIO_PINS;
@@ -96,7 +103,7 @@ esp_err_t ws2812_init(void) {
     
     // 初始化每个通道
     for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
-        // 初始化通道配置
+        // 先设置默认配置（将在load_config中覆盖）
         channels[ch].channel_id = ch;
         channels[ch].enabled = true;
         channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
@@ -167,6 +174,15 @@ esp_err_t ws2812_init(void) {
     }
     ESP_LOGI(TAG, "Channel test completed, returning to normal operation");
     
+    // 加载保存的配置
+    ESP_LOGI(TAG, "Loading saved WS2812 configuration...");
+    esp_err_t load_ret = ws2812_load_config();
+    if (load_ret == ESP_OK) {
+        ESP_LOGI(TAG, "Configuration loaded successfully");
+    } else {
+        ESP_LOGW(TAG, "Failed to load configuration: %s, using defaults", esp_err_to_name(load_ret));
+    }
+    
     return ESP_OK;
 }
 
@@ -191,6 +207,13 @@ esp_err_t ws2812_set_mode(uint8_t channel_id, ws2812_mode_t mode) {
             return ESP_ERR_INVALID_ARG;
         }
         xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after mode change: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -217,6 +240,13 @@ esp_err_t ws2812_set_color(uint8_t channel_id, uint8_t r, uint8_t g, uint8_t b) 
             return ESP_ERR_INVALID_ARG;
         }
         xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after color change: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -239,6 +269,13 @@ esp_err_t ws2812_set_brightness(uint8_t channel_id, uint8_t brightness) {
             return ESP_ERR_INVALID_ARG;
         }
         xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after brightness change: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -264,6 +301,13 @@ esp_err_t ws2812_set_speed(uint8_t channel_id, uint32_t speed) {
             return ESP_ERR_INVALID_ARG;
         }
         xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after speed change: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -294,6 +338,13 @@ esp_err_t ws2812_set_channel_enabled(uint8_t channel_id, bool enabled) {
             return ESP_ERR_INVALID_ARG;
         }
         xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after enable/disable change: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -347,6 +398,13 @@ esp_err_t ws2812_set_cycle_duration(uint8_t channel_id, uint32_t duration) {
             return ESP_ERR_INVALID_ARG;
         }
         xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after cycle duration change: %s", esp_err_to_name(save_ret));
+        }
+        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -714,4 +772,197 @@ esp_err_t ws2812_test_all_channels(void) {
     
     ESP_LOGI(TAG, "=== All Channel Test Completed ===");
     return ESP_OK;
+}
+
+/**
+ * @brief 保存WS2812参数到NVS
+ */
+esp_err_t ws2812_save_config(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t ret;
+    
+    // 打开NVS
+    ret = nvs_open(WS2812_NVS_NAMESPACE, NVS_READWRITE, &nvs_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS handle for saving: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        // 保存配置版本号
+        ret = nvs_set_u32(nvs_handle, "version", WS2812_CONFIG_VERSION);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save config version: %s", esp_err_to_name(ret));
+            goto cleanup;
+        }
+        
+        // 保存每个通道的配置
+        for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+            char key[32];
+            
+            // 保存通道配置结构体
+            snprintf(key, sizeof(key), "%s%d", WS2812_NVS_KEY_PREFIX, ch);
+            ret = nvs_set_blob(nvs_handle, key, &channels[ch], sizeof(ws2812_channel_t));
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to save channel %d config: %s", ch, esp_err_to_name(ret));
+                goto cleanup;
+            }
+            
+            // 保存自动循环持续时间
+            snprintf(key, sizeof(key), "cycle_dur_%d", ch);
+            ret = nvs_set_u32(nvs_handle, key, auto_cycle_durations[ch]);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to save channel %d cycle duration: %s", ch, esp_err_to_name(ret));
+                goto cleanup;
+            }
+        }
+        
+        // 提交写入
+        ret = nvs_commit(nvs_handle);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to commit NVS data: %s", esp_err_to_name(ret));
+            goto cleanup;
+        }
+        
+        ESP_LOGI(TAG, "WS2812 configuration saved successfully");
+        
+cleanup:
+        xSemaphoreGive(ws2812_mutex);
+    } else {
+        ESP_LOGE(TAG, "Failed to acquire mutex for saving config");
+        ret = ESP_ERR_TIMEOUT;
+    }
+    
+    nvs_close(nvs_handle);
+    return ret;
+}
+
+/**
+ * @brief 从NVS加载WS2812参数
+ */
+esp_err_t ws2812_load_config(void) {
+    nvs_handle_t nvs_handle;
+    esp_err_t ret;
+    uint32_t version = 0;
+    
+    // 打开NVS
+    ret = nvs_open(WS2812_NVS_NAMESPACE, NVS_READONLY, &nvs_handle);
+    if (ret != ESP_OK) {
+        if (ret == ESP_ERR_NVS_NOT_FOUND) {
+            ESP_LOGI(TAG, "No saved WS2812 config found, using defaults");
+            return ws2812_reset_config(); // 使用默认配置
+        }
+        ESP_LOGE(TAG, "Failed to open NVS handle for loading: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // 检查配置版本
+    ret = nvs_get_u32(nvs_handle, "version", &version);
+    if (ret != ESP_OK || version != WS2812_CONFIG_VERSION) {
+        ESP_LOGW(TAG, "Config version mismatch or not found, using defaults");
+        nvs_close(nvs_handle);
+        return ws2812_reset_config();
+    }
+    
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        bool load_success = true;
+        
+        // 加载每个通道的配置
+        for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+            char key[32];
+            size_t required_size = sizeof(ws2812_channel_t);
+            
+            // 加载通道配置
+            snprintf(key, sizeof(key), "%s%d", WS2812_NVS_KEY_PREFIX, ch);
+            ret = nvs_get_blob(nvs_handle, key, &channels[ch], &required_size);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to load channel %d config: %s, using default", 
+                         ch, esp_err_to_name(ret));
+                // 使用默认配置
+                channels[ch].channel_id = ch;
+                channels[ch].enabled = true;
+                channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
+                channels[ch].config.color = (rgb_color_t){255, 255, 255};
+                channels[ch].config.speed = 150;
+                channels[ch].config.brightness = 180;
+                load_success = false;
+            }
+            
+            // 加载自动循环持续时间
+            snprintf(key, sizeof(key), "cycle_dur_%d", ch);
+            ret = nvs_get_u32(nvs_handle, key, &auto_cycle_durations[ch]);
+            if (ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to load channel %d cycle duration, using default", ch);
+                auto_cycle_durations[ch] = 8000; // 默认8秒
+            }
+            
+            // 验证加载的数据有效性
+            if (channels[ch].config.mode >= WS2812_MODE_MAX) {
+                ESP_LOGW(TAG, "Invalid mode for channel %d, resetting to AUTO_CYCLE", ch);
+                channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
+                load_success = false;
+            }
+            
+            if (channels[ch].config.brightness > 255) {
+                ESP_LOGW(TAG, "Invalid brightness for channel %d, resetting to 180", ch);
+                channels[ch].config.brightness = 180;
+                load_success = false;
+            }
+            
+            if (auto_cycle_durations[ch] < 1000 || auto_cycle_durations[ch] > 60000) {
+                ESP_LOGW(TAG, "Invalid cycle duration for channel %d, resetting to 8000ms", ch);
+                auto_cycle_durations[ch] = 8000;
+                load_success = false;
+            }
+        }
+        
+        if (load_success) {
+            ESP_LOGI(TAG, "WS2812 configuration loaded successfully");
+        } else {
+            ESP_LOGW(TAG, "Some configuration data was invalid, using mixed default/loaded values");
+        }
+        
+        // 重置自动循环计时器
+        for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+            auto_cycle_timers[ch] = 0;
+            current_auto_mode_indices[ch] = 0;
+        }
+        
+        xSemaphoreGive(ws2812_mutex);
+    } else {
+        ESP_LOGE(TAG, "Failed to acquire mutex for loading config");
+        ret = ESP_ERR_TIMEOUT;
+    }
+    
+    nvs_close(nvs_handle);
+    return ret;
+}
+
+/**
+ * @brief 重置WS2812配置为默认值
+ */
+esp_err_t ws2812_reset_config(void) {
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        // 初始化每个通道的默认配置
+        for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+            channels[ch].channel_id = ch;
+            channels[ch].enabled = true;
+            channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
+            channels[ch].config.color = (rgb_color_t){255, 255, 255};
+            channels[ch].config.speed = 150;
+            channels[ch].config.brightness = 180;
+            
+            // 重置自动循环相关参数
+            auto_cycle_durations[ch] = 8000;
+            auto_cycle_timers[ch] = 0;
+            current_auto_mode_indices[ch] = 0;
+        }
+        
+        ESP_LOGI(TAG, "WS2812 configuration reset to defaults");
+        xSemaphoreGive(ws2812_mutex);
+        return ESP_OK;
+    }
+    
+    ESP_LOGE(TAG, "Failed to acquire mutex for resetting config");
+    return ESP_ERR_TIMEOUT;
 }

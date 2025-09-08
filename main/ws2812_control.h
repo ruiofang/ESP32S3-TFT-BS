@@ -141,4 +141,22 @@ esp_err_t ws2812_handle_json_command(const char *json_command);
  */
 esp_err_t ws2812_test_all_channels(void);
 
+/**
+ * @brief 保存WS2812参数到NVS
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_save_config(void);
+
+/**
+ * @brief 从NVS加载WS2812参数
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_load_config(void);
+
+/**
+ * @brief 重置WS2812配置为默认值
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_reset_config(void);
+
 #endif // WS2812_CONTROL_H

@@ -382,6 +382,39 @@ static void uart_command_task(void *pvParameters)
                                     uart_write_bytes(UART_NUM_1, "TEST_FAILED\r\n", 13);
                                 }
                             }
+                            else if (strcmp(command_buffer, "WS2812:SAVE") == 0) {
+                                ESP_LOGI(TAG, "Saving WS2812 configuration...");
+                                esp_err_t ret = ws2812_save_config();
+                                if (ret == ESP_OK) {
+                                    uart_write_bytes(UART_NUM_1, "CONFIG_SAVED\r\n", 14);
+                                } else {
+                                    uart_write_bytes(UART_NUM_1, "SAVE_FAILED\r\n", 13);
+                                }
+                            }
+                            else if (strcmp(command_buffer, "WS2812:LOAD") == 0) {
+                                ESP_LOGI(TAG, "Loading WS2812 configuration...");
+                                esp_err_t ret = ws2812_load_config();
+                                if (ret == ESP_OK) {
+                                    uart_write_bytes(UART_NUM_1, "CONFIG_LOADED\r\n", 15);
+                                } else {
+                                    uart_write_bytes(UART_NUM_1, "LOAD_FAILED\r\n", 13);
+                                }
+                            }
+                            else if (strcmp(command_buffer, "WS2812:RESET") == 0) {
+                                ESP_LOGI(TAG, "Resetting WS2812 configuration to defaults...");
+                                esp_err_t ret = ws2812_reset_config();
+                                if (ret == ESP_OK) {
+                                    // 立即保存默认配置
+                                    ret = ws2812_save_config();
+                                    if (ret == ESP_OK) {
+                                        uart_write_bytes(UART_NUM_1, "CONFIG_RESET\r\n", 14);
+                                    } else {
+                                        uart_write_bytes(UART_NUM_1, "RESET_SAVE_FAILED\r\n", 19);
+                                    }
+                                } else {
+                                    uart_write_bytes(UART_NUM_1, "RESET_FAILED\r\n", 14);
+                                }
+                            }
                             else if (strcmp(command_buffer, "HELP") == 0) {
                                 // 显示帮助信息
                                 ESP_LOGI(TAG, "=== Available Commands ===");
@@ -393,6 +426,9 @@ static void uart_command_task(void *pvParameters)
                                 ESP_LOGI(TAG, "Other Commands:");
                                 ESP_LOGI(TAG, "  BATTERY - Show battery status");
                                 ESP_LOGI(TAG, "  WS2812:TEST - Test all WS2812 channels");
+                                ESP_LOGI(TAG, "  WS2812:SAVE - Save current WS2812 configuration");
+                                ESP_LOGI(TAG, "  WS2812:LOAD - Load saved WS2812 configuration");
+                                ESP_LOGI(TAG, "  WS2812:RESET - Reset WS2812 to default configuration");
                                 ESP_LOGI(TAG, "  HELP - Show this help");
                                 ESP_LOGI(TAG, "Channels: 0-3 (GPIO 18-21), Broadcast ID: 255");
                                 uart_write_bytes(UART_NUM_1, "HELP_DISPLAYED\r\n", 16);

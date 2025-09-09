@@ -68,6 +68,7 @@ static bool charging_animation_enabled = true;  // 充电动画开关
 static uint32_t charging_animation_step = 0;    // 动画步骤计数器
 static bool charging_animation_direction = true; // 动画方向（true为增加，false为减少）
 static esp_timer_handle_t charging_animation_timer = NULL; // 充电动画定时器
+static int charging_animation_range = 15;        // 充电动画范围（百分比）
 
 /**
  * @brief 获取有效的充电状态（考虑外部控制）
@@ -75,6 +76,37 @@ static esp_timer_handle_t charging_animation_timer = NULL; // 充电动画定时
 static bool get_effective_charging_status(void)
 {
     return charging_status_override ? external_charging_status : g_charging_status;
+}
+
+/**
+ * @brief 计算带充电动画效果的电量显示值
+ */
+static int get_animated_battery_percentage(int base_percentage)
+{
+    bool is_charging_display = charging_status_override && external_charging_status;
+    
+    if (!is_charging_display || !charging_animation_enabled) {
+        return base_percentage;
+    }
+    
+    // 计算动画增量 (0 到 charging_animation_range)
+    float animation_progress = (float)charging_animation_step / (CHARGING_ANIM_STEPS - 1);
+    
+    // 如果是往下的方向，反转进度
+    if (!charging_animation_direction) {
+        animation_progress = 1.0f - animation_progress;
+    }
+    
+    // 应用动画增量
+    int animation_increment = (int)(charging_animation_range * animation_progress);
+    int animated_percentage = base_percentage + animation_increment;
+    
+    // 确保不超过100%
+    if (animated_percentage > 100) {
+        animated_percentage = 100;
+    }
+    
+    return animated_percentage;
 }
 
 /**
@@ -89,11 +121,12 @@ static void charging_animation_timer_callback(void *arg)
         return;
     }
     
-    // 更新动画步骤
+    // 更新动画步骤 - 进度条增长动画
     if (charging_animation_direction) {
         charging_animation_step++;
-        if (charging_animation_step >= CHARGING_ANIM_STEPS * 2 - 1) {
+        if (charging_animation_step >= CHARGING_ANIM_STEPS) {
             charging_animation_direction = false;
+            charging_animation_step = CHARGING_ANIM_STEPS - 1;
         }
     } else {
         if (charging_animation_step > 0) {
@@ -599,7 +632,7 @@ static esp_err_t load_battery_state_from_nvs(void)
 /**
  * @brief 生成电池状态JSON字符串
  */
-static char* create_battery_status_json(void)
+char* create_battery_status_json(void)
 {
     cJSON *json = cJSON_CreateObject();
     if (json == NULL) {
@@ -841,15 +874,17 @@ static void create_battery_ui(void)
 static void update_battery_ui(void)
 {
     // 获取要显示的电量值和充电状态
-    int display_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    int base_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    // 应用充电动画效果
+    int display_percentage = get_animated_battery_percentage(base_percentage);
     bool effective_charging = get_effective_charging_status();
     
     // 确保数值在有效范围内
     if (display_percentage < 1) display_percentage = 1;
     if (display_percentage > 100) display_percentage = 100;
     
-    ESP_LOGI(TAG, "Updating UI - Display: %d%%, BatteryOverride: %s, ChargingOverride: %s, EffectiveCharging: %s", 
-             display_percentage, 
+    ESP_LOGI(TAG, "Updating UI - Display: %d%% (base: %d%%), BatteryOverride: %s, ChargingOverride: %s, EffectiveCharging: %s", 
+             display_percentage, base_percentage,
              battery_display_override ? "true" : "false",
              charging_status_override ? "true" : "false",
              effective_charging ? "true" : "false");
@@ -863,17 +898,13 @@ static void update_battery_ui(void)
         bool is_charging_display = charging_status_override && external_charging_status;
         
         if (is_charging_display) {
-            // 充电显示模式 - 使用动画颜色和特效
-            if (charging_animation_enabled) {
-                if (display_percentage >= BATTERY_FULL_THRESHOLD) {
-                    // 充满电特殊效果
-                    bar_color = get_full_battery_color(charging_animation_step);
-                } else {
-                    bar_color = get_charging_animation_color(display_percentage, charging_animation_step);
-                }
+            // 充电显示模式 - 使用简单的充电颜色（动画通过进度条长度实现）
+            if (display_percentage >= BATTERY_FULL_THRESHOLD) {
+                // 充满电时使用绿色
+                bar_color = lv_color_hex(0x00FF00);
             } else {
-                // 充电状态但动画禁用时使用静态充电颜色
-                bar_color = lv_color_hex(0x00AAFF);  // 蓝色表示充电
+                // 充电中使用蓝绿色
+                bar_color = lv_color_hex(0x00AAFF);
             }
         } else {
             // 普通电量显示模式 - 根据电量设置合适的颜色
@@ -894,11 +925,11 @@ static void update_battery_ui(void)
         bool is_charging_display = charging_status_override && external_charging_status;
         
         if (is_charging_display) {
-            // 充电显示模式 - 显示充电状态文字
-            if (display_percentage >= BATTERY_FULL_THRESHOLD) {
-                lv_label_set_text_fmt(battery_label, "%d%% FULL [charging]", display_percentage);
+            // 充电显示模式 - 显示基础电量值（不显示动画值）
+            if (base_percentage >= BATTERY_FULL_THRESHOLD) {
+                lv_label_set_text_fmt(battery_label, "%d%% FULL [charging]", base_percentage);
             } else {
-                lv_label_set_text_fmt(battery_label, "%d%% [charging]", display_percentage);
+                lv_label_set_text_fmt(battery_label, "%d%% [charging]", base_percentage);
             }
         } else {
             // 普通电量显示模式 - 保持简约，只显示数字
@@ -983,14 +1014,17 @@ static void force_update_battery_ui(void)
              external_charging_status ? "true" : "false", charging_status_override ? "true" : "false");
     
     // 获取要显示的电量值和有效充电状态
-    int display_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    int base_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    // 应用充电动画效果
+    int display_percentage = get_animated_battery_percentage(base_percentage);
     bool effective_charging = get_effective_charging_status();
     
     // 确保数值在有效范围内
     if (display_percentage < 1) display_percentage = 1;
     if (display_percentage > 100) display_percentage = 100;
     
-    ESP_LOGI(TAG, "Final display_percentage: %d%%, effective_charging: %s", display_percentage, effective_charging ? "true" : "false");
+    ESP_LOGI(TAG, "Final display_percentage: %d%% (base: %d%%), effective_charging: %s", 
+             display_percentage, base_percentage, effective_charging ? "true" : "false");
     
     // 检查对象是否存在
     if (!battery_bar || !battery_label || !info_label) {
@@ -1007,17 +1041,13 @@ static void force_update_battery_ui(void)
     bool is_charging_display = charging_status_override && external_charging_status;
     
     if (is_charging_display) {
-        // 充电显示模式 - 使用动画颜色和特效
-        if (charging_animation_enabled) {
-            if (display_percentage >= BATTERY_FULL_THRESHOLD) {
-                // 充满电特殊效果
-                bar_color = get_full_battery_color(charging_animation_step);
-            } else {
-                bar_color = get_charging_animation_color(display_percentage, charging_animation_step);
-            }
+        // 充电显示模式 - 使用简单的充电颜色（动画通过进度条长度实现）
+        if (display_percentage >= BATTERY_FULL_THRESHOLD) {
+            // 充满电时使用绿色
+            bar_color = lv_color_hex(0x00FF00);
         } else {
-            // 充电状态但动画禁用时使用静态充电颜色
-            bar_color = lv_color_hex(0x00AAFF);  // 蓝色表示充电
+            // 充电中使用蓝绿色
+            bar_color = lv_color_hex(0x00AAFF);
         }
     } else {
         // 普通电量显示模式 - 根据电量设置合适的颜色
@@ -1034,11 +1064,11 @@ static void force_update_battery_ui(void)
     ESP_LOGI(TAG, "Updating battery label to %d%%", display_percentage);
     // 根据控制指令区分显示方式
     if (is_charging_display) {
-        // 充电显示模式 - 显示充电状态文字
-        if (display_percentage >= BATTERY_FULL_THRESHOLD) {
-            lv_label_set_text_fmt(battery_label, "%d%% FULL [charging]", display_percentage);
+        // 充电显示模式 - 显示基础电量值（不显示动画值）
+        if (base_percentage >= BATTERY_FULL_THRESHOLD) {
+            lv_label_set_text_fmt(battery_label, "%d%% FULL [charging]", base_percentage);
         } else {
-            lv_label_set_text_fmt(battery_label, "%d%% [charging]", display_percentage);
+            lv_label_set_text_fmt(battery_label, "%d%% [charging]", base_percentage);
         }
     } else {
         // 普通电量显示模式 - 保持简约，只显示数字

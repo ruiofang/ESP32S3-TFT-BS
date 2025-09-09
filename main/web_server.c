@@ -1,5 +1,6 @@
 #include "web_server.h"
 #include "ws2812_control.h"
+#include "battery_control.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "esp_log.h"
@@ -132,6 +133,33 @@ static const char* complete_html_page =
 "<span class='range-value' id='channel-speed-val'>100</span>ms"
 "</div>"
 "<button onclick='applyChannel()'>应用到选中通道</button>"
+"</div>"
+"<div class='channel-group'>"
+"<div class='channel-title'>🔋 电池状态控制</div>"
+"<div class='control-row'>"
+"<button onclick='getBatteryStatus()'>查询电池状态</button>"
+"<button onclick='restoreAutoMode()'>恢复自动模式</button>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>电量设置:</span>"
+"<input type='range' id='battery-level' min='0' max='100' value='50'>"
+"<span class='range-value' id='battery-level-val'>50</span>%"
+"<button onclick='setBatteryLevel()'>设置电量</button>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>充电状态:</span>"
+"<select id='charging-status'>"
+"<option value='false'>未充电</option>"
+"<option value='true'>充电中</option>"
+"<option value='auto'>自动检测</option>"
+"</select>"
+"<button onclick='setChargingStatus()'>设置充电状态</button>"
+"</div>"
+"<div class='control-row'>"
+"<div id='battery-info' style='background: #e8f5e8; padding: 10px; border-radius: 5px; margin: 10px 0;'>"
+"电池状态信息将显示在这里"
+"</div>"
+"</div>"
 "</div>"
 "<div class='channel-group'>"
 "<div class='channel-title'>⚡ 快速设置</div>"
@@ -290,10 +318,67 @@ static const char* complete_html_page =
 "function loadChannelConfig() {"
 "  console.log('Loading channel config...');"
 "}"
+"function getBatteryStatus() {"
+"  console.log('Getting battery status...');"
+"  document.getElementById('status').innerHTML = '状态: 🔄 查询电池状态中...';"
+"  fetch('/api/battery/status', { method: 'GET' })"
+"  .then(function(response) {"
+"    if (response.ok) {"
+"      return response.json();"
+"    } else {"
+"      throw new Error('Battery status request failed');"
+"    }"
+"  })"
+"  .then(function(data) {"
+"    console.log('Battery status:', data);"
+"    updateBatteryInfo(data);"
+"    document.getElementById('status').innerHTML = '状态: ✅ 电池状态查询成功';"
+"  })"
+"  .catch(function(error) {"
+"    console.error('Battery status error:', error);"
+"    document.getElementById('status').innerHTML = '状态: ❌ 电池状态查询失败';"
+"  });"
+"}"
+"function updateBatteryInfo(data) {"
+"  var info = '电池信息:<br/>';"
+"  info += '电压: ' + data.voltage + 'V<br/>';"
+"  info += '电量: ' + data.percentage + '%<br/>';"
+"  info += '充电状态: ' + data.charging_status + '<br/>';"
+"  if (data.display) {"
+"    info += '显示模式: ' + data.display.mode + '<br/>';"
+"    info += '当前显示: ' + data.display.current_display + '%<br/>';"
+"  }"
+"  if (data.animation) {"
+"    info += '动画效果: ' + data.animation.effect + '<br/>';"
+"  }"
+"  document.getElementById('battery-info').innerHTML = info;"
+"}"
+"function setBatteryLevel() {"
+"  var level = parseInt(document.getElementById('battery-level').value);"
+"  var data = { battery: level };"
+"  console.log('Setting battery level:', level);"
+"  sendRequest('/api/battery/control', data);"
+"}"
+"function setChargingStatus() {"
+"  var status = document.getElementById('charging-status').value;"
+"  var data = {};"
+"  if (status === 'auto') {"
+"    data.auto_charging = true;"
+"  } else {"
+"    data.charging = (status === 'true');"
+"  }"
+"  console.log('Setting charging status:', data);"
+"  sendRequest('/api/battery/control', data);"
+"}"
+"function restoreAutoMode() {"
+"  var data = { auto_mode: true, auto_charging: true };"
+"  console.log('Restoring auto mode');"
+"  sendRequest('/api/battery/control', data);"
+"}"
 "window.onload = function() {"
 "  console.log('Page loaded, initializing...');"
 "  var sliders = ['broadcast-r', 'broadcast-g', 'broadcast-b', 'broadcast-brightness', 'broadcast-speed',"
-"                 'channel-r', 'channel-g', 'channel-b', 'channel-brightness', 'channel-speed'];"
+"                 'channel-r', 'channel-g', 'channel-b', 'channel-brightness', 'channel-speed', 'battery-level'];"
 "  for(var i = 0; i < sliders.length; i++) {"
 "    var id = sliders[i];"
 "    var slider = document.getElementById(id);"
@@ -424,6 +509,123 @@ static esp_err_t api_simple_test_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+// API电池状态查询处理函数
+static esp_err_t api_battery_status_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "Battery status API called");
+    esp_task_wdt_reset();
+
+    // 获取电池状态JSON
+    char *json_response = create_battery_status_json();
+    
+    httpd_resp_set_type(req, "application/json");
+    if (json_response) {
+        httpd_resp_sendstr(req, json_response);
+        free(json_response);
+        ESP_LOGI(TAG, "Battery status sent successfully");
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"获取电池状态失败\"}");
+        ESP_LOGE(TAG, "Failed to create battery status JSON");
+    }
+
+    return ESP_OK;
+}
+
+// API电池控制处理函数
+static esp_err_t api_battery_control_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "=== BATTERY CONTROL API CALLED ===");
+    esp_task_wdt_reset();
+    
+    char content[1024];
+    size_t to_read = req->content_len;
+    if (to_read >= sizeof(content)) {
+        ESP_LOGE(TAG, "Battery control request body too large: %d (max %d)", (int)to_read, (int)sizeof(content) - 1);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Body too large");
+        return ESP_FAIL;
+    }
+
+    size_t received = 0;
+    while (received < to_read) {
+        int ret = httpd_req_recv(req, content + received, to_read - received);
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                ESP_LOGW(TAG, "httpd_req_recv timeout, retrying... received=%d/%d", (int)received, (int)to_read);
+                continue;
+            }
+            ESP_LOGE(TAG, "Failed to receive battery control request data, ret=%d", ret);
+            httpd_resp_send_500(req);
+            return ESP_FAIL;
+        }
+        received += (size_t)ret;
+        esp_task_wdt_reset();
+    }
+    content[received] = '\0';
+
+    ESP_LOGI(TAG, "Received battery control command (%d bytes): %s", (int)received, content);
+    esp_task_wdt_reset();
+    
+    // 解析JSON并处理电池控制命令
+    cJSON *json = cJSON_Parse(content);
+    if (json) {
+        bool did_any = false;
+        
+        // 自动模式恢复
+        cJSON *auto_mode = cJSON_GetObjectItem(json, "auto_mode");
+        if (auto_mode && cJSON_IsBool(auto_mode) && cJSON_IsTrue(auto_mode)) {
+            restore_auto_battery_mode();
+            did_any = true;
+            ESP_LOGI(TAG, "Restored auto battery mode");
+        }
+        
+        cJSON *auto_charging = cJSON_GetObjectItem(json, "auto_charging");
+        if (auto_charging && cJSON_IsBool(auto_charging) && cJSON_IsTrue(auto_charging)) {
+            restore_auto_charging_mode();
+            did_any = true;
+            ESP_LOGI(TAG, "Restored auto charging mode");
+        }
+        
+        // 电池电量设置
+        cJSON *battery_item = cJSON_GetObjectItem(json, "battery");
+        if (battery_item && cJSON_IsNumber(battery_item)) {
+            int battery_level = battery_item->valueint;
+            if (battery_level >= 0 && battery_level <= 100) {
+                set_external_battery_level(battery_level);
+                did_any = true;
+                ESP_LOGI(TAG, "Set battery level to %d%%", battery_level);
+            } else {
+                ESP_LOGW(TAG, "Invalid battery level: %d", battery_level);
+            }
+        }
+        
+        // 充电状态设置
+        cJSON *charging_status = cJSON_GetObjectItem(json, "charging");
+        if (charging_status && cJSON_IsBool(charging_status)) {
+            bool charging = cJSON_IsTrue(charging_status);
+            set_external_charging_status(charging);
+            did_any = true;
+            ESP_LOGI(TAG, "Set charging status to %s", charging ? "true" : "false");
+        }
+        
+        cJSON_Delete(json);
+        
+        httpd_resp_set_type(req, "application/json");
+        if (did_any) {
+            httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"电池控制命令执行成功\"}");
+            ESP_LOGI(TAG, "Battery control command processed successfully");
+        } else {
+            httpd_resp_sendstr(req, "{\"status\":\"warning\",\"message\":\"没有识别到有效的电池控制命令\"}");
+            ESP_LOGW(TAG, "No valid battery control commands found");
+        }
+    } else {
+        ESP_LOGE(TAG, "Failed to parse battery control JSON: %s", content);
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"无效的JSON格式\"}");
+    }
+
+    return ESP_OK;
+}
+
 // 启动Web服务器
 httpd_handle_t start_webserver(void)
 {
@@ -481,6 +683,24 @@ httpd_handle_t start_webserver(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &simple_uri);
+
+        // API电池状态查询处理器
+        httpd_uri_t battery_status_uri = {
+            .uri = "/api/battery/status",
+            .method = HTTP_GET,
+            .handler = api_battery_status_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &battery_status_uri);
+
+        // API电池控制处理器
+        httpd_uri_t battery_control_uri = {
+            .uri = "/api/battery/control",
+            .method = HTTP_POST,
+            .handler = api_battery_control_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &battery_control_uri);
 
         ESP_LOGI(TAG, "Web server started successfully");
         return server;

@@ -1,0 +1,2 @@
+# ESP32S3-TFT-BS Python控制器依赖包
+pyserial>=3.5

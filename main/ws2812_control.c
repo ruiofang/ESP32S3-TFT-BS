@@ -2,6 +2,7 @@
 #include "driver/rmt_tx.h"
 #include "led_strip.h"
 #include "esp_log.h"
+#include "esp_task_wdt.h"  // 添加看门狗头文件
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -601,11 +602,16 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     ESP_LOGI(TAG, "Processing JSON command: %s", json_command);
     
+    // 重置看门狗以防止JSON处理超时
+    esp_task_wdt_reset();
+    
     cJSON *json = cJSON_Parse(json_command);
     if (json == NULL) {
         ESP_LOGE(TAG, "Invalid JSON format");
         return ESP_ERR_INVALID_ARG;
     }
+    
+    esp_task_wdt_reset(); // JSON解析后重置
     
     esp_err_t ret = ESP_OK;
     
@@ -615,12 +621,14 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         if (strcmp(action->valuestring, "status") == 0) {
             // 返回所有通道状态
             ESP_LOGI(TAG, "=== WS2812 Multi-Channel Status ===");
+            esp_task_wdt_reset();
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
                 ws2812_channel_t config = ws2812_get_channel_config(ch);
                 ESP_LOGI(TAG, "Channel %d (GPIO %d): %s, Mode:%d, RGB(%d,%d,%d), Brightness:%d, Speed:%ld", 
                          ch, ws2812_gpio_pins[ch], config.enabled ? "Enabled" : "Disabled",
                          config.config.mode, config.config.color.r, config.config.color.g, 
                          config.config.color.b, config.config.brightness, config.config.speed);
+                esp_task_wdt_reset(); // 每次循环重置看门狗
             }
             cJSON_Delete(json);
             return ESP_OK;
@@ -635,6 +643,8 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         return ESP_ERR_INVALID_ARG;
     }
     
+    esp_task_wdt_reset(); // 通道ID处理后重置
+    
     uint8_t channel_id = (uint8_t)channel_json->valueint;
     if (channel_id != WS2812_BROADCAST_ID && channel_id >= WS2812_CHANNEL_COUNT) {
         ESP_LOGE(TAG, "Invalid channel ID: %d", channel_id);
@@ -647,6 +657,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     if (mode_json && cJSON_IsNumber(mode_json)) {
         int mode = mode_json->valueint;
         if (mode >= 0 && mode < WS2812_MODE_MAX) {
+            esp_task_wdt_reset(); // 模式设置前重置看门狗
             ret = ws2812_set_mode(channel_id, (ws2812_mode_t)mode);
             if (ret != ESP_OK) goto cleanup;
         } else {
@@ -658,6 +669,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *color_json = cJSON_GetObjectItem(json, "color");
     if (color_json && cJSON_IsObject(color_json)) {
+        esp_task_wdt_reset(); // 颜色处理前重置看门狗
         cJSON *r_json = cJSON_GetObjectItem(color_json, "r");
         cJSON *g_json = cJSON_GetObjectItem(color_json, "g");
         cJSON *b_json = cJSON_GetObjectItem(color_json, "b");
@@ -670,6 +682,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             
             if (r >= 0 && r <= 255 && g >= 0 && g <= 255 && b >= 0 && b <= 255) {
                 ret = ws2812_set_color(channel_id, (uint8_t)r, (uint8_t)g, (uint8_t)b);
+                esp_task_wdt_reset(); // 颜色设置后重置看门狗
                 if (ret != ESP_OK) goto cleanup;
             } else {
                 ESP_LOGE(TAG, "Invalid color values: RGB(%d,%d,%d)", r, g, b);
@@ -681,9 +694,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *brightness_json = cJSON_GetObjectItem(json, "brightness");
     if (brightness_json && cJSON_IsNumber(brightness_json)) {
+        esp_task_wdt_reset(); // 亮度处理前重置看门狗
         int brightness = brightness_json->valueint;
         if (brightness >= 0 && brightness <= 255) {
             ret = ws2812_set_brightness(channel_id, (uint8_t)brightness);
+            esp_task_wdt_reset(); // 亮度设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid brightness: %d", brightness);
@@ -694,9 +709,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *speed_json = cJSON_GetObjectItem(json, "speed");
     if (speed_json && cJSON_IsNumber(speed_json)) {
+        esp_task_wdt_reset(); // 速度处理前重置看门狗
         int speed = speed_json->valueint;
         if (speed >= 1 && speed <= 10000) {
             ret = ws2812_set_speed(channel_id, (uint32_t)speed);
+            esp_task_wdt_reset(); // 速度设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid speed: %d", speed);
@@ -707,16 +724,20 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *enabled_json = cJSON_GetObjectItem(json, "enabled");
     if (enabled_json && cJSON_IsBool(enabled_json)) {
+        esp_task_wdt_reset(); // 启用/禁用处理前重置看门狗
         bool enabled = cJSON_IsTrue(enabled_json);
         ret = ws2812_set_channel_enabled(channel_id, enabled);
+        esp_task_wdt_reset(); // 启用/禁用设置后重置看门狗
         if (ret != ESP_OK) goto cleanup;
     }
     
     cJSON *cycle_duration_json = cJSON_GetObjectItem(json, "cycle_duration");
     if (cycle_duration_json && cJSON_IsNumber(cycle_duration_json)) {
+        esp_task_wdt_reset(); // 循环持续时间处理前重置看门狗
         int duration = cycle_duration_json->valueint;
         if (duration >= 1000 && duration <= 60000) {
             ret = ws2812_set_cycle_duration(channel_id, (uint32_t)duration);
+            esp_task_wdt_reset(); // 循环持续时间设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid cycle duration: %d", duration);
@@ -726,6 +747,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     }
     
 cleanup:
+    esp_task_wdt_reset(); // 函数结束前最后一次重置看门狗
     cJSON_Delete(json);
     return ret;
 }

@@ -7,12 +7,14 @@
 #include "lcd.h"
 #include "lcd_init.h"
 #include "ws2812_control.h"
+#include "web_server.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
 #include "driver/uart.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "lvgl.h"
 #include <stdio.h>
 #include <string.h>
@@ -223,24 +225,33 @@ static void create_battery_ui(void)
  */
 static void update_battery_ui(void)
 {
+    // 重置看门狗以防止LVGL操作超时
+    esp_task_wdt_reset();
+    
     if (battery_bar) {
         // 更新电池条值和颜色
-        lv_bar_set_value(battery_bar, g_battery_percentage, LV_ANIM_ON);
+        lv_bar_set_value(battery_bar, g_battery_percentage, LV_ANIM_OFF); // 关闭动画减少处理时间
+        esp_task_wdt_reset(); // LVGL操作后重置看门狗
         lv_obj_set_style_bg_color(battery_bar, get_battery_color(g_battery_percentage), LV_PART_INDICATOR);
+        esp_task_wdt_reset();
     }
     
     if (battery_label) {
         lv_label_set_text_fmt(battery_label, "%d%%", g_battery_percentage);
+        esp_task_wdt_reset(); // 每次LVGL操作后重置看门狗
     }
     
     if (voltage_label) {
         lv_label_set_text_fmt(voltage_label, "%.2fV", g_battery_voltage);
+        esp_task_wdt_reset();
     }
     
     if (status_label) {
         lv_label_set_text(status_label, g_charging_status ? "Charging" : "Discharging");
+        esp_task_wdt_reset();
         lv_obj_set_style_text_color(status_label, 
                                    g_charging_status ? lv_color_hex(0x00FF00) : lv_color_hex(0xCCCCCC), 0);
+        esp_task_wdt_reset();
     }
     
     if (charging_icon) {
@@ -268,23 +279,36 @@ static void battery_monitor_task(void *pvParameters)
     ESP_LOGI(TAG, "Battery monitor task started");
     
     TickType_t last_wake_time = xTaskGetTickCount();
+    uint32_t ui_update_counter = 0;
     
     while (1) {
+        // 重置watchdog
+        esp_task_wdt_reset();
+        
         // 读取电池电压 (在实际应用中，这里应该是从ADC读取)
         g_battery_voltage = simulate_battery_voltage();
+        esp_task_wdt_reset();
         
         // 计算电池百分比
         g_battery_percentage = calculate_battery_percentage(g_battery_voltage);
+        esp_task_wdt_reset();
         
-        // 更新UI显示
-        update_battery_ui();
+        // 只每10次更新一次UI，进一步减少LVGL负载
+        ui_update_counter++;
+        if (ui_update_counter >= 10) {
+            update_battery_ui();
+            ui_update_counter = 0;
+            esp_task_wdt_reset(); // UI更新后重置看门狗
+        }
         
-        // 通过串口发送电池信息
-        send_battery_info_via_uart();
-        
-        ESP_LOGI(TAG, "Battery: %.2fV (%d%%) - %s", 
-                 g_battery_voltage, g_battery_percentage, 
-                 g_charging_status ? "CHARGING" : "DISCHARGING");
+        // 通过串口发送电池信息 (减少频率，每5次循环发送一次)
+        if (ui_update_counter % 5 == 0) {
+            send_battery_info_via_uart();
+            esp_task_wdt_reset();
+            ESP_LOGI(TAG, "Battery: %.2fV (%d%%) - %s", 
+                     g_battery_voltage, g_battery_percentage, 
+                     g_charging_status ? "CHARGING" : "DISCHARGING");
+        }
         
         // 等待下一次更新
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(BATTERY_UPDATE_PERIOD));
@@ -493,6 +517,14 @@ void app_main(void)
 
      // 初始化WS2812
     ESP_ERROR_CHECK(ws2812_init());
+    
+    // 初始化Web服务器
+    httpd_handle_t web_server_handle = web_server_init();
+    if (web_server_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to initialize web server");
+    } else {
+        ESP_LOGI(TAG, "Web server initialized successfully");
+    }
 
     // 初始化UART1
     uart1_init();
@@ -524,7 +556,14 @@ void app_main(void)
     xTaskCreate(lvgl_task, "lvgl", 4096, NULL, 3, NULL);
     
     // 创建电池监控任务
-    xTaskCreate(battery_monitor_task, "battery_monitor", 4096, NULL, 2, NULL);
+    TaskHandle_t battery_task_handle = NULL;
+    xTaskCreate(battery_monitor_task, "battery_monitor", 4096, NULL, 2, &battery_task_handle);
+    
+    // 将电池监控任务添加到watchdog监控中
+    if (battery_task_handle != NULL) {
+        esp_task_wdt_add(battery_task_handle);
+        ESP_LOGI(TAG, "Battery monitor task added to watchdog");
+    }
     
     // 创建UART命令处理任务
     xTaskCreate(uart_command_task, "uart_command", 4096, NULL, 2, NULL);

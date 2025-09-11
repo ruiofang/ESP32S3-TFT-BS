@@ -1713,7 +1713,7 @@ static void lvgl_tick_task(void *pvParameters)
  * @brief LVGL任务处理
  */
 static void lvgl_task(void *pvParameters)
-{
+{   uint16_t cnt = 0;
     while (1) {
         // 处理LVGL定时器
         lv_timer_handler();
@@ -1725,7 +1725,12 @@ static void lvgl_task(void *pvParameters)
             ui_update_pending = false;
             ESP_LOGI(TAG, "UI update completed in LVGL task context");
         }
-        LED_TOGGLE();
+        // 每10次处理一次，避免过于频繁
+        cnt++;
+        if (cnt >= 10) {
+            cnt = 0;
+            LED_TOGGLE();
+        }
         vTaskDelay(pdMS_TO_TICKS(20));  // 增加延迟至20ms，进一步减少CPU占用
     }
 }

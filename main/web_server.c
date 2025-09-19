@@ -357,7 +357,7 @@ static const char* complete_html_page =
 "  var level = parseInt(document.getElementById('battery-level').value);"
 "  var data = { battery: level };"
 "  console.log('Setting battery level:', level);"
-"  sendRequest('/api/battery/control', data);"
+"  sendRequest('/api/unified', data);"
 "}"
 "function setChargingStatus() {"
 "  var status = document.getElementById('charging-status').value;"
@@ -368,13 +368,14 @@ static const char* complete_html_page =
 "    data.charging = (status === 'true');"
 "  }"
 "  console.log('Setting charging status:', data);"
-"  sendRequest('/api/battery/control', data);"
+"  sendRequest('/api/unified', data);"
 "}"
 "function restoreAutoMode() {"
 "  var data = { auto_mode: true, auto_charging: true };"
 "  console.log('Restoring auto mode');"
 "  sendRequest('/api/battery/control', data);"
 "}"
+
 "window.onload = function() {"
 "  console.log('Page loaded, initializing...');"
 "  var sliders = ['broadcast-r', 'broadcast-g', 'broadcast-b', 'broadcast-brightness', 'broadcast-speed',"
@@ -609,6 +610,12 @@ static esp_err_t api_battery_control_handler(httpd_req_t *req)
         
         cJSON_Delete(json);
         
+        // 更新WS2812电量显示
+        if (did_any) {
+            ws2812_update_battery_display(get_battery_percentage(), is_charging());
+            ESP_LOGI(TAG, "Updated WS2812 battery display");
+        }
+        
         httpd_resp_set_type(req, "application/json");
         if (did_any) {
             httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"电池控制命令执行成功\"}");
@@ -623,6 +630,208 @@ static esp_err_t api_battery_control_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"无效的JSON格式\"}");
     }
 
+    return ESP_OK;
+}
+
+// API统一控制接口 - 支持WS2812和电池的所有功能
+static esp_err_t api_unified_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "=== UNIFIED API CALLED ===");
+    esp_task_wdt_reset();
+    
+    char content[2048];  // 增大缓冲区以支持复杂命令
+    size_t to_read = req->content_len;
+    if (to_read >= sizeof(content)) {
+        ESP_LOGE(TAG, "Unified API request body too large: %d (max %d)", (int)to_read, (int)sizeof(content) - 1);
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Request body too large");
+        return ESP_FAIL;
+    }
+
+    size_t received = 0;
+    while (received < to_read) {
+        int ret = httpd_req_recv(req, content + received, to_read - received);
+        if (ret <= 0) {
+            if (ret == HTTPD_SOCK_ERR_TIMEOUT) {
+                continue;
+            }
+            ESP_LOGE(TAG, "Failed to receive unified API request body");
+            return ESP_FAIL;
+        }
+        received += ret;
+    }
+    content[received] = '\0';
+    
+    ESP_LOGI(TAG, "Unified API received command: %s", content);
+    
+    // 尝试处理WS2812命令
+    esp_err_t ws2812_result = ws2812_handle_json_command(content);
+    
+    // 尝试处理电池控制命令
+    cJSON *json = cJSON_Parse(content);
+    bool battery_processed = false;
+    
+    if (json) {
+        // 处理电压设置
+        cJSON *voltage = cJSON_GetObjectItem(json, "voltage");
+        if (voltage && cJSON_IsNumber(voltage)) {
+            float voltage_val = (float)voltage->valuedouble;
+            set_external_voltage(voltage_val);
+            battery_processed = true;
+            ESP_LOGI(TAG, "Unified API: Set voltage to %.2fV", voltage_val);
+        }
+        
+        // 处理电量设置
+        cJSON *battery = cJSON_GetObjectItem(json, "battery");
+        if (battery && cJSON_IsNumber(battery)) {
+            int battery_percentage = battery->valueint;
+            set_external_battery_percentage(battery_percentage);
+            battery_processed = true;
+            ESP_LOGI(TAG, "Unified API: Set battery to %d%%", battery_percentage);
+        }
+        
+        // 处理充电状态
+        cJSON *charging = cJSON_GetObjectItem(json, "charging");
+        if (charging && cJSON_IsBool(charging)) {
+            bool charging_status = cJSON_IsTrue(charging);
+            set_external_charging_status(charging_status);
+            battery_processed = true;
+            ESP_LOGI(TAG, "Unified API: Set charging to %s", charging_status ? "true" : "false");
+        }
+        
+        // 处理电量显示配置
+        cJSON *battery_channel = cJSON_GetObjectItem(json, "battery_channel");
+        cJSON *show_charging_effect = cJSON_GetObjectItem(json, "show_charging_effect");
+        cJSON *background_brightness = cJSON_GetObjectItem(json, "background_brightness");
+        
+        if (battery_channel || show_charging_effect || background_brightness) {
+            uint8_t channel = 255;  // 默认禁用
+            bool show_effect = true;  // 默认启用充电特效
+            uint8_t brightness = 10;  // 默认背景亮度
+            
+            if (battery_channel && cJSON_IsNumber(battery_channel)) {
+                channel = (uint8_t)battery_channel->valueint;
+            }
+            if (show_charging_effect && cJSON_IsBool(show_charging_effect)) {
+                show_effect = cJSON_IsTrue(show_charging_effect);
+            }
+            if (background_brightness && cJSON_IsNumber(background_brightness)) {
+                brightness = (uint8_t)background_brightness->valueint;
+            }
+            
+            esp_err_t result = ws2812_set_battery_display(channel, show_effect, brightness);
+            if (result == ESP_OK) {
+                battery_processed = true;
+                ESP_LOGI(TAG, "Unified API: Set battery display - channel=%d, effect=%s, brightness=%d", 
+                        channel, show_effect ? "true" : "false", brightness);
+            } else {
+                ESP_LOGE(TAG, "Unified API: Failed to set battery display configuration");
+            }
+        }
+        
+        // 处理单通道电量模式设置
+        cJSON *channel_battery_mode = cJSON_GetObjectItem(json, "channel_battery_mode");
+        if (channel_battery_mode && cJSON_IsObject(channel_battery_mode)) {
+            cJSON *channel = cJSON_GetObjectItem(channel_battery_mode, "channel");
+            cJSON *enable = cJSON_GetObjectItem(channel_battery_mode, "enable");
+            cJSON *bg_brightness = cJSON_GetObjectItem(channel_battery_mode, "background_brightness");
+            
+            if (channel && cJSON_IsNumber(channel) && enable && cJSON_IsBool(enable)) {
+                uint8_t ch = (uint8_t)channel->valueint;
+                bool en = cJSON_IsTrue(enable);
+                uint8_t brightness = 10;  // 默认值
+                
+                if (bg_brightness && cJSON_IsNumber(bg_brightness)) {
+                    brightness = (uint8_t)bg_brightness->valueint;
+                }
+                
+                esp_err_t result = ws2812_set_channel_battery_mode(ch, en, brightness);
+                if (result == ESP_OK) {
+                    battery_processed = true;
+                    ESP_LOGI(TAG, "Unified API: Set channel %d battery mode to %s, brightness=%d", 
+                            ch, en ? "enabled" : "disabled", brightness);
+                } else {
+                    ESP_LOGE(TAG, "Unified API: Failed to set channel battery mode");
+                }
+            }
+        }
+        
+        // 同步更新WS2812电量显示
+        if (battery_processed) {
+            ws2812_update_battery_display(get_battery_percentage(), is_charging());
+        }
+        
+        cJSON_Delete(json);
+    }
+    
+    // 准备响应
+    httpd_resp_set_type(req, "application/json");
+    
+    if (ws2812_result == ESP_OK || battery_processed) {
+        httpd_resp_sendstr(req, "{\"status\":\"success\",\"message\":\"命令执行成功\"}");
+        ESP_LOGI(TAG, "Unified API: Command processed successfully");
+    } else if (ws2812_result != ESP_OK) {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"命令执行失败\"}");
+        ESP_LOGE(TAG, "Unified API: Command processing failed");
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"warning\",\"message\":\"未识别到有效命令\"}");
+        ESP_LOGW(TAG, "Unified API: No valid commands found");
+    }
+    
+    return ESP_OK;
+}
+
+// API系统状态查询接口
+static esp_err_t api_status_handler(httpd_req_t *req)
+{
+    ESP_LOGI(TAG, "System status API called");
+    esp_task_wdt_reset();
+    
+    // 获取系统状态信息
+    cJSON *status = cJSON_CreateObject();
+    
+    // 电池信息
+    cJSON *battery_info = cJSON_CreateObject();
+    cJSON_AddNumberToObject(battery_info, "voltage", get_battery_voltage());
+    cJSON_AddNumberToObject(battery_info, "percentage", get_battery_percentage());
+    cJSON_AddBoolToObject(battery_info, "charging", is_charging());
+    cJSON_AddItemToObject(status, "battery", battery_info);
+    
+    // WS2812通道状态
+    cJSON *channels = cJSON_CreateArray();
+    for (int i = 0; i < 4; i++) {
+        cJSON *channel = cJSON_CreateObject();
+        cJSON_AddNumberToObject(channel, "id", i);
+        cJSON_AddBoolToObject(channel, "enabled", true);  // 简化处理
+        cJSON_AddItemToArray(channels, channel);
+    }
+    cJSON_AddItemToObject(status, "ws2812_channels", channels);
+    
+    // 电量显示配置
+    ws2812_battery_config_t battery_config = ws2812_get_battery_config();
+    cJSON *battery_display = cJSON_CreateObject();
+    cJSON_AddNumberToObject(battery_display, "battery_channel", battery_config.battery_channel);
+    cJSON_AddBoolToObject(battery_display, "show_charging_effect", battery_config.show_charging_effect);
+    cJSON_AddNumberToObject(battery_display, "background_brightness", battery_config.background_brightness);
+    cJSON_AddItemToObject(status, "battery_display", battery_display);
+    
+    // 系统信息
+    cJSON_AddStringToObject(status, "device", "ESP32S3-TFT-BS");
+    cJSON_AddStringToObject(status, "version", "2.1");
+    cJSON_AddNumberToObject(status, "uptime", xTaskGetTickCount() / configTICK_RATE_HZ);
+    
+    char *json_string = cJSON_Print(status);
+    cJSON_Delete(status);
+    
+    httpd_resp_set_type(req, "application/json");
+    if (json_string) {
+        httpd_resp_sendstr(req, json_string);
+        free(json_string);
+        ESP_LOGI(TAG, "System status sent successfully");
+    } else {
+        httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"获取系统状态失败\"}");
+        ESP_LOGE(TAG, "Failed to create system status JSON");
+    }
+    
     return ESP_OK;
 }
 
@@ -702,7 +911,25 @@ httpd_handle_t start_webserver(void)
         };
         httpd_register_uri_handler(server, &battery_control_uri);
 
-        ESP_LOGI(TAG, "Web server started successfully");
+        // API统一控制接口 - 支持所有WS2812和电池功能
+        httpd_uri_t unified_uri = {
+            .uri = "/api/unified",
+            .method = HTTP_POST,
+            .handler = api_unified_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &unified_uri);
+
+        // API系统状态查询接口
+        httpd_uri_t status_uri = {
+            .uri = "/api/status",
+            .method = HTTP_GET,
+            .handler = api_status_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &status_uri);
+
+        ESP_LOGI(TAG, "Web server started successfully with %d API endpoints", 8);
         return server;
     } else {
         ESP_LOGE(TAG, "Failed to start web server");

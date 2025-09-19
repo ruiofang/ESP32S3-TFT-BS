@@ -8,8 +8,10 @@
 // WS2812配置 - 4通道支持
 #define WS2812_CHANNEL_COUNT    4           // 支持4个通道
 #define WS2812_GPIO_PINS        {18, 19, 20, 21}  // 4个通道的GPIO引脚
-#define WS2812_LED_COUNT        160         // 每个通道的LED数量
+#define WS2812_LED_COUNT_DEFAULT 160        // 默认每个通道的LED数量
+#define WS2812_MAX_LED_COUNT    300         // 每个通道最大LED数量
 #define WS2812_BROADCAST_ID     255         // 广播ID，控制所有通道
+#define WS2812_BATTERY_CHANNEL_DISABLED 255 // 表示未启用电量显示通道
 
 // 灯光效果模式
 typedef enum {
@@ -21,6 +23,7 @@ typedef enum {
     WS2812_MODE_FLASH,          // 闪烁效果
     WS2812_MODE_WAVE,           // 波浪效果
     WS2812_MODE_AUTO_CYCLE,     // 自动循环模式
+    WS2812_MODE_BATTERY,        // 电量显示模式
     WS2812_MODE_MAX
 } ws2812_mode_t;
 
@@ -39,10 +42,18 @@ typedef struct {
     uint8_t brightness;         // 亮度 (0-255)
 } ws2812_config_t;
 
+// 电量显示配置
+typedef struct {
+    uint8_t battery_channel;    // 显示电量的通道ID (0-3, 255表示禁用)
+    bool show_charging_effect;  // 是否显示充电特效
+    uint8_t background_brightness; // 背景LED亮度 (0-255)
+} ws2812_battery_config_t;
+
 // 通道配置结构体
 typedef struct {
     uint8_t channel_id;         // 通道ID (0-3)
     bool enabled;               // 通道是否启用
+    uint16_t led_count;         // 当前通道LED数量 (1-300)
     ws2812_config_t config;     // 通道配置
 } ws2812_channel_t;
 
@@ -158,5 +169,45 @@ esp_err_t ws2812_load_config(void);
  * @return ESP_OK成功，其他值失败
  */
 esp_err_t ws2812_reset_config(void);
+
+/**
+ * @brief 设置指定通道的LED数量
+ * @param channel_id 通道ID (0-3, 255表示广播到所有通道)
+ * @param led_count LED数量 (1-300)
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_set_led_count(uint8_t channel_id, uint16_t led_count);
+
+/**
+ * @brief 设置电量显示配置
+ * @param battery_channel 显示电量的通道ID (0-3, 255表示禁用)
+ * @param show_charging_effect 是否显示充电特效
+ * @param background_brightness 背景LED亮度 (0-255)
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_set_battery_display(uint8_t battery_channel, bool show_charging_effect, uint8_t background_brightness);
+
+/**
+ * @brief 设置指定通道的电量显示模式
+ * @param channel_id 通道ID (0-3)
+ * @param enable_battery_mode 是否启用电量显示模式
+ * @param background_brightness 背景LED亮度 (0-255，0使用默认值10)
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_set_channel_battery_mode(uint8_t channel_id, bool enable_battery_mode, uint8_t background_brightness);
+
+/**
+ * @brief 更新电量显示
+ * @param battery_percentage 电量百分比 (0-100)
+ * @param is_charging 是否正在充电
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_update_battery_display(int battery_percentage, bool is_charging);
+
+/**
+ * @brief 获取电量显示配置
+ * @return 电量显示配置结构体
+ */
+ws2812_battery_config_t ws2812_get_battery_config(void);
 
 #endif // WS2812_CONTROL_H

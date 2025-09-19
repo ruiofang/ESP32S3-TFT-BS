@@ -29,6 +29,16 @@ static ws2812_channel_t channels[WS2812_CHANNEL_COUNT];
 static SemaphoreHandle_t ws2812_mutex = NULL;
 static bool task_running = false;
 
+// 电量显示相关变量
+static ws2812_battery_config_t battery_config = {
+    .battery_channel = WS2812_BATTERY_CHANNEL_DISABLED,
+    .show_charging_effect = true,
+    .background_brightness = 5, // 默认背景亮度为5
+};
+static int current_battery_percentage = 50;
+static bool current_is_charging = false;
+static bool battery_display_needs_refresh = false; // 电量显示刷新标志
+
 // 自动循环模式相关变量 - 每个通道独立
 static uint32_t auto_cycle_timers[WS2812_CHANNEL_COUNT] = {0};
 static uint32_t auto_cycle_durations[WS2812_CHANNEL_COUNT] = {8000, 8000, 8000, 8000};
@@ -107,6 +117,7 @@ esp_err_t ws2812_init(void) {
         // 先设置默认配置（将在load_config中覆盖）
         channels[ch].channel_id = ch;
         channels[ch].enabled = true;
+        channels[ch].led_count = WS2812_LED_COUNT_DEFAULT;
         channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
         channels[ch].config.color = (rgb_color_t){255, 255, 255};
         channels[ch].config.speed = 150;
@@ -114,10 +125,10 @@ esp_err_t ws2812_init(void) {
         
         ESP_LOGI(TAG, "Initializing channel %d on GPIO %d", ch, ws2812_gpio_pins[ch]);
         
-        // 配置LED strip - 使用简化的配置
+        // 配置LED strip - 使用可配置的LED数量
         led_strip_config_t strip_config = {
             .strip_gpio_num = ws2812_gpio_pins[ch],
-            .max_leds = WS2812_LED_COUNT,
+            .max_leds = WS2812_MAX_LED_COUNT,  // 使用最大值，实际使用数量在运行时控制
             .led_pixel_format = LED_PIXEL_FORMAT_GRB,
             .led_model = LED_MODEL_WS2812,
             .flags.invert_out = false,
@@ -146,7 +157,7 @@ esp_err_t ws2812_init(void) {
         }
         
         ESP_LOGI(TAG, "Channel %d initialized successfully on GPIO %d with %d LEDs", 
-                 ch, ws2812_gpio_pins[ch], WS2812_LED_COUNT);
+                 ch, ws2812_gpio_pins[ch], channels[ch].led_count);
     }
     
     ESP_LOGI(TAG, "WS2812 multi-channel system initialized successfully");
@@ -155,7 +166,7 @@ esp_err_t ws2812_init(void) {
     ESP_LOGI(TAG, "Testing all channels with white light for 2 seconds...");
     for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
         if (led_strips[ch]) {
-            for (int i = 0; i < WS2812_LED_COUNT; i++) {
+            for (int i = 0; i < channels[ch].led_count; i++) {
                 led_strip_set_pixel(led_strips[ch], i, 50, 50, 50); // 低亮度白光
             }
             led_strip_refresh(led_strips[ch]);
@@ -411,6 +422,173 @@ esp_err_t ws2812_set_cycle_duration(uint8_t channel_id, uint32_t duration) {
     return ESP_ERR_TIMEOUT;
 }
 
+esp_err_t ws2812_set_led_count(uint8_t channel_id, uint16_t led_count) {
+    if (led_count < 1) led_count = 1;
+    if (led_count > WS2812_MAX_LED_COUNT) led_count = WS2812_MAX_LED_COUNT;
+    
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (channel_id == WS2812_BROADCAST_ID) {
+            // 广播到所有通道
+            bool has_battery_channel = false;
+            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                channels[ch].led_count = led_count;
+                // 清空所有LED
+                if (led_strips[ch]) {
+                    led_strip_clear(led_strips[ch]);
+                    led_strip_refresh(led_strips[ch]);
+                }
+                // 检查是否有电量显示通道
+                if (channels[ch].config.mode == WS2812_MODE_BATTERY) {
+                    has_battery_channel = true;
+                }
+            }
+            
+            // 如果有电量显示通道，触发刷新
+            if (has_battery_channel) {
+                battery_display_needs_refresh = true;
+            }
+            
+            ESP_LOGI(TAG, "LED count set to %d for all channels", led_count);
+        } else if (channel_id < WS2812_CHANNEL_COUNT) {
+            // 设置指定通道
+            channels[channel_id].led_count = led_count;
+            // 清空指定通道的所有LED
+            if (led_strips[channel_id]) {
+                led_strip_clear(led_strips[channel_id]);
+                led_strip_refresh(led_strips[channel_id]);
+            }
+            
+            // 如果是电量显示通道，触发刷新以恢复显示
+            if (channels[channel_id].config.mode == WS2812_MODE_BATTERY) {
+                battery_display_needs_refresh = true;
+            }
+            
+            ESP_LOGI(TAG, "LED count set to %d for channel %d", led_count, channel_id);
+        } else {
+            xSemaphoreGive(ws2812_mutex);
+            return ESP_ERR_INVALID_ARG;
+        }
+        xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after LED count change: %s", esp_err_to_name(save_ret));
+        }
+        
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t ws2812_set_battery_display(uint8_t battery_channel, bool show_charging_effect, uint8_t background_brightness) {
+    if (battery_channel != WS2812_BATTERY_CHANNEL_DISABLED && battery_channel >= WS2812_CHANNEL_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        battery_config.battery_channel = battery_channel;
+        battery_config.show_charging_effect = show_charging_effect;
+        battery_config.background_brightness = background_brightness;
+        
+        // 如果启用了电量显示，将对应通道设置为电量模式
+        if (battery_channel != WS2812_BATTERY_CHANNEL_DISABLED) {
+            channels[battery_channel].config.mode = WS2812_MODE_BATTERY;
+            battery_display_needs_refresh = true; // 设置刷新标志
+        }
+        
+        xSemaphoreGive(ws2812_mutex);
+        
+        ESP_LOGI(TAG, "Battery display config: channel=%d, charging_effect=%s, bg_brightness=%d",
+                 battery_channel, show_charging_effect ? "true" : "false", background_brightness);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after battery display change: %s", esp_err_to_name(save_ret));
+        }
+        
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t ws2812_set_channel_battery_mode(uint8_t channel_id, bool enable_battery_mode, uint8_t background_brightness) {
+    if (channel_id >= WS2812_CHANNEL_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        if (enable_battery_mode) {
+            // 启用指定通道的电量显示模式
+            channels[channel_id].config.mode = WS2812_MODE_BATTERY;
+            
+            // 更新电量显示配置，设置当前通道为电量显示通道
+            battery_config.battery_channel = channel_id;
+            battery_config.show_charging_effect = true;  // 默认启用充电特效
+            battery_config.background_brightness = (background_brightness > 0) ? background_brightness : 10;
+            battery_display_needs_refresh = true;
+            
+            ESP_LOGI(TAG, "Channel %d set to battery display mode, bg_brightness=%d", 
+                     channel_id, battery_config.background_brightness);
+        } else {
+            // 禁用指定通道的电量显示模式
+            if (battery_config.battery_channel == channel_id) {
+                // 如果当前是电量显示通道，禁用全局电量显示
+                battery_config.battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+            }
+            
+            // 将通道恢复为静态颜色模式
+            channels[channel_id].config.mode = WS2812_MODE_STATIC;
+            channels[channel_id].config.color = (rgb_color_t){255, 255, 255};  // 默认白色
+            channels[channel_id].config.brightness = 128;  // 默认亮度
+            
+            ESP_LOGI(TAG, "Channel %d disabled battery display mode, restored to static mode", channel_id);
+        }
+        
+        xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after channel battery mode change: %s", esp_err_to_name(save_ret));
+        }
+        
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+esp_err_t ws2812_update_battery_display(int battery_percentage, bool is_charging) {
+    if (battery_percentage < 0) battery_percentage = 0;
+    if (battery_percentage > 100) battery_percentage = 100;
+    
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        // 防抖逻辑：只在数值真正变化时才更新，减少无效刷新
+        if (current_battery_percentage != battery_percentage || current_is_charging != is_charging) {
+            ESP_LOGI(TAG, "Battery display update: %d%% -> %d%%, charging: %s -> %s", 
+                     current_battery_percentage, battery_percentage,
+                     current_is_charging ? "true" : "false",
+                     is_charging ? "true" : "false");
+            current_battery_percentage = battery_percentage;
+            current_is_charging = is_charging;
+            battery_display_needs_refresh = true; // 设置刷新标志
+        }
+        xSemaphoreGive(ws2812_mutex);
+        return ESP_OK;
+    }
+    return ESP_ERR_TIMEOUT;
+}
+
+ws2812_battery_config_t ws2812_get_battery_config(void) {
+    ws2812_battery_config_t config = {0};
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        config = battery_config;
+        xSemaphoreGive(ws2812_mutex);
+    }
+    return config;
+}
+
 void ws2812_task(void *pvParameters) {
     static uint32_t counters[WS2812_CHANNEL_COUNT] = {0};
     static int directions[WS2812_CHANNEL_COUNT] = {1, 1, 1, 1};
@@ -477,7 +655,7 @@ void ws2812_task(void *pvParameters) {
                     // 静态颜色
                     {
                         rgb_color_t color = apply_brightness(current_config.color, current_config.brightness);
-                        for (int i = 0; i < WS2812_LED_COUNT; i++) {
+                        for (int i = 0; i < channels[ch].led_count; i++) {
                             led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
                         }
                     }
@@ -485,8 +663,8 @@ void ws2812_task(void *pvParameters) {
                     
                 case WS2812_MODE_RAINBOW:
                     // 彩虹效果
-                    for (int i = 0; i < WS2812_LED_COUNT; i++) {
-                        uint16_t hue = (counters[ch] + i * 255 / WS2812_LED_COUNT) % 256;
+                    for (int i = 0; i < channels[ch].led_count; i++) {
+                        uint16_t hue = (counters[ch] + i * 255 / channels[ch].led_count) % 256;
                         rgb_color_t color = hsv_to_rgb(hue, 255, 255);
                         color = apply_brightness(color, current_config.brightness);
                         led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
@@ -505,7 +683,7 @@ void ws2812_task(void *pvParameters) {
                         breath_brightness = (breath_brightness * current_config.brightness) / 255;
                         rgb_color_t color = apply_brightness(current_config.color, breath_brightness);
                         
-                        for (int i = 0; i < WS2812_LED_COUNT; i++) {
+                        for (int i = 0; i < channels[ch].led_count; i++) {
                             led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
                         }
                         breath_values[ch] = (breath_values[ch] + breath_step) % 360;
@@ -516,12 +694,10 @@ void ws2812_task(void *pvParameters) {
                     // 跑马灯效果 - 速度和颜色可调
                     led_strip_clear(led_strips[ch]);
                     {
-                        rgb_color_t color = apply_brightness(current_config.color, current_config.brightness);
-                        
                         // 可配置跑马灯长度和间距
                         int tail_length = 5; // 拖尾长度
                         for (int i = 0; i < tail_length; i++) {
-                            int pos = (counters[ch] - i + WS2812_LED_COUNT) % WS2812_LED_COUNT;
+                            int pos = (counters[ch] - i + channels[ch].led_count) % channels[ch].led_count;
                             // 创建渐变拖尾效果
                             uint8_t tail_brightness = (uint8_t)((tail_length - i) * 255 / tail_length);
                             tail_brightness = (tail_brightness * current_config.brightness) / 255;
@@ -533,7 +709,7 @@ void ws2812_task(void *pvParameters) {
                         static uint32_t last_move_time[WS2812_CHANNEL_COUNT] = {0};
                         uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
                         if (current_time - last_move_time[ch] >= current_config.speed) {
-                            counters[ch] = (counters[ch] + directions[ch] + WS2812_LED_COUNT) % WS2812_LED_COUNT;
+                            counters[ch] = (counters[ch] + directions[ch] + channels[ch].led_count) % channels[ch].led_count;
                             last_move_time[ch] = current_time;
                         }
                     }
@@ -552,7 +728,7 @@ void ws2812_task(void *pvParameters) {
                         if (time_in_cycle < current_config.speed) {
                             // 亮起阶段 - 使用配置的颜色
                             rgb_color_t color = apply_brightness(current_config.color, current_config.brightness);
-                            for (int i = 0; i < WS2812_LED_COUNT; i++) {
+                            for (int i = 0; i < channels[ch].led_count; i++) {
                                 led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
                             }
                         } else {
@@ -569,13 +745,185 @@ void ws2812_task(void *pvParameters) {
                     
                 case WS2812_MODE_WAVE:
                     // 波浪效果
-                    for (int i = 0; i < WS2812_LED_COUNT; i++) {
+                    for (int i = 0; i < channels[ch].led_count; i++) {
                         uint8_t wave_brightness = (uint8_t)(128 + 127 * sin((counters[ch] + i * 20) * M_PI / 180));
                         wave_brightness = (wave_brightness * current_config.brightness) / 255;
                         rgb_color_t color = apply_brightness(current_config.color, wave_brightness);
                         led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
                     }
                     counters[ch] = (counters[ch] + 10) % 360;
+                    break;
+                    
+                case WS2812_MODE_BATTERY:
+                    // 电量显示模式 - 只在命令刷新时更新显示
+                    {
+                        static uint32_t charging_animation_counter = 0;
+                        bool should_refresh = false;
+                        
+                        // 检查是否需要刷新显示
+                        if (battery_display_needs_refresh) {
+                            should_refresh = true;
+                            battery_display_needs_refresh = false;
+                        }
+                        
+                        // 充电跑马灯动画需要适中频率更新以保持流畅效果
+                        if (current_is_charging && battery_config.show_charging_effect) {
+                            charging_animation_counter++;
+                            if (charging_animation_counter >= 4) { // 每200ms更新一次跑马灯，保持适中速度
+                                charging_animation_counter = 0;
+                                should_refresh = true;
+                            }
+                        } else {
+                            // 非充电时的呼吸灯动画需要更频繁更新以提高动感
+                            static uint32_t breathing_counter = 0;
+                            breathing_counter++;
+                            if (breathing_counter >= 2) { // 每100ms更新一次呼吸灯，更快的呼吸节奏
+                                breathing_counter = 0;
+                                should_refresh = true;
+                            }
+                        }
+                        
+                        // 只在需要时刷新LED显示
+                        if (should_refresh) {
+                            // 计算电量显示的LED数量 - 使用整数运算和四舍五入
+                            int battery_leds = (channels[ch].led_count * current_battery_percentage + 50) / 100;
+                            if (battery_leds > channels[ch].led_count) battery_leds = channels[ch].led_count;
+                            if (battery_leds < 0) battery_leds = 0;
+                            
+                            // 设置背景LED（低亮度白色）
+                            rgb_color_t bg_color = {battery_config.background_brightness, 
+                                                  battery_config.background_brightness, 
+                                                  battery_config.background_brightness};
+                            
+                            // 先设置所有LED为背景颜色
+                            for (int i = 0; i < channels[ch].led_count; i++) {
+                                led_strip_set_pixel(led_strips[ch], i, bg_color.r, bg_color.g, bg_color.b);
+                            }
+                            
+                            // 设置电量LED（绿色）
+                            if (current_is_charging && battery_config.show_charging_effect) {
+                                // 充电时的跑马灯效果
+                                static uint32_t runner_position = 0;
+                                runner_position = (runner_position + 1) % (battery_leds * 2); // 跑马灯位置循环
+                                
+                                // 先设置所有电量LED为暗绿色基础色
+                                for (int i = 0; i < battery_leds; i++) {
+                                    led_strip_set_pixel(led_strips[ch], i, 0, 80, 0); // 暗绿色基础
+                                }
+                                
+                                // 跑马灯主体：3个LED的亮点从左到右移动
+                                int runner_center = runner_position % battery_leds;
+                                
+                                // 设置跑马灯的LED（中心LED最亮，两侧渐暗）
+                                for (int offset = -1; offset <= 1; offset++) {
+                                    int led_pos = runner_center + offset;
+                                    
+                                    // 处理边界循环
+                                    if (led_pos < 0) led_pos += battery_leds;
+                                    if (led_pos >= battery_leds) led_pos -= battery_leds;
+                                    
+                                    // 根据距离中心的位置设置亮度
+                                    uint8_t brightness_factor = 0;
+                                    if (offset == 0) {
+                                        brightness_factor = 255; // 中心LED最亮
+                                    } else {
+                                        brightness_factor = 120; // 侧边LED稍暗
+                                    }
+                                    
+                                    // 设置跑马灯颜色：根据电量状态选择颜色
+                                    uint8_t red, green, blue;
+                                    if (current_battery_percentage <= 30) {
+                                        // 低电量充电：红色跑马灯
+                                        red = brightness_factor;
+                                        green = brightness_factor / 4;
+                                        blue = 0;
+                                    } else if (current_battery_percentage <= 50) {
+                                        // 中等电量充电：橙色跑马灯
+                                        red = brightness_factor;
+                                        green = brightness_factor / 2;
+                                        blue = 0;
+                                    } else {
+                                        // 正常电量充电：绿色跑马灯
+                                        red = brightness_factor / 8;
+                                        green = brightness_factor;
+                                        blue = brightness_factor / 4;
+                                    }
+                                    led_strip_set_pixel(led_strips[ch], led_pos, red, green, blue);
+                                }
+                                
+                                // 添加尾迹效果：在跑马灯后面留下逐渐减弱的光点
+                                for (int trail = 1; trail <= 3; trail++) {
+                                    int trail_pos = runner_center - trail;
+                                    if (trail_pos < 0) trail_pos += battery_leds;
+                                    
+                                    uint8_t trail_brightness = 150 / (trail + 1); // 尾迹亮度递减
+                                    
+                                    // 尾迹颜色与跑马灯主体颜色保持一致
+                                    uint8_t trail_red, trail_green, trail_blue;
+                                    if (current_battery_percentage <= 30) {
+                                        // 低电量：红色尾迹
+                                        trail_red = trail_brightness;
+                                        trail_green = trail_brightness / 4;
+                                        trail_blue = 0;
+                                    } else if (current_battery_percentage <= 50) {
+                                        // 中等电量：橙色尾迹
+                                        trail_red = trail_brightness;
+                                        trail_green = trail_brightness / 2;
+                                        trail_blue = 0;
+                                    } else {
+                                        // 正常电量：绿色尾迹
+                                        trail_red = 0;
+                                        trail_green = trail_brightness;
+                                        trail_blue = trail_brightness / 6;
+                                    }
+                                    
+                                    led_strip_set_pixel(led_strips[ch], trail_pos, 
+                                                       trail_red, trail_green, trail_blue);
+                                }
+                            } else {
+                                // 非充电时的快速呼吸灯显示 - 根据电量选择颜色
+                                static uint32_t breath_phase = 0;
+                                breath_phase = (breath_phase + 1) % 60; // 缩短呼吸循环周期，更快呼吸
+                                
+                                // 计算呼吸效果的亮度因子 (0.2 - 1.0)，更大的亮度变化范围
+                                float breath_factor = 0.2f + 0.8f * ((sin(breath_phase * M_PI / 30) + 1.0f) / 2.0f);
+                                
+                                for (int i = 0; i < battery_leds; i++) {
+                                    uint8_t base_red, base_green, base_blue;
+                                    
+                                    // 根据电量状态选择基础颜色
+                                    if (current_battery_percentage <= 30) {
+                                        // 低电量警示：红色呼吸
+                                        base_red = 255;
+                                        base_green = 0;
+                                        base_blue = 0;
+                                    } else if (current_battery_percentage <= 50) {
+                                        // 中等电量：橙色呼吸
+                                        base_red = 255;
+                                        base_green = 100;
+                                        base_blue = 0;
+                                    } else {
+                                        // 正常电量：绿色呼吸
+                                        base_red = 0;
+                                        base_green = 255;
+                                        base_blue = 0;
+                                    }
+                                    
+                                    // 应用呼吸效果
+                                    uint8_t breath_red = (uint8_t)(base_red * breath_factor);
+                                    uint8_t breath_green = (uint8_t)(base_green * breath_factor);
+                                    uint8_t breath_blue = (uint8_t)(base_blue * breath_factor);
+                                    
+                                    led_strip_set_pixel(led_strips[ch], i, breath_red, breath_green, breath_blue);
+                                }
+                            }
+                            
+                            // 刷新LED显示
+                            led_strip_refresh(led_strips[ch]);
+                        }
+                        // 电量模式下跳过通用的LED刷新
+                        continue;
+                    }
                     break;
                     
                 default:
@@ -587,8 +935,8 @@ void ws2812_task(void *pvParameters) {
             led_strip_refresh(led_strips[ch]);
         }
         
-        // 使用固定的任务延时，不影响各效果的独立速度控制
-        vTaskDelay(pdMS_TO_TICKS(20)); // 50Hz 刷新率
+        // 降低刷新频率以减少闪烁，特别是对电量显示模式
+        vTaskDelay(pdMS_TO_TICKS(50)); // 20Hz 刷新率，减少闪烁
     }
     
     ESP_LOGI(TAG, "WS2812 multi-channel task ended");
@@ -615,7 +963,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     esp_err_t ret = ESP_OK;
     
-    // 检查是否是状态查询
+    // 检查是否是状态查询或特殊命令
     cJSON *action = cJSON_GetObjectItem(json, "action");
     if (action && cJSON_IsString(action)) {
         if (strcmp(action->valuestring, "status") == 0) {
@@ -632,29 +980,54 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             }
             cJSON_Delete(json);
             return ESP_OK;
+        } else if (strcmp(action->valuestring, "ws2812_control") != 0) {
+            // 不是WS2812控制命令，直接返回错误
+            ESP_LOGE(TAG, "Invalid action: %s", action->valuestring);
+            cJSON_Delete(json);
+            return ESP_ERR_INVALID_ARG;
         }
     }
     
-    // 获取通道ID
+    esp_task_wdt_reset(); // 命令处理前重置
+    
+    // 首先检查所有的JSON字段
+    cJSON *battery_display_json = cJSON_GetObjectItem(json, "battery_display");
+    cJSON *battery_status_json = cJSON_GetObjectItem(json, "battery_status");
+    cJSON *battery_channel_json = cJSON_GetObjectItem(json, "battery_channel");
     cJSON *channel_json = cJSON_GetObjectItem(json, "channel");
-    if (!channel_json || !cJSON_IsNumber(channel_json)) {
-        ESP_LOGE(TAG, "Missing or invalid channel parameter");
+    
+    // 检查是否为电量相关命令（这些不需要channel字段）
+    bool is_battery_command = (battery_display_json != NULL || 
+                              battery_status_json != NULL || 
+                              battery_channel_json != NULL);
+    
+    // 获取通道ID和验证
+    uint8_t channel_id = 0;
+    bool has_channel = false;
+    
+    if (channel_json && cJSON_IsNumber(channel_json)) {
+        channel_id = (uint8_t)channel_json->valueint;
+        if (channel_id != WS2812_BROADCAST_ID && channel_id >= WS2812_CHANNEL_COUNT) {
+            ESP_LOGE(TAG, "Invalid channel ID: %d", channel_id);
+            cJSON_Delete(json);
+            return ESP_ERR_INVALID_ARG;
+        }
+        has_channel = true;
+    } else if (!is_battery_command) {
+        // 对于非电量命令，必须要有有效的channel参数
+        ESP_LOGE(TAG, "Missing or invalid channel parameter for non-battery command");
         cJSON_Delete(json);
         return ESP_ERR_INVALID_ARG;
     }
     
-    esp_task_wdt_reset(); // 通道ID处理后重置
-    
-    uint8_t channel_id = (uint8_t)channel_json->valueint;
-    if (channel_id != WS2812_BROADCAST_ID && channel_id >= WS2812_CHANNEL_COUNT) {
-        ESP_LOGE(TAG, "Invalid channel ID: %d", channel_id);
-        cJSON_Delete(json);
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    // 处理各种命令
+    // 处理需要通道ID的命令
     cJSON *mode_json = cJSON_GetObjectItem(json, "mode");
     if (mode_json && cJSON_IsNumber(mode_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Mode command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
         int mode = mode_json->valueint;
         if (mode >= 0 && mode < WS2812_MODE_MAX) {
             esp_task_wdt_reset(); // 模式设置前重置看门狗
@@ -669,6 +1042,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *color_json = cJSON_GetObjectItem(json, "color");
     if (color_json && cJSON_IsObject(color_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Color command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
         esp_task_wdt_reset(); // 颜色处理前重置看门狗
         cJSON *r_json = cJSON_GetObjectItem(color_json, "r");
         cJSON *g_json = cJSON_GetObjectItem(color_json, "g");
@@ -694,6 +1072,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *brightness_json = cJSON_GetObjectItem(json, "brightness");
     if (brightness_json && cJSON_IsNumber(brightness_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Brightness command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
         esp_task_wdt_reset(); // 亮度处理前重置看门狗
         int brightness = brightness_json->valueint;
         if (brightness >= 0 && brightness <= 255) {
@@ -709,6 +1092,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *speed_json = cJSON_GetObjectItem(json, "speed");
     if (speed_json && cJSON_IsNumber(speed_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Speed command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
         esp_task_wdt_reset(); // 速度处理前重置看门狗
         int speed = speed_json->valueint;
         if (speed >= 1 && speed <= 10000) {
@@ -724,6 +1112,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *enabled_json = cJSON_GetObjectItem(json, "enabled");
     if (enabled_json && cJSON_IsBool(enabled_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Enabled command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
         esp_task_wdt_reset(); // 启用/禁用处理前重置看门狗
         bool enabled = cJSON_IsTrue(enabled_json);
         ret = ws2812_set_channel_enabled(channel_id, enabled);
@@ -733,6 +1126,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     cJSON *cycle_duration_json = cJSON_GetObjectItem(json, "cycle_duration");
     if (cycle_duration_json && cJSON_IsNumber(cycle_duration_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Cycle duration command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
         esp_task_wdt_reset(); // 循环持续时间处理前重置看门狗
         int duration = cycle_duration_json->valueint;
         if (duration >= 1000 && duration <= 60000) {
@@ -743,6 +1141,137 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ESP_LOGE(TAG, "Invalid cycle duration: %d", duration);
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
+        }
+    }
+    
+    // LED数量设置
+    cJSON *led_count_json = cJSON_GetObjectItem(json, "led_count");
+    if (led_count_json && cJSON_IsNumber(led_count_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "LED count command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        esp_task_wdt_reset(); // LED数量处理前重置看门狗
+        int led_count = led_count_json->valueint;
+        if (led_count >= 1 && led_count <= WS2812_MAX_LED_COUNT) {
+            ret = ws2812_set_led_count(channel_id, (uint16_t)led_count);
+            esp_task_wdt_reset(); // LED数量设置后重置看门狗
+            if (ret != ESP_OK) goto cleanup;
+        } else {
+            ESP_LOGE(TAG, "Invalid LED count: %d", led_count);
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+    }
+    
+    // 单通道电量显示模式设置
+    cJSON *channel_battery_mode_json = cJSON_GetObjectItem(json, "channel_battery_mode");
+    if (channel_battery_mode_json && cJSON_IsBool(channel_battery_mode_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Channel battery mode command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        esp_task_wdt_reset(); // 电量模式处理前重置看门狗
+        
+        bool enable_battery_mode = cJSON_IsTrue(channel_battery_mode_json);
+        uint8_t bg_brightness = 10;  // 默认背景亮度
+        
+        // 检查是否有背景亮度参数
+        cJSON *bg_brightness_json = cJSON_GetObjectItem(json, "background_brightness");
+        if (bg_brightness_json && cJSON_IsNumber(bg_brightness_json)) {
+            int brightness = bg_brightness_json->valueint;
+            if (brightness >= 0 && brightness <= 255) {
+                bg_brightness = (uint8_t)brightness;
+            }
+        }
+        
+        ret = ws2812_set_channel_battery_mode(channel_id, enable_battery_mode, bg_brightness);
+        esp_task_wdt_reset(); // 电量模式设置后重置看门狗
+        if (ret != ESP_OK) goto cleanup;
+        
+        ESP_LOGI(TAG, "Channel %d battery mode set to: %s, bg_brightness=%d", 
+                 channel_id, enable_battery_mode ? "enabled" : "disabled", bg_brightness);
+    }
+    
+    // 简化电量显示通道配置（与LCD兼容）
+    if (battery_channel_json && cJSON_IsNumber(battery_channel_json)) {
+        esp_task_wdt_reset();
+        int ch = battery_channel_json->valueint;
+        uint8_t battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+        
+        if (ch >= 0 && ch < WS2812_CHANNEL_COUNT) {
+            battery_channel = (uint8_t)ch;
+        } else if (ch == 255) {
+            battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+        }
+        
+        // 使用默认设置：启用充电动画，背景亮度20
+        ret = ws2812_set_battery_display(battery_channel, true, 10);
+        esp_task_wdt_reset();
+        if (ret != ESP_OK) goto cleanup;
+        
+        ESP_LOGI(TAG, "Battery display channel set to: %d", battery_channel);
+    }
+    
+    // 原有的详细电量显示配置（向后兼容）
+    // battery_display_json already defined above
+    if (battery_display_json && cJSON_IsObject(battery_display_json)) {
+        esp_task_wdt_reset(); // 电量显示处理前重置看门狗
+        
+        cJSON *battery_channel_json = cJSON_GetObjectItem(battery_display_json, "channel");
+        cJSON *show_charging_json = cJSON_GetObjectItem(battery_display_json, "show_charging_effect");
+        cJSON *bg_brightness_json = cJSON_GetObjectItem(battery_display_json, "background_brightness");
+        
+        uint8_t battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+        bool show_charging_effect = true;
+        uint8_t background_brightness = 20;
+        
+        if (battery_channel_json && cJSON_IsNumber(battery_channel_json)) {
+            int ch = battery_channel_json->valueint;
+            if (ch >= 0 && ch < WS2812_CHANNEL_COUNT) {
+                battery_channel = (uint8_t)ch;
+            } else if (ch == 255) {
+                battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+            }
+        }
+        
+        if (show_charging_json && cJSON_IsBool(show_charging_json)) {
+            show_charging_effect = cJSON_IsTrue(show_charging_json);
+        }
+        
+        if (bg_brightness_json && cJSON_IsNumber(bg_brightness_json)) {
+            int brightness = bg_brightness_json->valueint;
+            if (brightness >= 0 && brightness <= 255) {
+                background_brightness = (uint8_t)brightness;
+            }
+        }
+        
+        ret = ws2812_set_battery_display(battery_channel, show_charging_effect, background_brightness);
+        esp_task_wdt_reset(); // 电量显示设置后重置看门狗
+        if (ret != ESP_OK) goto cleanup;
+    }
+    
+    // 电量状态更新
+    // battery_status_json already defined above
+    if (battery_status_json && cJSON_IsObject(battery_status_json)) {
+        esp_task_wdt_reset(); // 电量状态处理前重置看门狗
+        
+        cJSON *percentage_json = cJSON_GetObjectItem(battery_status_json, "percentage");
+        cJSON *charging_json = cJSON_GetObjectItem(battery_status_json, "charging");
+        
+        if (percentage_json && cJSON_IsNumber(percentage_json)) {
+            int percentage = percentage_json->valueint;
+            bool is_charging = false;
+            
+            if (charging_json && cJSON_IsBool(charging_json)) {
+                is_charging = cJSON_IsTrue(charging_json);
+            }
+            
+            ret = ws2812_update_battery_display(percentage, is_charging);
+            esp_task_wdt_reset(); // 电量状态设置后重置看门狗
+            if (ret != ESP_OK) goto cleanup;
         }
     }
     
@@ -774,7 +1303,7 @@ esp_err_t ws2812_test_all_channels(void) {
                  test_colors[ch].r, test_colors[ch].g, test_colors[ch].b);
         
         // 点亮当前通道
-        for (int i = 0; i < WS2812_LED_COUNT; i++) {
+        for (int i = 0; i < channels[ch].led_count; i++) {
             led_strip_set_pixel(led_strips[ch], i, 
                               test_colors[ch].r / 4,  // 降低亮度以节省电流
                               test_colors[ch].g / 4, 
@@ -815,6 +1344,13 @@ esp_err_t ws2812_save_config(void) {
         ret = nvs_set_u32(nvs_handle, "version", WS2812_CONFIG_VERSION);
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save config version: %s", esp_err_to_name(ret));
+            goto cleanup;
+        }
+        
+        // 保存电量显示配置
+        ret = nvs_set_blob(nvs_handle, "battery_config", &battery_config, sizeof(ws2812_battery_config_t));
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save battery config: %s", esp_err_to_name(ret));
             goto cleanup;
         }
         
@@ -889,6 +1425,18 @@ esp_err_t ws2812_load_config(void) {
     if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
         bool load_success = true;
         
+        // 加载电量显示配置
+        size_t battery_config_size = sizeof(ws2812_battery_config_t);
+        ret = nvs_get_blob(nvs_handle, "battery_config", &battery_config, &battery_config_size);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to load battery config, using defaults: %s", esp_err_to_name(ret));
+            // 使用默认电量显示配置
+            battery_config.battery_channel = 255;  // 禁用
+            battery_config.show_charging_effect = true;
+            battery_config.background_brightness = 20;
+            load_success = false;
+        }
+        
         // 加载每个通道的配置
         for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
             char key[32];
@@ -903,6 +1451,7 @@ esp_err_t ws2812_load_config(void) {
                 // 使用默认配置
                 channels[ch].channel_id = ch;
                 channels[ch].enabled = true;
+                channels[ch].led_count = WS2812_LED_COUNT_DEFAULT;  // 默认LED数量
                 channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
                 channels[ch].config.color = (rgb_color_t){255, 255, 255};
                 channels[ch].config.speed = 150;
@@ -925,9 +1474,11 @@ esp_err_t ws2812_load_config(void) {
                 load_success = false;
             }
             
-            if (channels[ch].config.brightness > 255) {
-                ESP_LOGW(TAG, "Invalid brightness for channel %d, resetting to 180", ch);
-                channels[ch].config.brightness = 180;
+            // brightness字段是uint8_t类型，范围自然限制在0-255，无需检查上限
+            
+            if (channels[ch].led_count < 1 || channels[ch].led_count > WS2812_MAX_LED_COUNT) {
+                ESP_LOGW(TAG, "Invalid LED count for channel %d, resetting to default", ch);
+                channels[ch].led_count = WS2812_LED_COUNT_DEFAULT;
                 load_success = false;
             }
             
@@ -965,10 +1516,16 @@ esp_err_t ws2812_load_config(void) {
  */
 esp_err_t ws2812_reset_config(void) {
     if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        // 重置电量显示配置
+        battery_config.battery_channel = 255;  // 禁用
+        battery_config.show_charging_effect = true;
+        battery_config.background_brightness = 20;
+        
         // 初始化每个通道的默认配置
         for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
             channels[ch].channel_id = ch;
             channels[ch].enabled = true;
+            channels[ch].led_count = WS2812_LED_COUNT_DEFAULT;
             channels[ch].config.mode = WS2812_MODE_AUTO_CYCLE;
             channels[ch].config.color = (rgb_color_t){255, 255, 255};
             channels[ch].config.speed = 150;

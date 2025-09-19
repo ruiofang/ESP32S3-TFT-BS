@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <math.h>
 
 #define TAG "BATTERY_MONITOR"
 
@@ -38,11 +39,9 @@
 #define UART1_TXD_PIN       16
 #define UART1_RXD_PIN       17
 #define UART1_BAUD_RATE     115200
-#define UART_BUF_SIZE       1024
+#define UART_BUF_SIZE       2048  // 增加缓冲区大小
 
-// 电池电量相关定义  
-#define BATTERY_MIN_VOLTAGE 18.0f   // 最低电压 (V) - 24V系统
-#define BATTERY_MAX_VOLTAGE 29.4f   // 最高电压 (V) - 24V系统  
+// 电池监控周期定义 (仅用于任务延时)
 #define BATTERY_UPDATE_PERIOD 1000  // 更新周期 (ms)
 
 // 充电动画相关定义
@@ -67,12 +66,39 @@ static float external_voltage_value = 24.0f;   // 外部设置的电压值
 
 static bool ui_update_pending = false;         // UI更新待处理标志
 
+// 异步处理队列
+#define UART_QUEUE_SIZE 10
+#define UART_CMD_MAX_LEN 512
+
+typedef struct {
+    char command[UART_CMD_MAX_LEN];
+    size_t length;
+} uart_command_t;
+
+static QueueHandle_t uart_command_queue = NULL;
+static bool nvs_save_pending = false;          // NVS保存待处理标志
+static esp_timer_handle_t nvs_save_timer = NULL;
+
+// 预构建响应字符串 - 避免动态JSON创建
+static const char* const RESPONSE_SUCCESS = "{\"status\":\"success\"}";
+static const char* const RESPONSE_UNKNOWN_QUERY = "{\"status\":\"error\",\"message\":\"Unknown query\"}";
+static const char* const RESPONSE_FAST_MODE_ONLY = "{\"status\":\"error\",\"message\":\"Use fast mode\"}";
+
+// 电池状态缓存（避免每次重新创建JSON）
+static char cached_battery_json[256] = "";
+static uint32_t last_battery_json_update = 0;
+
 // 充电动画相关变量
 static bool charging_animation_enabled = true;  // 充电动画开关
 static uint32_t charging_animation_step = 0;    // 动画步骤计数器
 static bool charging_animation_direction = true; // 动画方向（true为增加，false为减少）
 static esp_timer_handle_t charging_animation_timer = NULL; // 充电动画定时器
 static int charging_animation_range = 15;        // 充电动画范围（百分比）
+
+// 函数声明
+static void start_charging_animation(void);
+static void stop_charging_animation(void);
+static esp_err_t save_battery_state_to_nvs(void);
 
 /**
  * @brief 获取有效的充电状态（考虑外部控制）
@@ -81,6 +107,133 @@ static bool get_effective_charging_status(void)
 {
     return charging_status_override ? external_charging_status : g_charging_status;
 }
+
+/**
+ * @brief NVS延时保存定时器回调
+ */
+static void nvs_save_timer_callback(void *arg)
+{
+    if (nvs_save_pending) {
+        save_battery_state_to_nvs();
+        nvs_save_pending = false;
+    }
+}
+
+/**
+ * @brief 请求延时保存到NVS（避免频繁写入）
+ */
+static void schedule_nvs_save(void)
+{
+    nvs_save_pending = true;
+    if (nvs_save_timer != NULL) {
+        esp_timer_stop(nvs_save_timer);
+        esp_timer_start_once(nvs_save_timer, 500000); // 500ms延时
+    }
+}
+
+/**
+ * @brief 超快速JSON解析（只处理电池相关字段，优化版）
+ */
+static bool quick_parse_battery_json(const char* json_str, int* battery_out, bool* charging_out, float* voltage_out)
+{
+    // 初始化输出参数
+    *battery_out = -1;
+    *charging_out = false;
+    *voltage_out = -1.0f;
+    
+    bool found_any = false;
+    const char* pos = json_str;
+    
+    // 单次遍历解析所有字段，避免多次strstr调用
+    while (*pos) {
+        if (*pos == '"') {
+            pos++;  // 跳过引号
+            
+            // 检查字段名
+            if (strncmp(pos, "battery", 7) == 0) {
+                pos += 7;
+                if (*pos == '"' && *(pos+1) == ':') {
+                    pos += 2;
+                    while (*pos == ' ') pos++;  // 跳过空格
+                    *battery_out = atoi(pos);
+                    found_any = true;
+                }
+            }
+            else if (strncmp(pos, "charging", 8) == 0) {
+                pos += 8;
+                if (*pos == '"' && *(pos+1) == ':') {
+                    pos += 2;
+                    while (*pos == ' ') pos++;  // 跳过空格
+                    *charging_out = (strncmp(pos, "true", 4) == 0);
+                    found_any = true;
+                }
+            }
+            else if (strncmp(pos, "voltage", 7) == 0) {
+                pos += 7;
+                if (*pos == '"' && *(pos+1) == ':') {
+                    pos += 2;
+                    while (*pos == ' ') pos++;  // 跳过空格
+                    *voltage_out = atof(pos);
+                    found_any = true;
+                }
+            }
+        }
+        pos++;
+    }
+    
+    return found_any;
+}
+
+/**
+ * @brief 快速生成电池状态JSON（缓存版本）
+ */
+static const char* get_cached_battery_json(void)
+{
+    uint32_t current_time = xTaskGetTickCount();
+    
+    // 如果缓存太旧（超过100ms）或为空，则更新缓存
+    if (current_time - last_battery_json_update > pdMS_TO_TICKS(100) || cached_battery_json[0] == '\0') {
+        int battery = battery_display_override ? external_battery_value : g_battery_percentage;
+        float voltage = voltage_override ? external_voltage_value : g_battery_voltage;
+        bool charging = get_effective_charging_status();
+        
+        snprintf(cached_battery_json, sizeof(cached_battery_json),
+                "{\"battery\":%d,\"voltage\":%.2f,\"charging\":%s,\"mode\":\"%s\"}",
+                battery, voltage, charging ? "true" : "false",
+                battery_display_override ? "manual" : "auto");
+        
+        last_battery_json_update = current_time;
+    }
+    
+    return cached_battery_json;
+}
+
+/**
+ * @brief 超轻量级立即设置（完全非阻塞，最小化操作）
+ */
+static void instant_set_battery_params(int battery, bool charging, float voltage)
+{
+    // 直接设置，不做复杂检查，最大化速度
+    if (battery >= 1 && battery <= 100) {
+        external_battery_value = battery;
+        battery_display_override = true;
+    }
+    
+    if (external_charging_status != charging) {
+        external_charging_status = charging;
+        charging_status_override = true;
+    }
+    
+    if (voltage > 0.0f) {
+        external_voltage_value = voltage;
+        voltage_override = true;
+    }
+    
+    // 仅设置标志，所有复杂操作都推迟到后台
+    ui_update_pending = true;
+}
+
+
 
 /**
  * @brief 计算带充电动画效果的电量显示值
@@ -175,43 +328,70 @@ static void stop_charging_animation(void)
     }
 }
 
-// UART发送函数，带调试信息
+// 高性能UART发送函数 - 完全非阻塞
 static void uart_send_response(const char* response) {
-    if (response == NULL) {
-        ESP_LOGE(TAG, "Null response, skipping send");
+    if (response == NULL || strlen(response) == 0) {
         return;
     }
     
     size_t len = strlen(response);
-    ESP_LOGI(TAG, "=== UART SEND DEBUG ===");
-    ESP_LOGI(TAG, "Sending UART response: %s", response);
-    ESP_LOGI(TAG, "Response length: %d", len);
     
-    if (len == 0) {
-        ESP_LOGE(TAG, "Empty response, skipping send");
-        return;
+    // 完全非阻塞发送 - 不等待完成，最大化响应速度
+    uart_write_bytes(UART_NUM_1, response, len);
+    uart_write_bytes(UART_NUM_1, "\r\n", 2);
+    // 不调用 uart_wait_tx_done - 完全异步
+}
+
+/**
+ * @brief 后台处理任务（处理所有耗时操作）
+ */
+static void background_processing_task(void *pvParameters)
+{
+    TickType_t last_ws2812_update = 0;
+    TickType_t last_animation_check = 0;
+    
+    while (1) {
+        TickType_t current_time = xTaskGetTickCount();
+        
+        // 处理UI更新标志
+        if (ui_update_pending) {
+            ui_update_pending = false;
+            // 这里可以触发UI更新，但不在UART任务中
+        }
+        
+        // 定期处理WS2812更新（避免过于频繁）
+        if (current_time - last_ws2812_update > pdMS_TO_TICKS(50)) {  // 最多20Hz更新
+            if (battery_display_override || charging_status_override) {
+                ws2812_update_battery_display(external_battery_value, external_charging_status);
+            }
+            last_ws2812_update = current_time;
+        }
+        
+        // 定期检查充电动画状态
+        if (current_time - last_animation_check > pdMS_TO_TICKS(100)) {  // 每100ms检查一次
+            bool should_animate = charging_status_override && external_charging_status && charging_animation_enabled;
+            
+            if (should_animate && !esp_timer_is_active(charging_animation_timer)) {
+                start_charging_animation();
+            } else if (!should_animate && esp_timer_is_active(charging_animation_timer)) {
+                stop_charging_animation();
+            }
+            
+            last_animation_check = current_time;
+        }
+        
+        // 处理队列中的复杂命令（如果有的话）
+        uart_command_t cmd;
+        if (uart_command_queue != NULL && xQueueReceive(uart_command_queue, &cmd, 0) == pdTRUE) {
+            // 处理复杂的WS2812命令等
+            if (strncmp(cmd.command, "JSON:", 5) == 0) {
+                ws2812_handle_json_command(cmd.command + 5);
+            }
+        }
+        
+        // 适当休眠，避免占用过多CPU
+        vTaskDelay(pdMS_TO_TICKS(10));  // 100Hz处理频率
     }
-    
-    int sent = uart_write_bytes(UART_NUM_1, response, len);
-    ESP_LOGI(TAG, "UART write result: %d bytes written", sent);
-    
-    if (sent < 0) {
-        ESP_LOGE(TAG, "UART write error: %d", sent);
-        return;
-    }
-    
-    // 发送换行符
-    sent = uart_write_bytes(UART_NUM_1, "\r\n", 2);
-    ESP_LOGI(TAG, "UART newline write result: %d bytes", sent);
-    
-    // 等待发送完成
-    esp_err_t wait_result = uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(1000));
-    if (wait_result == ESP_OK) {
-        ESP_LOGI(TAG, "UART transmission completed successfully");
-    } else {
-        ESP_LOGE(TAG, "UART wait_tx_done failed: %d", wait_result);
-    }
-    ESP_LOGI(TAG, "=== UART SEND END ===");
 }
 
 // NVS存储键名
@@ -249,7 +429,6 @@ bool is_charging(void);
 // LCD控制函数声明
 static uint16_t parse_color_string(const char* color_str);
 static uint16_t parse_color_json(cJSON* color_obj);
-static esp_err_t handle_lcd_command(cJSON* json);
 
 /**
  * @brief UART1 初始化
@@ -272,21 +451,7 @@ static void uart1_init(void)
     ESP_LOGI(TAG, "UART1 initialized - TX:%d, RX:%d, Baud:%d", UART1_TXD_PIN, UART1_RXD_PIN, UART1_BAUD_RATE);
 }
 
-/**
- * @brief 通过串口发送电池信息
- */
-static void send_battery_info_via_uart(void)
-{
-    char buffer[128];
-    
-    // 格式：BATTERY:电压,百分比,充电状态
-    snprintf(buffer, sizeof(buffer), "BATTERY:%.2fV,%d%%,%s", 
-             g_battery_voltage, g_battery_percentage, g_charging_status ? "CHARGING" : "DISCHARGING");
-    
-    uart_send_response(buffer);
-    
-    ESP_LOGI(TAG, "Sent via UART1: %s", buffer);
-}
+
 
 /**
  * @brief 解析颜色字符串为RGB565格式
@@ -341,154 +506,6 @@ static uint16_t parse_color_json(cJSON* color_obj)
     }
     
     return LCD_COLOR_WHITE;
-}
-
-/**
- * @brief 处理LCD控制命令
- */
-static esp_err_t handle_lcd_command(cJSON* json)
-{
-    cJSON* lcd_item = cJSON_GetObjectItem(json, "lcd");
-    if (!lcd_item || !cJSON_IsString(lcd_item)) {
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    const char* command = lcd_item->valuestring;
-    ESP_LOGI(TAG, "Processing LCD command: %s", command);
-    
-    if (strcmp(command, "clear") == 0) {
-        // 清屏命令
-        cJSON* color_item = cJSON_GetObjectItem(json, "color");
-        uint16_t color = color_item ? parse_color_json(color_item) : LCD_COLOR_BLACK;
-        LCD_FastFill(color);
-        ESP_LOGI(TAG, "LCD cleared with color: 0x%04X", color);
-        
-    } else if (strcmp(command, "fill") == 0) {
-        // 填充命令
-        cJSON* color_item = cJSON_GetObjectItem(json, "color");
-        uint16_t color = color_item ? parse_color_json(color_item) : LCD_COLOR_WHITE;
-        LCD_FastFill(color);
-        ESP_LOGI(TAG, "LCD filled with color: 0x%04X", color);
-        
-    } else if (strcmp(command, "text") == 0) {
-        // 文字显示命令
-        cJSON* content_item = cJSON_GetObjectItem(json, "content");
-        if (!content_item || !cJSON_IsString(content_item)) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        
-        // 获取参数
-        cJSON* x_item = cJSON_GetObjectItem(json, "x");
-        cJSON* y_item = cJSON_GetObjectItem(json, "y");
-        cJSON* color_item = cJSON_GetObjectItem(json, "color");
-        cJSON* size_item = cJSON_GetObjectItem(json, "size");
-        
-        uint16_t x = x_item ? (uint16_t)x_item->valueint : 10;
-        uint16_t y = y_item ? (uint16_t)y_item->valueint : 10;
-        uint16_t color = color_item ? parse_color_json(color_item) : LCD_COLOR_WHITE;
-        uint16_t bg_color = LCD_COLOR_BLACK;
-        uint8_t size = size_item ? (uint8_t)size_item->valueint : 16;
-        
-        // 确保字体大小有效
-        if (size != 12 && size != 16 && size != 24) size = 16;
-        
-        LCD_ShowStr(x, y, content_item->valuestring, color, bg_color, size, 0);
-        ESP_LOGI(TAG, "LCD text displayed: '%s' at (%d,%d) size:%d color:0x%04X", 
-                 content_item->valuestring, x, y, size, color);
-        
-    } else if (strcmp(command, "rect") == 0) {
-        // 矩形绘制命令
-        cJSON* x_item = cJSON_GetObjectItem(json, "x");
-        cJSON* y_item = cJSON_GetObjectItem(json, "y");
-        cJSON* width_item = cJSON_GetObjectItem(json, "width");
-        cJSON* height_item = cJSON_GetObjectItem(json, "height");
-        cJSON* fill_item = cJSON_GetObjectItem(json, "fill");
-        cJSON* color_item = cJSON_GetObjectItem(json, "color");
-        
-        if (!x_item || !y_item || !width_item || !height_item) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        
-        uint16_t x = (uint16_t)x_item->valueint;
-        uint16_t y = (uint16_t)y_item->valueint;
-        uint16_t width = (uint16_t)width_item->valueint;
-        uint16_t height = (uint16_t)height_item->valueint;
-        uint16_t color = color_item ? parse_color_json(color_item) : LCD_COLOR_WHITE;
-        bool fill = fill_item ? cJSON_IsTrue(fill_item) : false;
-        
-        if (fill) {
-            LCD_DrawFillRectangle(x, y, x + width - 1, y + height - 1, color);
-        } else {
-            LCD_DrawRectangle(x, y, x + width - 1, y + height - 1, color);
-        }
-        ESP_LOGI(TAG, "LCD rectangle drawn: (%d,%d) %dx%d %s color:0x%04X", 
-                 x, y, width, height, fill ? "filled" : "outline", color);
-        
-    } else if (strcmp(command, "circle") == 0) {
-        // 圆形绘制命令
-        cJSON* x_item = cJSON_GetObjectItem(json, "x");
-        cJSON* y_item = cJSON_GetObjectItem(json, "y");
-        cJSON* radius_item = cJSON_GetObjectItem(json, "radius");
-        cJSON* fill_item = cJSON_GetObjectItem(json, "fill");
-        cJSON* color_item = cJSON_GetObjectItem(json, "color");
-        
-        if (!x_item || !y_item || !radius_item) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        
-        uint16_t x = (uint16_t)x_item->valueint;
-        uint16_t y = (uint16_t)y_item->valueint;
-        uint16_t radius = (uint16_t)radius_item->valueint;
-        uint16_t color = color_item ? parse_color_json(color_item) : LCD_COLOR_WHITE;
-        bool fill = fill_item ? cJSON_IsTrue(fill_item) : false;
-        
-        LCD_DrawCircle(x, y, radius, color, fill ? 1 : 0);
-        ESP_LOGI(TAG, "LCD circle drawn: center(%d,%d) radius:%d %s color:0x%04X", 
-                 x, y, radius, fill ? "filled" : "outline", color);
-        
-    } else if (strcmp(command, "line") == 0) {
-        // 线条绘制命令
-        cJSON* x1_item = cJSON_GetObjectItem(json, "x1");
-        cJSON* y1_item = cJSON_GetObjectItem(json, "y1");
-        cJSON* x2_item = cJSON_GetObjectItem(json, "x2");
-        cJSON* y2_item = cJSON_GetObjectItem(json, "y2");
-        cJSON* color_item = cJSON_GetObjectItem(json, "color");
-        
-        if (!x1_item || !y1_item || !x2_item || !y2_item) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        
-        uint16_t x1 = (uint16_t)x1_item->valueint;
-        uint16_t y1 = (uint16_t)y1_item->valueint;
-        uint16_t x2 = (uint16_t)x2_item->valueint;
-        uint16_t y2 = (uint16_t)y2_item->valueint;
-        uint16_t color = color_item ? parse_color_json(color_item) : LCD_COLOR_WHITE;
-        
-        LCD_DrawLine(x1, y1, x2, y2, color);
-        ESP_LOGI(TAG, "LCD line drawn: (%d,%d) to (%d,%d) color:0x%04X", 
-                 x1, y1, x2, y2, color);
-        
-    } else if (strcmp(command, "backlight") == 0) {
-        // 背光控制命令
-        cJSON* state_item = cJSON_GetObjectItem(json, "state");
-        if (!state_item) {
-            return ESP_ERR_INVALID_ARG;
-        }
-        
-        bool state = cJSON_IsTrue(state_item);
-        if (state) {
-            LCD_BLK_Set();
-        } else {
-            LCD_BLK_Clr();
-        }
-        ESP_LOGI(TAG, "LCD backlight %s", state ? "ON" : "OFF");
-        
-    } else {
-        ESP_LOGW(TAG, "Unknown LCD command: %s", command);
-        return ESP_ERR_INVALID_ARG;
-    }
-    
-    return ESP_OK;
 }
 
 /**
@@ -720,8 +737,7 @@ char* create_battery_status_json(void)
     if (voltage_override) {
         cJSON_AddNumberToObject(voltage_control, "external_voltage", (double)external_voltage_value);
     }
-    cJSON_AddNumberToObject(voltage_control, "min_voltage", (double)BATTERY_MIN_VOLTAGE);
-    cJSON_AddNumberToObject(voltage_control, "max_voltage", (double)BATTERY_MAX_VOLTAGE);
+    cJSON_AddStringToObject(voltage_control, "note", "Voltage is for monitoring only and does not affect battery percentage");
     cJSON_AddItemToObject(json, "voltage_control", voltage_control);
 
     // 添加充电动画信息
@@ -757,12 +773,13 @@ static float simulate_battery_voltage(void)
     
     voltage += direction;
     
-    if (voltage >= BATTERY_MAX_VOLTAGE) {
-        voltage = BATTERY_MAX_VOLTAGE;
+    // 简单的电压范围限制（仅用于模拟，不影响百分比计算）
+    if (voltage >= 29.4f) {  // 原 BATTERY_MAX_VOLTAGE
+        voltage = 29.4f;
         direction = -0.1f;
         g_charging_status = false;
-    } else if (voltage <= BATTERY_MIN_VOLTAGE) {
-        voltage = BATTERY_MIN_VOLTAGE;
+    } else if (voltage <= 18.0f) {  // 原 BATTERY_MIN_VOLTAGE
+        voltage = 18.0f;
         direction = 0.1f;
         g_charging_status = true;
     }
@@ -780,21 +797,6 @@ static float simulate_battery_voltage(void)
     }
     
     return voltage;
-}
-
-/**
- * @brief 计算电池百分比
- */
-static int calculate_battery_percentage(float voltage)
-{
-    if (voltage <= BATTERY_MIN_VOLTAGE) {
-        return 0;
-    } else if (voltage >= BATTERY_MAX_VOLTAGE) {
-        return 100;
-    }
-    
-    float percentage = ((voltage - BATTERY_MIN_VOLTAGE) / (BATTERY_MAX_VOLTAGE - BATTERY_MIN_VOLTAGE)) * 100.0f;
-    return (int)percentage;
 }
 
 /**
@@ -938,11 +940,8 @@ static void update_battery_ui(void)
     if (display_percentage < 1) display_percentage = 1;
     if (display_percentage > 100) display_percentage = 100;
     
-    ESP_LOGI(TAG, "Updating UI - Display: %d%% (base: %d%%), BatteryOverride: %s, ChargingOverride: %s, EffectiveCharging: %s", 
-             display_percentage, base_percentage,
-             battery_display_override ? "true" : "false",
-             charging_status_override ? "true" : "false",
-             effective_charging ? "true" : "false");
+    // 减少日志输出频率 - 只在调试时输出
+    // ESP_LOGI(TAG, "Updating UI - Display: %d%% (base: %d%%)", display_percentage, base_percentage);
     
     if (battery_bar) {
         // 更新电量条值
@@ -1055,7 +1054,7 @@ static void update_battery_ui(void)
         lv_obj_invalidate(info_label);
     }
     
-    ESP_LOGI(TAG, "UI update completed");
+    // ESP_LOGI(TAG, "UI update completed");  // 减少日志输出
 }
 
 /**
@@ -1224,34 +1223,28 @@ static void test_ui_update(void)
     
     ESP_LOGI(TAG, "=== UI Update Test Completed ===");
 }
+
 void set_external_battery_level(int level)
 {
     if (level >= 1 && level <= 100) {
-        ESP_LOGI(TAG, "Setting external battery level from %d%% to %d%%", external_battery_value, level);
-        ESP_LOGI(TAG, "Previous override state: %s", battery_display_override ? "true" : "false");
+        // 检查参数是否真正发生变化
+        bool battery_changed = (external_battery_value != level);
+        bool override_changed = !battery_display_override;
         
-        external_battery_value = level;
-        battery_display_override = true;
-        
-        ESP_LOGI(TAG, "New values - external_battery_value: %d%%, battery_display_override: %s", 
-                 external_battery_value, battery_display_override ? "true" : "false");
-        
-        // 设置待处理标志，让LVGL任务处理UI更新
-        ui_update_pending = true;
-        ESP_LOGI(TAG, "UI update pending flag set");
-        
-        // *** 删除这里的force_update_battery_ui()调用，避免跨任务LVGL调用 ***
-        // force_update_battery_ui();
-        
-        // 立即保存到NVS
-        save_battery_state_to_nvs();
-        
-        // 立即更新WS2812电量显示
-        ws2812_update_battery_display(external_battery_value, external_charging_status);
-        ESP_LOGI(TAG, "WS2812 battery display updated with new level: %d%%, charging: %s", 
-                 external_battery_value, external_charging_status ? "true" : "false");
-        
-        ESP_LOGI(TAG, "External battery level updated and saved");
+        if (battery_changed || override_changed) {
+            external_battery_value = level;
+            battery_display_override = true;
+            
+            // 设置待处理标志，让LVGL任务处理UI更新
+            ui_update_pending = true;
+            
+            // 只有参数真正改变时才保存到NVS
+            schedule_nvs_save();
+            
+            // 异步更新WS2812电量显示
+            ws2812_update_battery_display(external_battery_value, external_charging_status);
+        }
+        // 如果参数没有变化，跳过所有操作，提高性能
     } else {
         ESP_LOGW(TAG, "Invalid battery level: %d (must be 1-100)", level);
     }
@@ -1262,41 +1255,32 @@ void set_external_battery_level(int level)
  */
 void set_external_charging_status(bool charging)
 {
-    ESP_LOGI(TAG, "Setting external charging status from %s to %s", 
-             external_charging_status ? "charging" : "not charging",
-             charging ? "charging" : "not charging");
-    ESP_LOGI(TAG, "Previous charging override state: %s", charging_status_override ? "true" : "false");
+    // 检查参数是否真正发生变化
+    bool charging_changed = (external_charging_status != charging);
+    bool override_changed = !charging_status_override;
     
-    external_charging_status = charging;
-    charging_status_override = true;
-    
-    ESP_LOGI(TAG, "New values - external_charging_status: %s, charging_status_override: %s", 
-             external_charging_status ? "true" : "false", 
-             charging_status_override ? "true" : "false");
-    
-    // 根据充电显示模式控制动画（只有在充电显示模式下才启用动画）
-    bool is_charging_display = charging_status_override && external_charging_status;
-    if (is_charging_display) {
-        ESP_LOGI(TAG, "Starting charging animation for charging display mode");
-        start_charging_animation();
-    } else {
-        ESP_LOGI(TAG, "Stopping charging animation (not in charging display mode)");
-        stop_charging_animation();
+    if (charging_changed || override_changed) {
+        external_charging_status = charging;
+        charging_status_override = true;
+        
+        // 根据充电显示模式控制动画（只有在充电显示模式下才启用动画）
+        bool is_charging_display = charging_status_override && external_charging_status;
+        if (is_charging_display) {
+            start_charging_animation();
+        } else {
+            stop_charging_animation();
+        }
+        
+        // 设置待处理标志，让LVGL任务处理UI更新
+        ui_update_pending = true;
+        
+        // 只有参数真正改变时才保存到NVS
+        schedule_nvs_save();
+        
+        // 异步更新WS2812电量显示
+        ws2812_update_battery_display(external_battery_value, external_charging_status);
     }
-    
-    // 设置待处理标志，让LVGL任务处理UI更新
-    ui_update_pending = true;
-    ESP_LOGI(TAG, "UI update pending flag set");
-    
-    // 立即保存到NVS
-    save_battery_state_to_nvs();
-    
-    // 立即更新WS2812电量显示
-    ws2812_update_battery_display(external_battery_value, external_charging_status);
-    ESP_LOGI(TAG, "WS2812 battery display updated with new charging status: %s, level: %d%%", 
-             external_charging_status ? "true" : "false", external_battery_value);
-    
-    ESP_LOGI(TAG, "External charging status updated and saved");
+    // 如果参数没有变化，跳过所有操作
 }
 
 /**
@@ -1304,21 +1288,20 @@ void set_external_charging_status(bool charging)
  */
 void restore_auto_charging_mode(void)
 {
-    charging_status_override = false;
-    
-    ESP_LOGI(TAG, "Restoring auto charging mode - Forcing UI update...");
-    
-    // 恢复自动模式后，不再是充电显示模式，停止动画
-    ESP_LOGI(TAG, "Stopping charging animation (restored to auto charging mode)");
-    stop_charging_animation();
-    
-    // 将刷新交由 LVGL 任务，避免跨任务调用
-    ui_update_pending = true;
-    
-    // 立即保存到NVS
-    save_battery_state_to_nvs();
-    
-    ESP_LOGI(TAG, "Auto charging mode restored and saved");
+    // 只有在当前为手动模式时才进行切换
+    if (charging_status_override) {
+        charging_status_override = false;
+        
+        // 恢复自动模式后，不再是充电显示模式，停止动画
+        stop_charging_animation();
+        
+        // 将刷新交由 LVGL 任务，避免跨任务调用
+        ui_update_pending = true;
+        
+        // 只有真正改变时才保存到NVS
+        schedule_nvs_save();
+    }
+    // 如果已经是自动模式，跳过所有操作
 }
 
 /**
@@ -1326,17 +1309,17 @@ void restore_auto_charging_mode(void)
  */
 void restore_auto_battery_mode(void)
 {
-    battery_display_override = false;
-    
-    ESP_LOGI(TAG, "Restoring auto battery mode - Forcing UI update...");
-    
-    // 将刷新交由 LVGL 任务，避免跨任务调用
-    ui_update_pending = true;
-    
-    // 立即保存到NVS
-    save_battery_state_to_nvs();
-    
-    ESP_LOGI(TAG, "Auto battery mode restored and saved");
+    // 只有在当前为手动模式时才进行切换
+    if (battery_display_override) {
+        battery_display_override = false;
+        
+        // 将刷新交由 LVGL 任务，避免跨任务调用
+        ui_update_pending = true;
+        
+        // 只有真正改变时才保存到NVS
+        schedule_nvs_save();
+    }
+    // 如果已经是自动模式，跳过所有操作
 }
 
 /**
@@ -1381,41 +1364,22 @@ bool is_charging(void)
 }
 
 /**
- * @brief 设置外部电压
+ * @brief 设置外部电压（仅记录电压值，不影响电量百分比显示）
  */
 void set_external_voltage(float voltage)
 {
-    if (voltage >= BATTERY_MIN_VOLTAGE && voltage <= BATTERY_MAX_VOLTAGE) {
-        ESP_LOGI(TAG, "Setting external voltage from %.2fV to %.2fV", external_voltage_value, voltage);
-        ESP_LOGI(TAG, "Previous voltage override state: %s", voltage_override ? "true" : "false");
-        
+    // 检查电压值是否真正发生变化（使用小的容差避免浮点精度问题）
+    bool voltage_changed = (fabs(external_voltage_value - voltage) > 0.01f);
+    bool override_changed = !voltage_override;
+    
+    if (voltage_changed || override_changed) {
         external_voltage_value = voltage;
         voltage_override = true;
         
-        ESP_LOGI(TAG, "New values - external_voltage_value: %.2fV, voltage_override: %s", 
-                 external_voltage_value, voltage_override ? "true" : "false");
-        
-        // 设置待处理标志，让LVGL任务处理UI更新
-        ui_update_pending = true;
-        ESP_LOGI(TAG, "UI update pending flag set");
-        
-        // 根据新电压计算电量百分比
-        int calculated_percentage = calculate_battery_percentage(external_voltage_value);
-        external_battery_value = calculated_percentage;
-        battery_display_override = true;  // 标记为手动设置的电量
-        
-        // 立即保存到NVS
-        save_battery_state_to_nvs();
-        
-        // 立即更新WS2812电量显示
-        ws2812_update_battery_display(external_battery_value, external_charging_status);
-        ESP_LOGI(TAG, "WS2812 battery display updated with calculated percentage: %d%% (from %.2fV), charging: %s", 
-                 external_battery_value, external_voltage_value, external_charging_status ? "true" : "false");
-        
-        ESP_LOGI(TAG, "External voltage updated and saved");
-    } else {
-        ESP_LOGW(TAG, "Invalid voltage: %.2fV (must be %.1fV-%.1fV)", voltage, BATTERY_MIN_VOLTAGE, BATTERY_MAX_VOLTAGE);
+        // 只有参数真正改变时才保存到NVS
+        schedule_nvs_save();
     }
+    // 如果电压值没有明显变化，跳过NVS保存
 }
 
 /**
@@ -1423,17 +1387,17 @@ void set_external_voltage(float voltage)
  */
 void restore_auto_voltage_mode(void)
 {
-    voltage_override = false;
-    
-    ESP_LOGI(TAG, "Restoring auto voltage mode - Forcing UI update...");
-    
-    // 将刷新交由 LVGL 任务，避免跨任务调用
-    ui_update_pending = true;
-    
-    // 立即保存到NVS
-    save_battery_state_to_nvs();
-    
-    ESP_LOGI(TAG, "Auto voltage mode restored and saved");
+    // 只有在当前为手动模式时才进行切换
+    if (voltage_override) {
+        voltage_override = false;
+        
+        // 将刷新交由 LVGL 任务，避免跨任务调用
+        ui_update_pending = true;
+        
+        // 只有真正改变时才保存到NVS
+        schedule_nvs_save();
+    }
+    // 如果已经是自动模式，跳过所有操作
 }
 
 /**
@@ -1449,14 +1413,13 @@ static void increase_lvgl_tick(void *arg)
  */
 static void battery_monitor_task(void *pvParameters)
 {
-    ESP_LOGI(TAG, "Battery monitor task started (Passive Mode)");
+    ESP_LOGI(TAG, "Battery monitor task started (Passive Mode - No voltage-based percentage calculation)");
     
     TickType_t last_wake_time = xTaskGetTickCount();
-    uint32_t ui_update_counter = 0;
     uint32_t save_counter = 0;
     
     while (1) {
-        // 根据电压控制模式决定电压来源
+        // 仅记录电压值（用于显示），不计算百分比
         if (voltage_override) {
             // 使用外部设置的电压值
             g_battery_voltage = external_voltage_value;
@@ -1465,15 +1428,8 @@ static void battery_monitor_task(void *pvParameters)
             g_battery_voltage = simulate_battery_voltage();
         }
         
-        // 计算电池百分比
-        g_battery_percentage = calculate_battery_percentage(g_battery_voltage);
-        
-        // 只在自动模式下才更新UI显示，降低频率
-        ui_update_counter++;
-        if (ui_update_counter >= 20 && (!battery_display_override || voltage_override)) {  // 当使用外部电压时也需要更新UI
-            ui_update_pending = true;  // 设置待处理标志，让LVGL任务处理
-            ui_update_counter = 0;
-        }
+        // 不再自动计算电池百分比，只有通过JSON命令设置时才更新
+        // g_battery_percentage 仅作为默认值保留
         
         // 定期保存状态到NVS (每200次循环，约200秒)
         save_counter++;
@@ -1495,7 +1451,7 @@ static void uart_command_task(void *pvParameters)
     ESP_LOGI(TAG, "UART command task started");
     
     uint8_t data[UART_BUF_SIZE];
-    char command_buffer[512]; // 增加缓冲区大小以支持较长的JSON
+    char command_buffer[1024]; // 增加缓冲区大小以支持较长的JSON
     int command_pos = 0;
     int json_brace_count = 0;
     bool in_json = false;
@@ -1530,142 +1486,32 @@ static void uart_command_task(void *pvParameters)
                     }
                     json_brace_count--;
                     
-                    // JSON对象完成
+                    // JSON对象完成 - 超快速处理
                     if (json_brace_count == 0) {
                         command_buffer[command_pos] = '\0';
-                        ESP_LOGI(TAG, "=== JSON COMMAND PROCESSING START ===");
-                        ESP_LOGI(TAG, "Received JSON command: %s", command_buffer);
                         
-                        // 解析JSON命令
-                        cJSON *json = cJSON_Parse(command_buffer);
-                        if (json) {
-                            ESP_LOGI(TAG, "JSON parsing successful");
-                            // 查询优先，单独处理并返回
-                            cJSON *query_item = cJSON_GetObjectItem(json, "query");
-                            if (query_item && cJSON_IsString(query_item)) {
-                                const char *query_type = query_item->valuestring;
-                                if (strcmp(query_type, "battery") == 0) {
-                                    char *json_response = create_battery_status_json();
-                                    if (json_response) {
-                                        uart_send_response(json_response);
-                                        free(json_response);
-                                    } else {
-                                        uart_send_response("{\"status\":\"error\",\"message\":\"Failed to create JSON response\"}");
-                                    }
-                                } else {
-                                    uart_send_response("{\"status\":\"error\",\"message\":\"Unknown query type\"}");
-                                }
+                        // 超快速命令处理 - 完全非阻塞
+                        if (strstr(command_buffer, "\"query\"")) {
+                            if (strstr(command_buffer, "\"battery\"")) {
+                                // 使用预缓存的JSON响应
+                                uart_send_response(get_cached_battery_json());
                             } else {
-                                bool did_any = false;
-                                // 自动模式优先，若设置自动则忽略对应的手动字段
-                                cJSON *auto_mode = cJSON_GetObjectItem(json, "auto_mode");
-                                if (auto_mode && cJSON_IsBool(auto_mode) && cJSON_IsTrue(auto_mode)) {
-                                    restore_auto_battery_mode();
-                                    did_any = true;
-                                }
-                                cJSON *auto_charging = cJSON_GetObjectItem(json, "auto_charging");
-                                if (auto_charging && cJSON_IsBool(auto_charging) && cJSON_IsTrue(auto_charging)) {
-                                    restore_auto_charging_mode();
-                                    did_any = true;
-                                }
-                                cJSON *auto_voltage = cJSON_GetObjectItem(json, "auto_voltage");
-                                if (auto_voltage && cJSON_IsBool(auto_voltage) && cJSON_IsTrue(auto_voltage)) {
-                                    restore_auto_voltage_mode();
-                                    did_any = true;
-                                }
-                                // 电量与充电可合并，同步更新LCD和WS2812电量显示
-                                bool battery_updated = false;
-                                bool charging_updated = false;
-                                int current_battery_level = 0;
-                                bool current_charging_status = false;
-                                
-                                if (!(auto_mode && cJSON_IsBool(auto_mode) && cJSON_IsTrue(auto_mode))) {
-                                    cJSON *battery_item = cJSON_GetObjectItem(json, "battery");
-                                    cJSON *percentage_item = cJSON_GetObjectItem(json, "percentage");
-                                    if ((battery_item && cJSON_IsNumber(battery_item)) || (percentage_item && cJSON_IsNumber(percentage_item))) {
-                                        current_battery_level = battery_item ? battery_item->valueint : percentage_item->valueint;
-                                        set_external_battery_level(current_battery_level);
-                                        battery_updated = true;
-                                        did_any = true;
-                                    }
-                                }
-                                if (!(auto_charging && cJSON_IsBool(auto_charging) && cJSON_IsTrue(auto_charging))) {
-                                    cJSON *charging_status = cJSON_GetObjectItem(json, "charging");
-                                    if (charging_status && cJSON_IsBool(charging_status)) {
-                                        current_charging_status = cJSON_IsTrue(charging_status);
-                                        set_external_charging_status(current_charging_status);
-                                        charging_updated = true;
-                                        did_any = true;
-                                    }
-                                }
-                                
-                                // 如果电量或充电状态有更新，同步更新WS2812电量显示
-                                if (battery_updated || charging_updated) {
-                                    // 获取当前实际的电量和充电状态
-                                    if (!battery_updated) {
-                                        current_battery_level = battery_display_override ? external_battery_value : g_battery_percentage;
-                                    }
-                                    if (!charging_updated) {
-                                        current_charging_status = get_effective_charging_status();
-                                    }
-                                    // 同步更新WS2812电量显示
-                                    ws2812_update_battery_display(current_battery_level, current_charging_status);
-                                }
-                                // 电压控制（仅在非自动电压模式下生效）
-                                if (!(auto_voltage && cJSON_IsBool(auto_voltage) && cJSON_IsTrue(auto_voltage))) {
-                                    cJSON *voltage_item = cJSON_GetObjectItem(json, "voltage");
-                                    if (voltage_item && cJSON_IsNumber(voltage_item)) {
-                                        float voltage_value = (float)cJSON_GetNumberValue(voltage_item);
-                                        set_external_voltage(voltage_value);
-                                        did_any = true;
-                                    }
-                                }
-                                // 充电动画开关
-                                cJSON *charging_anim = cJSON_GetObjectItem(json, "charging_animation");
-                                if (charging_anim && cJSON_IsBool(charging_anim)) {
-                                    bool enable_anim = cJSON_IsTrue(charging_anim);
-                                    charging_animation_enabled = enable_anim;
-                                    bool eff = get_effective_charging_status();
-                                    if (!enable_anim) stop_charging_animation(); else if (eff) start_charging_animation();
-                                    did_any = true;
-                                }
-                                // 模拟充电状态（测试）
-                                cJSON *simulate_charging = cJSON_GetObjectItem(json, "simulate_charging");
-                                if (simulate_charging && cJSON_IsBool(simulate_charging)) {
-                                    bool charging = cJSON_IsTrue(simulate_charging);
-                                    bool prev_status = g_charging_status;
-                                    g_charging_status = charging;
-                                    bool eff = get_effective_charging_status();
-                                    if (eff && charging_animation_enabled) start_charging_animation(); else stop_charging_animation();
-                                    if (prev_status != g_charging_status) ui_update_pending = true;
-                                    did_any = true;
-                                }
-                                // LCD 控制
-                                cJSON *lcd_ctrl = cJSON_GetObjectItem(json, "lcd");
-                                if (lcd_ctrl) {
-                                    esp_err_t ret2 = handle_lcd_command(json);
-                                    if (ret2 == ESP_OK) {
-                                        uart_send_response("{\"status\":\"success\",\"message\":\"LCD command executed\"}");
-                                    } else {
-                                        uart_send_response("{\"status\":\"error\",\"message\":\"LCD command failed\"}");
-                                    }
-                                } else if (did_any) {
-                                    // 统一成功响应
-                                    uart_send_response("{\"status\":\"success\"}");
-                                } else {
-                                    // 其余交给 WS2812 处理
-                                    esp_err_t ret3 = ws2812_handle_json_command(command_buffer);
-                                    if (ret3 == ESP_OK) uart_send_response("OK"); else uart_send_response("ERROR");
-                                }
+                                uart_send_response(RESPONSE_UNKNOWN_QUERY);
                             }
-                            cJSON_Delete(json);
-                            ESP_LOGI(TAG, "JSON object deleted");
                         } else {
-                            ESP_LOGE(TAG, "Failed to parse JSON: %s", command_buffer);
-                            uart_send_response("{\"status\":\"error\",\"message\":\"Invalid JSON format\"}");
+                            // 电池数据超快速处理
+                            int battery;
+                            bool charging; 
+                            float voltage;
+                            
+                            if (quick_parse_battery_json(command_buffer, &battery, &charging, &voltage)) {
+                                // 立即设置参数并响应 - 无任何阻塞操作
+                                instant_set_battery_params(battery, charging, voltage);
+                                uart_send_response(RESPONSE_SUCCESS);
+                            } else {
+                                uart_send_response(RESPONSE_FAST_MODE_ONLY);
+                            }
                         }
-                        
-                        ESP_LOGI(TAG, "=== JSON COMMAND PROCESSING END ===");
                         
                         // 重置状态
                         in_json = false;
@@ -1675,6 +1521,12 @@ static void uart_command_task(void *pvParameters)
                     // JSON内部的其他字符
                     if (command_pos < sizeof(command_buffer) - 1) {
                         command_buffer[command_pos++] = c;
+                    } else {
+                        // 缓冲区溢出保护 - 重置JSON解析状态
+                        ESP_LOGW(TAG, "JSON command buffer overflow, resetting");
+                        in_json = false;
+                        command_pos = 0;
+                        json_brace_count = 0;
                     }
                 } else {
                     // 非JSON命令处理（传统命令）
@@ -1682,67 +1534,78 @@ static void uart_command_task(void *pvParameters)
                         if (command_pos > 0) {
                             command_buffer[command_pos] = '\0';
                             
-                            // 处理传统命令
+                            // 超快速传统命令处理
                             if (strncmp(command_buffer, "JSON:", 5) == 0) {
-                                esp_err_t ret = ws2812_handle_json_command(command_buffer + 5);
-                                if (ret == ESP_OK) {
-                                    uart_send_response("OK");
+                                // WS2812命令放入队列异步处理，立即响应
+                                if (uart_command_queue != NULL) {
+                                    uart_command_t cmd;
+                                    strncpy(cmd.command, command_buffer, sizeof(cmd.command) - 1);
+                                    cmd.command[sizeof(cmd.command) - 1] = '\0';
+                                    cmd.length = strlen(cmd.command);
+                                    
+                                    if (xQueueSend(uart_command_queue, &cmd, 0) == pdTRUE) {
+                                        uart_send_response("QUEUED");
+                                    } else {
+                                        uart_send_response("QUEUE_FULL");
+                                    }
                                 } else {
-                                    uart_send_response("ERROR");
+                                    uart_send_response("NO_QUEUE");
                                 }
                             }
                             else if (strcmp(command_buffer, "BATTERY") == 0) {
-                                send_battery_info_via_uart();
+                                // 使用预缓存的简单格式响应
+                                int battery = battery_display_override ? external_battery_value : g_battery_percentage;
+                                float voltage = voltage_override ? external_voltage_value : g_battery_voltage;
+                                bool charging = get_effective_charging_status();
+                                
+                                // 直接发送简单格式，避免复杂字符串构建
+                                char simple_response[64];
+                                snprintf(simple_response, sizeof(simple_response), "BATTERY:%.1fV,%d%%,%s", 
+                                        voltage, battery, charging ? "CHARGING" : "DISCHARGING");
+                                uart_send_response(simple_response);
                             }
                             else if (strcmp(command_buffer, "BATTERY:JSON") == 0) {
-                                // 返回JSON格式的电池状态
-                                char *json_response = create_battery_status_json();
-                                if (json_response) {
-                                    uart_send_response(json_response);
-                                    free(json_response);
-                                } else {
-                                    uart_send_response("JSON_CREATE_ERROR");
-                                }
+                                // 使用预缓存的JSON响应
+                                uart_send_response(get_cached_battery_json());
                             }
                             else if (strncmp(command_buffer, "BATTERY:", 8) == 0) {
                                 // 传统格式设置电池电量: BATTERY:75
                                 int level = atoi(command_buffer + 8);
-                                set_external_battery_level(level);
                                 if (level >= 1 && level <= 100) {
-                                    uart_send_response("BATTERY_SET_OK");
+                                    instant_set_battery_params(level, external_charging_status, external_voltage_value);
+                                    uart_send_response("OK");
                                 } else {
-                                    uart_send_response("BATTERY_RANGE_ERROR");
+                                    uart_send_response("RANGE_ERROR");
                                 }
                             }
                             else if (strcmp(command_buffer, "BATTERY:AUTO") == 0) {
-                                restore_auto_battery_mode();
-                                uart_send_response("AUTO_MODE_OK");
+                                battery_display_override = false;  // 直接设置，不调用函数
+                                ui_update_pending = true;
+                                uart_send_response("OK");
                             }
                             else if (strncmp(command_buffer, "CHARGING:", 9) == 0) {
                                 // 充电状态控制命令: CHARGING:ON 或 CHARGING:OFF
                                 const char* charging_cmd = command_buffer + 9;
                                 if (strcmp(charging_cmd, "ON") == 0) {
-                                    set_external_charging_status(true);
-                                    uart_send_response("CHARGING_ON_OK");
+                                    instant_set_battery_params(external_battery_value, true, external_voltage_value);
+                                    uart_send_response("OK");
                                 } else if (strcmp(charging_cmd, "OFF") == 0) {
-                                    set_external_charging_status(false);
-                                    uart_send_response("CHARGING_OFF_OK");
+                                    instant_set_battery_params(external_battery_value, false, external_voltage_value);
+                                    uart_send_response("OK");
                                 } else if (strcmp(charging_cmd, "AUTO") == 0) {
-                                    restore_auto_charging_mode();
-                                    uart_send_response("CHARGING_AUTO_OK");
+                                    charging_status_override = false;  // 直接设置
+                                    ui_update_pending = true;
+                                    uart_send_response("OK");
                                 } else {
-                                    uart_send_response("CHARGING_COMMAND_ERROR");
+                                    uart_send_response("COMMAND_ERROR");
                                 }
                             }
                             else if (strncmp(command_buffer, "VOLTAGE:", 8) == 0) {
                                 // 电压控制命令: VOLTAGE:24.0
                                 float voltage = atof(command_buffer + 8);
                                 set_external_voltage(voltage);
-                                if (voltage >= BATTERY_MIN_VOLTAGE && voltage <= BATTERY_MAX_VOLTAGE) {
-                                    uart_send_response("VOLTAGE_SET_OK");
-                                } else {
-                                    uart_send_response("VOLTAGE_RANGE_ERROR");
-                                }
+                                // 移除电压范围验证，接受任何合理电压值
+                                uart_send_response("VOLTAGE_SET_OK");
                             }
                             else if (strcmp(command_buffer, "VOLTAGE:AUTO") == 0) {
                                 restore_auto_voltage_mode();
@@ -1937,10 +1800,8 @@ static void lvgl_task(void *pvParameters)
         
         // 检查是否有待处理的UI更新
         if (ui_update_pending) {
-            ESP_LOGI(TAG, "Processing pending UI update in LVGL task context");
             update_battery_ui();
             ui_update_pending = false;
-            ESP_LOGI(TAG, "UI update completed in LVGL task context");
         }
         // 每10次处理一次，避免过于频繁
         cnt++;
@@ -1994,6 +1855,21 @@ void app_main(void)
         ESP_LOGI(TAG, "Web server initialized successfully");
     }
 
+    // 初始化高性能UART处理
+    uart_command_queue = xQueueCreate(UART_QUEUE_SIZE, sizeof(uart_command_t));
+    if (uart_command_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create UART command queue");
+    } else {
+        ESP_LOGI(TAG, "UART command queue created (size: %d)", UART_QUEUE_SIZE);
+    }
+    
+    // 创建NVS延时保存定时器
+    const esp_timer_create_args_t nvs_timer_args = {
+        .callback = &nvs_save_timer_callback,
+        .name = "nvs_save"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&nvs_timer_args, &nvs_save_timer));
+    
     // 初始化UART1
     uart1_init();
 
@@ -2038,8 +1914,14 @@ void app_main(void)
         ESP_LOGI(TAG, "Battery monitor task added to watchdog");
     }
     
-    // 创建UART命令处理任务
-    xTaskCreate(uart_command_task, "uart_command", 4096, NULL, 2, NULL);
+    // 创建UART命令处理任务（快速响应版）
+    xTaskCreate(uart_command_task, "uart_command", 6144, NULL, 4, NULL);  // 提高优先级以实现快速响应
+    
+    // 创建后台处理任务
+    if (uart_command_queue != NULL) {
+        xTaskCreate(background_processing_task, "background", 4096, NULL, 1, NULL);  // 较低优先级的后台处理
+        ESP_LOGI(TAG, "Background processing task created");
+    }
     
     // 创建WS2812控制任务
     xTaskCreate(ws2812_task, "ws2812", 4096, NULL, 2, NULL);

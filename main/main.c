@@ -1246,6 +1246,11 @@ void set_external_battery_level(int level)
         // 立即保存到NVS
         save_battery_state_to_nvs();
         
+        // 立即更新WS2812电量显示
+        ws2812_update_battery_display(external_battery_value, external_charging_status);
+        ESP_LOGI(TAG, "WS2812 battery display updated with new level: %d%%, charging: %s", 
+                 external_battery_value, external_charging_status ? "true" : "false");
+        
         ESP_LOGI(TAG, "External battery level updated and saved");
     } else {
         ESP_LOGW(TAG, "Invalid battery level: %d (must be 1-100)", level);
@@ -1285,6 +1290,11 @@ void set_external_charging_status(bool charging)
     
     // 立即保存到NVS
     save_battery_state_to_nvs();
+    
+    // 立即更新WS2812电量显示
+    ws2812_update_battery_display(external_battery_value, external_charging_status);
+    ESP_LOGI(TAG, "WS2812 battery display updated with new charging status: %s, level: %d%%", 
+             external_charging_status ? "true" : "false", external_battery_value);
     
     ESP_LOGI(TAG, "External charging status updated and saved");
 }
@@ -1343,6 +1353,10 @@ void set_external_battery_percentage(int percentage)
  */
 float get_battery_voltage(void)
 {
+    // 如果有外部设置的电压值，优先返回外部值
+    if (voltage_override) {
+        return external_voltage_value;
+    }
     return g_battery_voltage;
 }
 
@@ -1351,6 +1365,10 @@ float get_battery_voltage(void)
  */
 int get_battery_percentage(void)
 {
+    // 如果有外部设置的电量值，优先返回外部值
+    if (battery_display_override) {
+        return external_battery_value;
+    }
     return g_battery_percentage;
 }
 
@@ -1381,8 +1399,18 @@ void set_external_voltage(float voltage)
         ui_update_pending = true;
         ESP_LOGI(TAG, "UI update pending flag set");
         
+        // 根据新电压计算电量百分比
+        int calculated_percentage = calculate_battery_percentage(external_voltage_value);
+        external_battery_value = calculated_percentage;
+        battery_display_override = true;  // 标记为手动设置的电量
+        
         // 立即保存到NVS
         save_battery_state_to_nvs();
+        
+        // 立即更新WS2812电量显示
+        ws2812_update_battery_display(external_battery_value, external_charging_status);
+        ESP_LOGI(TAG, "WS2812 battery display updated with calculated percentage: %d%% (from %.2fV), charging: %s", 
+                 external_battery_value, external_voltage_value, external_charging_status ? "true" : "false");
         
         ESP_LOGI(TAG, "External voltage updated and saved");
     } else {

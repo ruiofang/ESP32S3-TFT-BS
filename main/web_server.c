@@ -21,7 +21,7 @@ static const char* complete_html_page =
 "<head>"
 "<meta charset='UTF-8'>"
 "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
-"<title>ESP32 灯光控制</title>"
+"<title>ESP32S3-TFT-BS 智能控制面板</title>"
 "<style>"
 "body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }"
 ".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
@@ -38,13 +38,20 @@ static const char* complete_html_page =
 ".range-value { min-width: 50px; text-align: center; font-weight: bold; }"
 ".broadcast-section { background: #e8f5e8; }"
 ".channel-section { background: #f8f9fa; }"
+".battery-section { background: #fff3cd; }"
+".voltage-section { background: #cce5ff; }"
+".advanced-section { background: #f0f0f0; }"
 ".status-info { background: #d4edda; border-left: 4px solid #28a745; padding: 10px; margin: 10px 0; }"
+"input[type=number] { padding: 8px; border-radius: 5px; border: 1px solid #ccc; width: 80px; }"
+".small-button { padding: 5px 10px; font-size: 12px; margin-left: 5px; }"
+".config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }"
+"@media (max-width: 600px) { .config-grid { grid-template-columns: 1fr; } }"
 "</style>"
 "</head>"
 "<body>"
 "<div class='container'>"
-"<h1>🌈 ESP32S3 WS2812 灯光控制面板</h1>"
-"<div class='status-info' id='status'>状态: 连接成功</div>"
+"<h1>🌈 ESP32S3-TFT-BS 智能控制面板</h1>"
+"<div class='status-info' id='status'>状态: 连接成功 | 设备IP: 192.168.4.1 | WiFi: ESP32_LightControl</div>"
 "<div class='channel-group broadcast-section'>"
 "<div class='channel-title'>📡 广播控制 (所有通道)</div>"
 "<div class='control-row'>"
@@ -58,6 +65,7 @@ static const char* complete_html_page =
 "<option value='5'>闪烁效果</option>"
 "<option value='6'>波浪效果</option>"
 "<option value='7'>自动循环</option>"
+"<option value='8'>电量显示</option>"
 "</select>"
 "</div>"
 "<div class='control-row'>"
@@ -109,6 +117,7 @@ static const char* complete_html_page =
 "<option value='5'>闪烁效果</option>"
 "<option value='6'>波浪效果</option>"
 "<option value='7'>自动循环</option>"
+"<option value='8'>电量显示</option>"
 "</select>"
 "</div>"
 "<div class='control-row'>"
@@ -132,7 +141,47 @@ static const char* complete_html_page =
 "<input type='range' id='channel-speed' min='10' max='2000' value='100'>"
 "<span class='range-value' id='channel-speed-val'>100</span>ms"
 "</div>"
+"<div class='control-row'>"
+"<span class='control-label'>LED数量:</span>"
+"<input type='range' id='channel-led-count' min='1' max='300' value='60'>"
+"<span class='range-value' id='channel-led-count-val'>60</span>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>循环持续时间:</span>"
+"<input type='range' id='channel-cycle-duration' min='1000' max='60000' value='8000'>"
+"<span class='range-value' id='channel-cycle-duration-val'>8000</span>ms"
+"</div>"
 "<button onclick='applyChannel()'>应用到选中通道</button>"
+"</div>"
+"<div class='channel-group battery-section'>"
+"<div class='channel-title'>🔋 电池电量显示配置</div>"
+"<div class='control-row'>"
+"<span class='control-label'>电量显示通道:</span>"
+"<select id='battery-channel'>"
+"<option value='255'>禁用电量显示</option>"
+"<option value='0'>通道 1</option>"
+"<option value='1'>通道 2</option>"
+"<option value='2'>通道 3</option>"
+"<option value='3'>通道 4</option>"
+"</select>"
+"<button onclick='setBatteryChannel()'>设置电量显示通道</button>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>背景亮度:</span>"
+"<input type='range' id='battery-bg-brightness' min='0' max='255' value='20'>"
+"<span class='range-value' id='battery-bg-brightness-val'>20</span>"
+"<button onclick='setBatteryDisplay()'>应用显示配置</button>"
+"</div>"
+"</div>"
+"<div class='channel-group voltage-section'>"
+"<div class='channel-title'>⚡ 电压控制</div>"
+"<div class='control-row'>"
+"<span class='control-label'>电压设置:</span>"
+"<input type='number' id='voltage-input' min='18.0' max='29.4' step='0.1' value='24.0' style='width: 100px;'>"
+"<span>V</span>"
+"<button onclick='setVoltage()'>设置电压</button>"
+"<button onclick='restoreAutoVoltage()'>恢复自动检测</button>"
+"</div>"
 "</div>"
 "<div class='channel-group'>"
 "<div class='channel-title'>🔋 电池状态控制</div>"
@@ -161,16 +210,26 @@ static const char* complete_html_page =
 "</div>"
 "</div>"
 "</div>"
+"<div class='channel-group advanced-section'>"
+"<div class='channel-title'>⚙️ 高级配置</div>"
+"<div class='control-row'>"
+"<button onclick='systemTest()'>系统测试</button>"
+"<button onclick='getSystemInfo()'>系统信息</button>"
+"<button onclick='saveConfig()'>保存配置</button>"
+"<button onclick='loadConfig()'>加载配置</button>"
+"</div>"
+"</div>"
 "<div class='channel-group'>"
 "<div class='channel-title'>⚡ 快速设置</div>"
-"<div class='control-row center'>"
-"<button onclick='preset(\"off\")'>全部关闭</button>"
-"<button onclick='preset(\"white\")'>白色</button>"
-"<button onclick='preset(\"rainbow\")'>彩虹</button>"
-"<button onclick='preset(\"party\")'>派对模式</button>"
-"<button onclick='testLights()'>测试灯光</button>"
-"<button onclick='simpleTest()'>简单测试</button>"
-"<button onclick='debugTest()'>调试测试</button>"
+"<div class='control-row center config-grid'>"
+"<button onclick='preset(\"off\")'>🔴 全部关闭</button>"
+"<button onclick='preset(\"white\")'>⚪ 白色光</button>"
+"<button onclick='preset(\"rainbow\")'>🌈 彩虹效果</button>"
+"<button onclick='preset(\"party\")'>🎉 派对模式</button>"
+"<button onclick='preset(\"battery\")'>🔋 电量显示</button>"
+"<button onclick='preset(\"breathing\")'>💨 呼吸灯</button>"
+"<button onclick='testLights()'>🔧 测试灯光</button>"
+"<button onclick='debugTest()'>🐛 调试测试</button>"
 "</div>"
 "</div>"
 "</div>"
@@ -224,7 +283,7 @@ static const char* complete_html_page =
 "      data.brightness = 200;"
 "      break;"
 "    case 'rainbow':"
-"      data.mode = 2;"
+"      data.mode = 4;"
 "      data.speed = 50;"
 "      data.brightness = 150;"
 "      break;"
@@ -232,6 +291,16 @@ static const char* complete_html_page =
 "      data.mode = 7;"
 "      data.speed = 30;"
 "      data.brightness = 255;"
+"      break;"
+"    case 'battery':"
+"      data = { battery_channel: 0 };"
+"      sendRequest('/api/control', data);"
+"      return;"
+"    case 'breathing':"
+"      data.mode = 2;"
+"      data.color = {r: 0, g: 255, b: 128};"
+"      data.speed = 200;"
+"      data.brightness = 180;"
 "      break;"
 "  }"
 "  console.log('Preset data:', data);"
@@ -311,7 +380,9 @@ static const char* complete_html_page =
 "      b: parseInt(document.getElementById('channel-b').value)"
 "    },"
 "    brightness: parseInt(document.getElementById('channel-brightness').value),"
-"    speed: parseInt(document.getElementById('channel-speed').value)"
+"    speed: parseInt(document.getElementById('channel-speed').value),"
+"    led_count: parseInt(document.getElementById('channel-led-count').value),"
+"    cycle_duration: parseInt(document.getElementById('channel-cycle-duration').value)"
 "  };"
 "  sendRequest('/api/control', data);"
 "}"
@@ -375,11 +446,88 @@ static const char* complete_html_page =
 "  console.log('Restoring auto mode');"
 "  sendRequest('/api/battery/control', data);"
 "}"
+"function setBatteryChannel() {"
+"  var channel = parseInt(document.getElementById('battery-channel').value);"
+"  var data = { battery_channel: channel };"
+"  console.log('Setting battery channel:', channel);"
+"  sendRequest('/api/unified', data);"
+"}"
+"function setBatteryDisplay() {"
+"  var channel = parseInt(document.getElementById('battery-channel').value);"
+"  var bg_brightness = parseInt(document.getElementById('battery-bg-brightness').value);"
+"  var data = {"
+"    battery_display: {"
+"      channel: channel,"
+"      show_charging_effect: true,"
+"      background_brightness: bg_brightness"
+"    }"
+"  };"
+"  console.log('Setting battery display config:', data);"
+"  sendRequest('/api/unified', data);"
+"}"
+"function setVoltage() {"
+"  var voltage = parseFloat(document.getElementById('voltage-input').value);"
+"  var data = { voltage: voltage };"
+"  console.log('Setting voltage:', voltage);"
+"  sendRequest('/api/unified', data);"
+"}"
+"function restoreAutoVoltage() {"
+"  var data = { auto_voltage: true };"
+"  console.log('Restoring auto voltage mode');"
+"  sendRequest('/api/unified', data);"
+"}"
+"function systemTest() {"
+"  console.log('System test clicked');"
+"  var data = { action: 'test_all_channels' };"
+"  sendRequest('/api/control', data);"
+"}"
+"function getSystemInfo() {"
+"  console.log('Getting system info...');"
+"  document.getElementById('status').innerHTML = '状态: 🔄 获取系统信息中...';"
+"  fetch('/api/status', { method: 'GET' })"
+"  .then(function(response) {"
+"    if (response.ok) {"
+"      return response.json();"
+"    } else {"
+"      throw new Error('System info request failed');"
+"    }"
+"  })"
+"  .then(function(data) {"
+"    console.log('System info:', data);"
+"    var info = '系统信息:<br/>';"
+"    if (data.battery_percentage !== undefined) info += '电量: ' + data.battery_percentage + '%<br/>';"
+"    if (data.voltage !== undefined) info += '电压: ' + data.voltage + 'V<br/>';"
+"    if (data.is_charging !== undefined) info += '充电: ' + (data.is_charging ? '是' : '否') + '<br/>';"
+"    if (data.channels) {"
+"      info += '通道配置:<br/>';"
+"      data.channels.forEach(function(ch) {"
+"        info += '  通道' + ch.id + ': ' + (ch.enabled ? '启用' : '禁用') + ', 模式' + ch.mode + ', ' + ch.led_count + '个LED<br/>';"
+"      });"
+"    }"
+"    document.getElementById('battery-info').innerHTML = info;"
+"    document.getElementById('status').innerHTML = '状态: ✅ 系统信息获取成功';"
+"  })"
+"  .catch(function(error) {"
+"    console.error('System info error:', error);"
+"    document.getElementById('status').innerHTML = '状态: ❌ 系统信息获取失败';"
+"  });"
+"}"
+"function saveConfig() {"
+"  console.log('Saving config');"
+"  var data = { action: 'save_config' };"
+"  sendRequest('/api/control', data);"
+"}"
+"function loadConfig() {"
+"  console.log('Loading config');"
+"  var data = { action: 'load_config' };"
+"  sendRequest('/api/control', data);"
+"}"
 
 "window.onload = function() {"
 "  console.log('Page loaded, initializing...');"
 "  var sliders = ['broadcast-r', 'broadcast-g', 'broadcast-b', 'broadcast-brightness', 'broadcast-speed',"
-"                 'channel-r', 'channel-g', 'channel-b', 'channel-brightness', 'channel-speed', 'battery-level'];"
+"                 'channel-r', 'channel-g', 'channel-b', 'channel-brightness', 'channel-speed',"
+"                 'channel-led-count', 'channel-cycle-duration', 'battery-level', 'battery-bg-brightness'];"
 "  for(var i = 0; i < sliders.length; i++) {"
 "    var id = sliders[i];"
 "    var slider = document.getElementById(id);"
@@ -703,7 +851,40 @@ static esp_err_t api_unified_handler(httpd_req_t *req)
         cJSON *show_charging_effect = cJSON_GetObjectItem(json, "show_charging_effect");
         cJSON *background_brightness = cJSON_GetObjectItem(json, "background_brightness");
         
-        if (battery_channel || show_charging_effect || background_brightness) {
+        // 处理battery_display对象
+        cJSON *battery_display_obj = cJSON_GetObjectItem(json, "battery_display");
+        if (battery_display_obj && cJSON_IsObject(battery_display_obj)) {
+            cJSON *bd_channel = cJSON_GetObjectItem(battery_display_obj, "channel");
+            cJSON *bd_show_effect = cJSON_GetObjectItem(battery_display_obj, "show_charging_effect");
+            cJSON *bd_brightness = cJSON_GetObjectItem(battery_display_obj, "background_brightness");
+            
+            uint8_t channel = 255;  // 默认禁用
+            bool show_effect = true;  // 默认启用充电特效
+            uint8_t brightness = 10;  // 默认背景亮度
+            
+            if (bd_channel && cJSON_IsNumber(bd_channel)) {
+                channel = (uint8_t)bd_channel->valueint;
+            }
+            if (bd_show_effect && cJSON_IsBool(bd_show_effect)) {
+                show_effect = cJSON_IsTrue(bd_show_effect);
+            }
+            if (bd_brightness && cJSON_IsNumber(bd_brightness)) {
+                brightness = (uint8_t)bd_brightness->valueint;
+            }
+            
+            esp_err_t result = ws2812_set_battery_display(channel, show_effect, brightness);
+            if (result == ESP_OK) {
+                battery_processed = true;
+                ESP_LOGI(TAG, "Unified API: Set battery display from object - channel=%d, effect=%s, brightness=%d", 
+                        channel, show_effect ? "true" : "false", brightness);
+                // 立即更新电量显示以反映新配置
+                ws2812_update_battery_display(get_battery_percentage(), is_charging());
+            } else {
+                ESP_LOGE(TAG, "Unified API: Failed to set battery display configuration from object");
+            }
+        }
+        // 处理简化的电量显示配置
+        else if (battery_channel || show_charging_effect || background_brightness) {
             uint8_t channel = 255;  // 默认禁用
             bool show_effect = true;  // 默认启用充电特效
             uint8_t brightness = 10;  // 默认背景亮度
@@ -723,6 +904,8 @@ static esp_err_t api_unified_handler(httpd_req_t *req)
                 battery_processed = true;
                 ESP_LOGI(TAG, "Unified API: Set battery display - channel=%d, effect=%s, brightness=%d", 
                         channel, show_effect ? "true" : "false", brightness);
+                // 立即更新电量显示以反映新配置
+                ws2812_update_battery_display(get_battery_percentage(), is_charging());
             } else {
                 ESP_LOGE(TAG, "Unified API: Failed to set battery display configuration");
             }
@@ -749,6 +932,8 @@ static esp_err_t api_unified_handler(httpd_req_t *req)
                     battery_processed = true;
                     ESP_LOGI(TAG, "Unified API: Set channel %d battery mode to %s, brightness=%d", 
                             ch, en ? "enabled" : "disabled", brightness);
+                    // 立即更新电量显示以反映新配置
+                    ws2812_update_battery_display(get_battery_percentage(), is_charging());
                 } else {
                     ESP_LOGE(TAG, "Unified API: Failed to set channel battery mode");
                 }

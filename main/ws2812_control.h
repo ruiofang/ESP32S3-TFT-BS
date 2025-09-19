@@ -8,7 +8,7 @@
 // WS2812配置 - 4通道支持
 #define WS2812_CHANNEL_COUNT    4           // 支持4个通道
 #define WS2812_GPIO_PINS        {18, 19, 20, 21}  // 4个通道的GPIO引脚
-#define WS2812_LED_COUNT_DEFAULT 160        // 默认每个通道的LED数量
+#define WS2812_LED_COUNT_DEFAULT 30       // 默认每个通道的LED数量
 #define WS2812_MAX_LED_COUNT    300         // 每个通道最大LED数量
 #define WS2812_BROADCAST_ID     255         // 广播ID，控制所有通道
 #define WS2812_BATTERY_CHANNEL_DISABLED 255 // 表示未启用电量显示通道

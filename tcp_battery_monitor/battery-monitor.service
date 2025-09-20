@@ -1,0 +1,48 @@
+[Unit]
+Description=TCP Battery Monitor Service
+Documentation=TCP电池监控程序
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=phi
+Group=phi
+WorkingDirectory=/home/phi/tcp_battery_monitor
+ExecStart=/home/phi/tcp_battery_monitor/run_tcp_battery_monitor.sh
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# 重启策略
+Restart=always
+RestartSec=10
+
+# 环境变量
+Environment=PYTHONUNBUFFERED=1
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 日志配置
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=battery-monitor
+
+# 安全设置
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=false
+ReadWritePaths=/home/phi/tcp_battery_monitor
+PrivateDevices=false
+DeviceAllow=/dev/ttyUSB0 rw
+DeviceAllow=/dev/ttyACM0 rw
+DeviceAllow=char-usb_device rw
+
+# 资源限制
+LimitNOFILE=1024
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

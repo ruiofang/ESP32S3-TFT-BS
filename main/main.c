@@ -65,6 +65,15 @@ static bool voltage_override = false;          // 外部控制电压标志
 static float external_voltage_value = 24.0f;   // 外部设置的电压值
 
 static bool ui_update_pending = false;         // UI更新待处理标志
+static TaskHandle_t lvgl_task_handle = NULL;   // LVGL任务句柄
+
+// UI更新通知函数
+static void notify_ui_update_needed(void) {
+    ui_update_pending = true;
+    if (lvgl_task_handle != NULL) {
+        xTaskNotifyGive(lvgl_task_handle);  // 立即唤醒LVGL任务
+    }
+}
 
 // 异步处理队列
 #define UART_QUEUE_SIZE 10
@@ -193,7 +202,7 @@ static const char* get_cached_battery_json(void)
     
     // 如果缓存太旧（超过100ms）或为空，则更新缓存
     if (current_time - last_battery_json_update > pdMS_TO_TICKS(100) || cached_battery_json[0] == '\0') {
-        int battery = battery_display_override ? external_battery_value : g_battery_percentage;
+        int battery = external_battery_value;  // 始终使用external_battery_value作为当前显示值
         float voltage = voltage_override ? external_voltage_value : g_battery_voltage;
         bool charging = get_effective_charging_status();
         
@@ -214,7 +223,7 @@ static const char* get_cached_battery_json(void)
 static void instant_set_battery_params(int battery, bool charging, float voltage)
 {
     // 直接设置，不做复杂检查，最大化速度
-    if (battery >= 1 && battery <= 100) {
+    if (battery >= 0 && battery <= 100) {
         external_battery_value = battery;
         battery_display_override = true;
     }
@@ -353,11 +362,7 @@ static void background_processing_task(void *pvParameters)
     while (1) {
         TickType_t current_time = xTaskGetTickCount();
         
-        // 处理UI更新标志
-        if (ui_update_pending) {
-            ui_update_pending = false;
-            // 这里可以触发UI更新，但不在UART任务中
-        }
+        // UI更新标志由LVGL任务专门处理，这里不处理
         
         // 定期处理WS2812更新（避免过于频繁）
         if (current_time - last_ws2812_update > pdMS_TO_TICKS(50)) {  // 最多20Hz更新
@@ -428,7 +433,6 @@ bool is_charging(void);
 
 // LCD控制函数声明
 static uint16_t parse_color_string(const char* color_str);
-static uint16_t parse_color_json(cJSON* color_obj);
 
 /**
  * @brief UART1 初始化
@@ -472,41 +476,7 @@ static uint16_t parse_color_string(const char* color_str)
     return LCD_COLOR_WHITE; // 默认白色
 }
 
-/**
- * @brief 解析JSON颜色对象为RGB565格式
- */
-static uint16_t parse_color_json(cJSON* color_obj)
-{
-    if (!color_obj) return LCD_COLOR_WHITE;
-    
-    // 如果是字符串，使用字符串解析
-    if (cJSON_IsString(color_obj)) {
-        return parse_color_string(color_obj->valuestring);
-    }
-    
-    // 如果是数字，直接使用
-    if (cJSON_IsNumber(color_obj)) {
-        return (uint16_t)color_obj->valueint;
-    }
-    
-    // 如果是RGB对象
-    if (cJSON_IsObject(color_obj)) {
-        cJSON* r = cJSON_GetObjectItem(color_obj, "r");
-        cJSON* g = cJSON_GetObjectItem(color_obj, "g");
-        cJSON* b = cJSON_GetObjectItem(color_obj, "b");
-        
-        if (cJSON_IsNumber(r) && cJSON_IsNumber(g) && cJSON_IsNumber(b)) {
-            uint8_t red = (uint8_t)r->valueint;
-            uint8_t green = (uint8_t)g->valueint;
-            uint8_t blue = (uint8_t)b->valueint;
-            
-            // 转换为RGB565格式
-            return ((red >> 3) << 11) | ((green >> 2) << 5) | (blue >> 3);
-        }
-    }
-    
-    return LCD_COLOR_WHITE;
-}
+
 
 /**
  * @brief 保存电池显示状态到NVS
@@ -544,7 +514,7 @@ static esp_err_t save_battery_state_to_nvs(void)
         return ret;
     }
 
-    ret = nvs_set_u8(nvs_handle, NVS_KEY_PERCENTAGE, (uint8_t)g_battery_percentage);
+    ret = nvs_set_u8(nvs_handle, NVS_KEY_PERCENTAGE, (uint8_t)external_battery_value);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Error saving percentage: %s", esp_err_to_name(ret));
         nvs_close(nvs_handle);
@@ -636,9 +606,11 @@ static esp_err_t load_battery_state_from_nvs(void)
         g_battery_voltage = 24.0f; // 默认值适配24V系统
     }
 
-    // 加载电池百分比
+    // 加载电池百分比到外部控制值
     ret = nvs_get_u8(nvs_handle, NVS_KEY_PERCENTAGE, &temp_u8);
     if (ret == ESP_OK) {
+        external_battery_value = (int)temp_u8;
+        // 同时更新g_battery_percentage以保持兼容性
         g_battery_percentage = (int)temp_u8;
     }
 
@@ -701,14 +673,14 @@ char* create_battery_status_json(void)
 
     // 直接添加电池基本信息到根级别（取消battery对象）
     cJSON_AddNumberToObject(json, "voltage", (double)g_battery_voltage);
-    cJSON_AddNumberToObject(json, "percentage", g_battery_percentage);
+    cJSON_AddNumberToObject(json, "percentage", external_battery_value);
     
     // 获取有效的充电状态
     bool effective_charging = get_effective_charging_status();
     cJSON_AddStringToObject(json, "charging_status", effective_charging ? "CHARGING" : "DISCHARGING");
     
     // 添加电量和充电状态控制信息
-    int display_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    int display_percentage = external_battery_value;  // 始终使用external_battery_value
     cJSON_AddBoolToObject(json, "is_full", display_percentage >= BATTERY_FULL_THRESHOLD);
 
     // 添加显示控制信息
@@ -885,7 +857,7 @@ static void create_battery_ui(void)
     lv_obj_align(battery_container, LV_ALIGN_CENTER, 0, -5);
     
     // 获取正确的初始显示值
-    int initial_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    int initial_percentage = external_battery_value;  // 始终使用external_battery_value
     ESP_LOGI(TAG, "Creating UI with initial percentage: %d%% (Override: %s)", 
              initial_percentage, battery_display_override ? "true" : "false");
     
@@ -931,13 +903,13 @@ static void create_battery_ui(void)
 static void update_battery_ui(void)
 {
     // 获取要显示的电量值和充电状态
-    int base_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    int base_percentage = external_battery_value;  // 始终使用external_battery_value
     // 应用充电动画效果
     int display_percentage = get_animated_battery_percentage(base_percentage);
     bool effective_charging = get_effective_charging_status();
     
     // 确保数值在有效范围内
-    if (display_percentage < 1) display_percentage = 1;
+    if (display_percentage < 0) display_percentage = 0;
     if (display_percentage > 100) display_percentage = 100;
     
     // 减少日志输出频率 - 只在调试时输出
@@ -1068,13 +1040,13 @@ static void force_update_battery_ui(void)
              external_charging_status ? "true" : "false", charging_status_override ? "true" : "false");
     
     // 获取要显示的电量值和有效充电状态
-    int base_percentage = battery_display_override ? external_battery_value : g_battery_percentage;
+    int base_percentage = external_battery_value;  // 始终使用external_battery_value
     // 应用充电动画效果
     int display_percentage = get_animated_battery_percentage(base_percentage);
     bool effective_charging = get_effective_charging_status();
     
     // 确保数值在有效范围内
-    if (display_percentage < 1) display_percentage = 1;
+    if (display_percentage < 0) display_percentage = 0;
     if (display_percentage > 100) display_percentage = 100;
     
     ESP_LOGI(TAG, "Final display_percentage: %d%% (base: %d%%), effective_charging: %s", 
@@ -1226,7 +1198,7 @@ static void test_ui_update(void)
 
 void set_external_battery_level(int level)
 {
-    if (level >= 1 && level <= 100) {
+    if (level >= 0 && level <= 100) {
         // 检查参数是否真正发生变化
         bool battery_changed = (external_battery_value != level);
         bool override_changed = !battery_display_override;
@@ -1235,8 +1207,8 @@ void set_external_battery_level(int level)
             external_battery_value = level;
             battery_display_override = true;
             
-            // 设置待处理标志，让LVGL任务处理UI更新
-            ui_update_pending = true;
+            // 通知LVGL任务立即处理UI更新
+            notify_ui_update_needed();
             
             // 只有参数真正改变时才保存到NVS
             schedule_nvs_save();
@@ -1246,7 +1218,7 @@ void set_external_battery_level(int level)
         }
         // 如果参数没有变化，跳过所有操作，提高性能
     } else {
-        ESP_LOGW(TAG, "Invalid battery level: %d (must be 1-100)", level);
+        ESP_LOGW(TAG, "Invalid battery level: %d (must be 0-100)", level);
     }
 }
 
@@ -1271,8 +1243,8 @@ void set_external_charging_status(bool charging)
             stop_charging_animation();
         }
         
-        // 设置待处理标志，让LVGL任务处理UI更新
-        ui_update_pending = true;
+        // 通知LVGL任务立即处理UI更新
+        notify_ui_update_needed();
         
         // 只有参数真正改变时才保存到NVS
         schedule_nvs_save();
@@ -1295,8 +1267,8 @@ void restore_auto_charging_mode(void)
         // 恢复自动模式后，不再是充电显示模式，停止动画
         stop_charging_animation();
         
-        // 将刷新交由 LVGL 任务，避免跨任务调用
-        ui_update_pending = true;
+        // 通知LVGL任务立即处理UI更新
+        notify_ui_update_needed();
         
         // 只有真正改变时才保存到NVS
         schedule_nvs_save();
@@ -1313,8 +1285,8 @@ void restore_auto_battery_mode(void)
     if (battery_display_override) {
         battery_display_override = false;
         
-        // 将刷新交由 LVGL 任务，避免跨任务调用
-        ui_update_pending = true;
+        // 通知LVGL任务立即处理UI更新
+        notify_ui_update_needed();
         
         // 只有真正改变时才保存到NVS
         schedule_nvs_save();
@@ -1352,7 +1324,9 @@ int get_battery_percentage(void)
     if (battery_display_override) {
         return external_battery_value;
     }
-    return g_battery_percentage;
+    // 当恢复自动模式时，返回最后一次设置的外部值作为当前显示
+    // 这比返回一个可能过时的g_battery_percentage更合理
+    return external_battery_value;
 }
 
 /**
@@ -1416,7 +1390,6 @@ static void battery_monitor_task(void *pvParameters)
     ESP_LOGI(TAG, "Battery monitor task started (Passive Mode - No voltage-based percentage calculation)");
     
     TickType_t last_wake_time = xTaskGetTickCount();
-    uint32_t save_counter = 0;
     
     while (1) {
         // 仅记录电压值（用于显示），不计算百分比
@@ -1431,12 +1404,7 @@ static void battery_monitor_task(void *pvParameters)
         // 不再自动计算电池百分比，只有通过JSON命令设置时才更新
         // g_battery_percentage 仅作为默认值保留
         
-        // 定期保存状态到NVS (每200次循环，约200秒)
-        save_counter++;
-        if (save_counter >= 200) {
-            save_battery_state_to_nvs();
-            save_counter = 0;
-        }
+        // NVS保存已改为按需保存机制，不需要定期保存
         
         // 等待下一次更新
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(BATTERY_UPDATE_PERIOD));
@@ -1554,7 +1522,7 @@ static void uart_command_task(void *pvParameters)
                             }
                             else if (strcmp(command_buffer, "BATTERY") == 0) {
                                 // 使用预缓存的简单格式响应
-                                int battery = battery_display_override ? external_battery_value : g_battery_percentage;
+                                int battery = external_battery_value;  // 始终使用external_battery_value
                                 float voltage = voltage_override ? external_voltage_value : g_battery_voltage;
                                 bool charging = get_effective_charging_status();
                                 
@@ -1571,7 +1539,7 @@ static void uart_command_task(void *pvParameters)
                             else if (strncmp(command_buffer, "BATTERY:", 8) == 0) {
                                 // 传统格式设置电池电量: BATTERY:75
                                 int level = atoi(command_buffer + 8);
-                                if (level >= 1 && level <= 100) {
+                                if (level >= 0 && level <= 100) {
                                     instant_set_battery_params(level, external_charging_status, external_voltage_value);
                                     uart_send_response("OK");
                                 } else {
@@ -1626,7 +1594,7 @@ static void uart_command_task(void *pvParameters)
                             }
                             else if (strcmp(command_buffer, "UI:FORCE") == 0) {
                                 ESP_LOGI(TAG, "Manual force UI update command received");
-                                force_update_battery_ui();
+                                notify_ui_update_needed();  // 通知LVGL任务立即处理UI更新
                                 uart_send_response("UI_FORCE_COMPLETED");
                             }
                             else if (strcmp(command_buffer, "WS2812:TEST") == 0) {
@@ -1803,13 +1771,16 @@ static void lvgl_task(void *pvParameters)
             update_battery_ui();
             ui_update_pending = false;
         }
+        
         // 每10次处理一次，避免过于频繁
         cnt++;
         if (cnt >= 10) {
             cnt = 0;
             LED_TOGGLE();
         }
-        vTaskDelay(pdMS_TO_TICKS(20));  // 增加延迟至20ms，进一步减少CPU占用
+        
+        // 等待任务通知或超时，实现更快的响应
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));  // 等待通知或10ms超时
     }
 }
 
@@ -1902,7 +1873,7 @@ void app_main(void)
     
     // 创建LVGL相关任务 - 增加栈大小
     xTaskCreate(lvgl_tick_task, "lvgl_tick", 3072, NULL, 4, NULL);  // 增加栈大小
-    xTaskCreate(lvgl_task, "lvgl", 6144, NULL, 3, NULL);           // 增加栈大小
+    xTaskCreate(lvgl_task, "lvgl", 6144, NULL, 3, &lvgl_task_handle);  // 增加栈大小并保存句柄
     
     // 创建电池监控任务 - 增加栈大小
     TaskHandle_t battery_task_handle = NULL;

@@ -33,7 +33,7 @@ static bool task_running = false;
 static ws2812_battery_config_t battery_config = {
     .battery_channel = WS2812_BATTERY_CHANNEL_DISABLED,
     .show_charging_effect = true,
-    .background_brightness = 5, // 默认背景亮度为5
+    .background_brightness = 10, // 默认背景亮度为10
 };
 static int current_battery_percentage = 50;
 static bool current_is_charging = false;

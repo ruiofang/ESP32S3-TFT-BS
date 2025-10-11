@@ -838,12 +838,12 @@ static void create_battery_ui(void)
     lv_obj_t *scr = lv_scr_act();
     lv_obj_set_style_bg_color(scr, lv_color_hex(0x000000), 0);  // 黑色背景
     
-    // 标题标签 - 居中显示
-    title_label = lv_label_create(scr);
-    lv_label_set_text(title_label, "BATTERY LEVEL");
-    lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), 0);
-    lv_obj_set_style_text_font(title_label, &lv_font_montserrat_18, 0);
-    lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 15);
+    // // 标题标签 - 居中显示
+    // title_label = lv_label_create(scr);
+    // lv_label_set_text(title_label, "BATTERY LEVEL");
+    // lv_obj_set_style_text_color(title_label, lv_color_hex(0xFFFFFF), 0);
+    // lv_obj_set_style_text_font(title_label, &lv_font_montserrat_18, 0);
+    // lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 15);
     
     // 创建电量条容器 - 简洁的白色边框
     lv_obj_t *battery_container = lv_obj_create(scr);
@@ -882,17 +882,17 @@ static void create_battery_ui(void)
     lv_obj_set_style_text_font(battery_label, &lv_font_montserrat_16, 0);
     lv_obj_align(battery_label, LV_ALIGN_CENTER, 0, -5);
     
-    // 信息标签 - 显示控制模式
-    info_label = lv_label_create(scr);
-    if (battery_display_override) {
-        lv_label_set_text_fmt(info_label, "JSON Mode | %d%%", initial_percentage);
-        lv_obj_set_style_text_color(info_label, lv_color_hex(0x00FF00), 0);  // 绿色表示外部控制
-    } else {
-        lv_label_set_text(info_label, "Auto Mode");
-        lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示自动模式
-    }
-    lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
-    lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -15);
+    // // 信息标签 - 显示控制模式
+    // info_label = lv_label_create(scr);
+    // if (battery_display_override) {
+    //     lv_label_set_text_fmt(info_label, "JSON Mode | %d%%", initial_percentage);
+    //     lv_obj_set_style_text_color(info_label, lv_color_hex(0x00FF00), 0);  // 绿色表示外部控制
+    // } else {
+    //     lv_label_set_text(info_label, "Auto Mode");
+    //     lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示自动模式
+    // }
+    // lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
+    // lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -15);
     
     ESP_LOGI(TAG, "Simplified battery UI created successfully (428x142) with %d%%", initial_percentage);
 }
@@ -979,52 +979,52 @@ static void update_battery_ui(void)
         lv_obj_invalidate(battery_label);
     }
     
-    if (info_label) {
-        // 根据控制指令区分显示模式信息
-        bool is_charging_display = charging_status_override && external_charging_status;
+    // if (info_label) {
+    //     // 根据控制指令区分显示模式信息
+    //     bool is_charging_display = charging_status_override && external_charging_status;
         
-        if (battery_display_override || charging_status_override) {
-            // 外部控制模式
-            char mode_text[128];
-            if (is_charging_display) {
-                // 充电显示模式
-                if (battery_display_override) {
-                    snprintf(mode_text, sizeof(mode_text), "Charging Mode | Level:%d%% | Anim:%s", 
-                            display_percentage, charging_animation_enabled ? "ON" : "OFF");
-                } else {
-                    snprintf(mode_text, sizeof(mode_text), "Charging Mode | Auto Level | Anim:%s", 
-                            charging_animation_enabled ? "ON" : "OFF");
-                }
-                lv_obj_set_style_text_color(info_label, lv_color_hex(0xFFAA00), 0);  // 橙色表示充电模式
-            } else {
-                // 普通显示模式
-                if (battery_display_override) {
-                    snprintf(mode_text, sizeof(mode_text), "Normal Mode | Level:%d%% | White Bar", display_percentage);
-                } else {
-                    snprintf(mode_text, sizeof(mode_text), "Normal Mode | Auto Level | White Bar");
-                }
-                lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示普通模式
-            }
-            lv_label_set_text(info_label, mode_text);
-        } else {
-            // 完全自动模式
-            if (effective_charging) {
-                if (display_percentage >= BATTERY_FULL_THRESHOLD) {
-                    lv_label_set_text(info_label, "Auto Mode | Battery Full | JSON Control Available");
-                    lv_obj_set_style_text_color(info_label, lv_color_hex(0x00AAFF), 0);  // 蓝色表示充满
-                } else {
-                    lv_label_set_text(info_label, "Auto Mode | Charging | JSON Control Available");
-                    lv_obj_set_style_text_color(info_label, lv_color_hex(0xFFAA00), 0);  // 橙色表示充电
-                }
-            } else {
-                lv_label_set_text(info_label, "Auto Mode | JSON Control Available");
-                lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示自动模式
-            }
-        }
+    //     if (battery_display_override || charging_status_override) {
+    //         // 外部控制模式
+    //         char mode_text[128];
+    //         if (is_charging_display) {
+    //             // 充电显示模式
+    //             if (battery_display_override) {
+    //                 snprintf(mode_text, sizeof(mode_text), "Charging Mode | Level:%d%% | Anim:%s", 
+    //                         display_percentage, charging_animation_enabled ? "ON" : "OFF");
+    //             } else {
+    //                 snprintf(mode_text, sizeof(mode_text), "Charging Mode | Auto Level | Anim:%s", 
+    //                         charging_animation_enabled ? "ON" : "OFF");
+    //             }
+    //             lv_obj_set_style_text_color(info_label, lv_color_hex(0xFFAA00), 0);  // 橙色表示充电模式
+    //         } else {
+    //             // 普通显示模式
+    //             if (battery_display_override) {
+    //                 snprintf(mode_text, sizeof(mode_text), "Normal Mode | Level:%d%% | White Bar", display_percentage);
+    //             } else {
+    //                 snprintf(mode_text, sizeof(mode_text), "Normal Mode | Auto Level | White Bar");
+    //             }
+    //             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示普通模式
+    //         }
+    //         lv_label_set_text(info_label, mode_text);
+    //     } else {
+    //         // 完全自动模式
+    //         if (effective_charging) {
+    //             if (display_percentage >= BATTERY_FULL_THRESHOLD) {
+    //                 lv_label_set_text(info_label, "Auto Mode | Battery Full | JSON Control Available");
+    //                 lv_obj_set_style_text_color(info_label, lv_color_hex(0x00AAFF), 0);  // 蓝色表示充满
+    //             } else {
+    //                 lv_label_set_text(info_label, "Auto Mode | Charging | JSON Control Available");
+    //                 lv_obj_set_style_text_color(info_label, lv_color_hex(0xFFAA00), 0);  // 橙色表示充电
+    //             }
+    //         } else {
+    //             lv_label_set_text(info_label, "Auto Mode | JSON Control Available");
+    //             lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示自动模式
+    //         }
+    //     }
         
-        // 强制重新绘制标签
-        lv_obj_invalidate(info_label);
-    }
+    //     // 强制重新绘制标签
+    //     lv_obj_invalidate(info_label);
+    // }
     
     // ESP_LOGI(TAG, "UI update completed");  // 减少日志输出
 }

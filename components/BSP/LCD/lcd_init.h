@@ -4,7 +4,7 @@
 #include "spi.h"
 
 /* 设置LCD显示方向 */
-#define USE_HORIZONTIAL 3 /* 0: 竖屏0； 1: 竖屏180；  2: 横屏90；  3: 横屏270； */
+#define USE_HORIZONTIAL 2 /* 0: 竖屏0； 1: 竖屏180；  2: 横屏90；  3: 横屏270； */
 
 /* 显示偏移量调整 - 横屏模式调整 */
 #if USE_HORIZONTIAL == 2 

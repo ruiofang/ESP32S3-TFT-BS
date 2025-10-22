@@ -5,7 +5,7 @@
 #include "esp_http_server.h"
 
 // WiFi 配置
-#define WIFI_SSID "ESP32_LightControl"
+#define WIFI_SSID "LightControl_01"
 #define WIFI_PASS "12345678"
 #define WIFI_CHANNEL 1
 #define WIFI_MAX_STA_CONN 4

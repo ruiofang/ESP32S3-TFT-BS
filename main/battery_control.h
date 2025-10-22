@@ -66,4 +66,22 @@ void restore_auto_battery_mode(void);
  */
 void restore_auto_charging_mode(void);
 
+/**
+ * @brief 获取电池详细信息 (RS485)
+ * @return JSON格式的电池详细信息字符串，使用后需要free释放
+ */
+char* get_battery_detailed_info(void);
+
+/**
+ * @brief 启用/禁用电池自动查询
+ * @param enable true启用，false禁用
+ */
+void set_battery_auto_query(bool enable);
+
+/**
+ * @brief 手动触发电池查询
+ * @return true查询成功，false查询失败
+ */
+bool trigger_battery_query(void);
+
 #endif // BATTERY_CONTROL_H

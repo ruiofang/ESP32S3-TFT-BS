@@ -1159,8 +1159,12 @@ static void update_battery_ui(void)
                 // 充满电时使用绿色
                 bar_color = lv_color_hex(0x00FF00);
             } else {
-                // 充电中使用蓝绿色
-                bar_color = lv_color_hex(0x00AAFF);
+                // 充电中可以选择以下颜色之一：
+                bar_color = lv_color_hex(0x00CED1);  // 深青色 - 科技感强
+                // bar_color = lv_color_hex(0x1E90FF);  // 道奇蓝 - 活力感
+                // bar_color = lv_color_hex(0x32CD32);  // 酸橙绿 - 充电活跃感
+                // bar_color = lv_color_hex(0xFF6B35);  // 活力橙 - 温暖充电感
+                // bar_color = lv_color_hex(0x00BFFF);  // 深天蓝 - 清新感
             }
         } else {
             // 普通电量显示模式 - 根据电量设置合适的颜色

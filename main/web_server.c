@@ -1194,11 +1194,11 @@ esp_err_t wifi_init_ap(void)
 
     wifi_config_t wifi_config = {
         .ap = {
-            .ssid = "ESP32_LightControl",
-            .ssid_len = strlen("ESP32_LightControl"),
-            .channel = 1,
-            .password = "12345678",
-            .max_connection = 4,
+            .ssid =  WIFI_SSID,
+            .ssid_len = strlen(WIFI_SSID),
+            .channel = WIFI_CHANNEL,
+            .password = WIFI_PASS,
+            .max_connection = WIFI_MAX_STA_CONN,
             .authmode = WIFI_AUTH_WPA_WPA2_PSK
         },
     };

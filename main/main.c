@@ -1,4 +1,3 @@
-
 #include "nvs_flash.h"
 #include "lvgl_demo.h"
 #include "esp_vfs.h"
@@ -17,10 +16,12 @@
 #include "esp_task_wdt.h"
 #include "lvgl.h"
 #include "Lib/cJSON/cJSON.h"
+#include "i2s_mic.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "battery_control.h"
 
 #define TAG "BATTERY_MONITOR"
 
@@ -35,8 +36,10 @@
 #define LCD_COLOR_BLACK   0x0000
 
 // 功能模式选择 (通过宏定义控制)
-#define ENABLE_RS485_BATTERY_QUERY  1  // 1=启用RS485电池查询, 0=禁用
+#define ENABLE_RS485_BATTERY_QUERY  0  // 1=启用RS485电池查询, 0=禁用
 #define ENABLE_JSON_PASSIVE_MODE    1  // 1=启用JSON被动控制, 0=禁用
+// 电池监控任务使能开关（为避免WDT问题可禁用）
+#define ENABLE_BATTERY_MONITOR_TASK 0  // 1=启用电池监控任务, 0=禁用
 
 // UART1 配置 (统一串口)
 #define UART1_TXD_PIN       16
@@ -74,7 +77,7 @@ static int g_battery_percentage = 50;   // 当前电池百分比
 static bool g_charging_status = false;  // 充电状态
 
 // RS485电池数据
-#if ENABLE_RS485_BATTERY_QUERY
+// #if ENABLE_RS485_BATTERY_QUERY
 typedef struct {
     float pack_voltage;      // 总电压 (V)
     float pack_current;      // 电流 (A), 正数充电，负数放电
@@ -92,7 +95,7 @@ typedef struct {
 
 static battery_data_t g_battery_data = {0};
 static bool g_battery_auto_query = true;  // 自动查询使能
-#endif
+// #endif
 
 // 外部控制状态
 static bool battery_display_override = false;  // 外部控制电量显示标志
@@ -1787,23 +1790,13 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
-    // 初始化WS2812
+    // 初始化WS2812灯带
     ESP_ERROR_CHECK(ws2812_init());
-    
-    // 从NVS加载电池显示状态
-    load_battery_state_from_nvs();
-    
-    // 初始化充电动画（如果处于充电状态）
-    ESP_LOGI(TAG, "Initializing charging animation system");
-    ESP_LOGI(TAG, "Charging animation enabled: %s", charging_animation_enabled ? "true" : "false");
-    ESP_LOGI(TAG, "Current charging status: %s", g_charging_status ? "charging" : "not charging");
-    
-    if (g_charging_status && charging_animation_enabled) {
-        ESP_LOGI(TAG, "Starting charging animation on initialization");
-        start_charging_animation();
-    }
-    
-    // 初始化Web服务器
+
+    // 初始化I2S麦克风
+    ESP_ERROR_CHECK(i2s_mic_init());
+
+    // 创建Web服务器任务
     httpd_handle_t web_server_handle = web_server_init();
     if (web_server_handle == NULL) {
         ESP_LOGE(TAG, "Failed to initialize web server");
@@ -1860,15 +1853,18 @@ void app_main(void)
     xTaskCreate(lvgl_tick_task, "lvgl_tick", 3072, NULL, 4, NULL);  // 增加栈大小
     xTaskCreate(lvgl_task, "lvgl", 6144, NULL, 3, &lvgl_task_handle);  // 增加栈大小并保存句柄
     
-    // 创建电池监控任务 - 增加栈大小
+    // 创建电池监控任务 - 可禁用以避免WDT问题
+#if ENABLE_BATTERY_MONITOR_TASK
     TaskHandle_t battery_task_handle = NULL;
     xTaskCreate(battery_monitor_task, "battery_monitor", 6144, NULL, 2, &battery_task_handle);  // 增加栈大小
-    
     // 将电池监控任务添加到watchdog监控中
     if (battery_task_handle != NULL) {
         esp_task_wdt_add(battery_task_handle);
         ESP_LOGI(TAG, "Battery monitor task added to watchdog");
     }
+#else
+    ESP_LOGW(TAG, "Battery monitor task disabled by config (ENABLE_BATTERY_MONITOR_TASK=0)");
+#endif
     
     // 创建UART命令处理任务（快速响应版）
     xTaskCreate(uart_command_task, "uart_command", 6144, NULL, 4, NULL);  // 提高优先级以实现快速响应

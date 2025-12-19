@@ -24,6 +24,7 @@ typedef enum {
     WS2812_MODE_WAVE,           // 波浪效果
     WS2812_MODE_AUTO_CYCLE,     // 自动循环模式
     WS2812_MODE_BATTERY,        // 电量显示模式
+    WS2812_MODE_MUSIC_RHYTHM,   // 音乐律动模式
     WS2812_MODE_MAX
 } ws2812_mode_t;
 

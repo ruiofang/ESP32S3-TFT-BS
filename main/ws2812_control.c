@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include "i2s_mic.h"
 
 static const char *TAG = "WS2812_CONTROL";
 
@@ -51,6 +52,10 @@ static ws2812_mode_t auto_cycle_modes[] = {
 };
 static const int auto_cycle_count = sizeof(auto_cycle_modes) / sizeof(auto_cycle_modes[0]);
 static int current_auto_mode_indices[WS2812_CHANNEL_COUNT] = {0};
+
+// 音乐律动模式相关变量
+static int32_t music_volume = 0;
+static uint32_t last_beat_time = 0;
 
 // HSV转RGB函数
 static rgb_color_t hsv_to_rgb(uint16_t h, uint8_t s, uint8_t v) {
@@ -100,6 +105,49 @@ static rgb_color_t apply_brightness(rgb_color_t color, uint8_t brightness) {
     result.g = (color.g * brightness) / 255;
     result.b = (color.b * brightness) / 255;
     return result;
+}
+
+// 音乐律动模式处理函数
+static void ws2812_handle_music_rhythm(int ch, int32_t volume) {
+    // 更新全局音量变量用于调试
+    music_volume = volume;
+    // ESP_LOGI(TAG, "Music Rhythm: Ch=%d, Vol=%ld", ch, (long)music_volume); // Debug log
+
+    // 简单的节奏检测
+    bool is_beat = false;
+    // 降低阈值，使颜色变化更灵敏
+    if (music_volume > 800) { 
+        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (current_time - last_beat_time > 150) { // 节拍间隔
+            is_beat = true;
+            last_beat_time = current_time;
+        }
+    }
+
+    // 根据音量和节拍控制灯光
+    // 增加一个放大系数，并保证一个最小亮度，使效果更灵敏
+    uint8_t brightness = (uint8_t)(music_volume * 10 / 100); // 增加灵敏度
+    if (brightness > channels[ch].config.brightness) {
+        brightness = channels[ch].config.brightness;
+    }
+    if (music_volume > 50 && brightness < 10) { // 如果有声音但计算出的亮度过低
+        brightness = 10; // 给一个最小亮度
+    }
+
+    if (is_beat) {
+        // 节拍时随机改变颜色 (使用HSV确保颜色鲜艳)
+        uint16_t hue = rand() % 360;
+        channels[ch].config.color = hsv_to_rgb(hue, 255, 255);
+    }
+
+    rgb_color_t color = apply_brightness(channels[ch].config.color, brightness);
+    for (int i = 0; i < channels[ch].led_count; i++) {
+        led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
+    }
+    // 音乐模式需要在处理函数内刷新显示
+    if (led_strips[ch]) {
+        led_strip_refresh(led_strips[ch]);
+    }
 }
 
 esp_err_t ws2812_init(void) {
@@ -598,6 +646,20 @@ void ws2812_task(void *pvParameters) {
     ESP_LOGI(TAG, "WS2812 multi-channel task started");
     
     while (task_running) {
+        // 检查是否有通道处于音乐律动模式
+        bool need_mic = false;
+        for (int i = 0; i < WS2812_CHANNEL_COUNT; i++) {
+            if (channels[i].enabled && channels[i].config.mode == WS2812_MODE_MUSIC_RHYTHM) {
+                need_mic = true;
+                break;
+            }
+        }
+        
+        int32_t current_volume = 0;
+        if (need_mic) {
+            current_volume = get_mic_volume();
+        }
+
         // 处理每个通道
         for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
             if (!led_strips[ch] || !channels[ch].enabled) {
@@ -753,7 +815,11 @@ void ws2812_task(void *pvParameters) {
                     }
                     counters[ch] = (counters[ch] + 10) % 360;
                     break;
-                    
+                
+                case WS2812_MODE_MUSIC_RHYTHM:
+                    ws2812_handle_music_rhythm(ch, current_volume);
+                    break;
+
                 case WS2812_MODE_BATTERY:
                     // 电量显示模式 - 只在命令刷新时更新显示
                     {
@@ -932,7 +998,11 @@ void ws2812_task(void *pvParameters) {
             }
             
             // 刷新LED显示
-            led_strip_refresh(led_strips[ch]);
+            if (effective_mode == WS2812_MODE_MUSIC_RHYTHM) {
+                // 音乐模式下，由其自己的处理函数刷新
+            } else {
+                led_strip_refresh(led_strips[ch]);
+            }
         }
         
         // 降低刷新频率以减少闪烁，特别是对电量显示模式
@@ -951,7 +1021,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     ESP_LOGI(TAG, "Processing JSON command: %s", json_command);
     
     // 重置看门狗以防止JSON处理超时
-    esp_task_wdt_reset();
+    // esp_task_wdt_reset();
     
     cJSON *json = cJSON_Parse(json_command);
     if (json == NULL) {
@@ -959,7 +1029,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         return ESP_ERR_INVALID_ARG;
     }
     
-    esp_task_wdt_reset(); // JSON解析后重置
+    // esp_task_wdt_reset(); // JSON解析后重置
     
     esp_err_t ret = ESP_OK;
     
@@ -969,14 +1039,14 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         if (strcmp(action->valuestring, "status") == 0) {
             // 返回所有通道状态
             ESP_LOGI(TAG, "=== WS2812 Multi-Channel Status ===");
-            esp_task_wdt_reset();
+            // esp_task_wdt_reset();
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
                 ws2812_channel_t config = ws2812_get_channel_config(ch);
                 ESP_LOGI(TAG, "Channel %d (GPIO %d): %s, Mode:%d, RGB(%d,%d,%d), Brightness:%d, Speed:%ld", 
                          ch, ws2812_gpio_pins[ch], config.enabled ? "Enabled" : "Disabled",
                          config.config.mode, config.config.color.r, config.config.color.g, 
                          config.config.color.b, config.config.brightness, config.config.speed);
-                esp_task_wdt_reset(); // 每次循环重置看门狗
+                // esp_task_wdt_reset(); // 每次循环重置看门狗
             }
             cJSON_Delete(json);
             return ESP_OK;
@@ -988,7 +1058,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         }
     }
     
-    esp_task_wdt_reset(); // 命令处理前重置
+    // esp_task_wdt_reset(); // 命令处理前重置
     
     // 首先检查所有的JSON字段
     cJSON *battery_display_json = cJSON_GetObjectItem(json, "battery_display");
@@ -1030,7 +1100,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         }
         int mode = mode_json->valueint;
         if (mode >= 0 && mode < WS2812_MODE_MAX) {
-            esp_task_wdt_reset(); // 模式设置前重置看门狗
+            // esp_task_wdt_reset(); // 模式设置前重置看门狗
             ret = ws2812_set_mode(channel_id, (ws2812_mode_t)mode);
             if (ret != ESP_OK) goto cleanup;
         } else {
@@ -1047,7 +1117,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // 颜色处理前重置看门狗
+        // esp_task_wdt_reset(); // 颜色处理前重置看门狗
         cJSON *r_json = cJSON_GetObjectItem(color_json, "r");
         cJSON *g_json = cJSON_GetObjectItem(color_json, "g");
         cJSON *b_json = cJSON_GetObjectItem(color_json, "b");
@@ -1060,7 +1130,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             
             if (r >= 0 && r <= 255 && g >= 0 && g <= 255 && b >= 0 && b <= 255) {
                 ret = ws2812_set_color(channel_id, (uint8_t)r, (uint8_t)g, (uint8_t)b);
-                esp_task_wdt_reset(); // 颜色设置后重置看门狗
+                // esp_task_wdt_reset(); // 颜色设置后重置看门狗
                 if (ret != ESP_OK) goto cleanup;
             } else {
                 ESP_LOGE(TAG, "Invalid color values: RGB(%d,%d,%d)", r, g, b);
@@ -1077,11 +1147,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // 亮度处理前重置看门狗
+        // esp_task_wdt_reset(); // 亮度处理前重置看门狗
         int brightness = brightness_json->valueint;
         if (brightness >= 0 && brightness <= 255) {
             ret = ws2812_set_brightness(channel_id, (uint8_t)brightness);
-            esp_task_wdt_reset(); // 亮度设置后重置看门狗
+            // esp_task_wdt_reset(); // 亮度设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid brightness: %d", brightness);
@@ -1097,11 +1167,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // 速度处理前重置看门狗
+        // esp_task_wdt_reset(); // 速度处理前重置看门狗
         int speed = speed_json->valueint;
         if (speed >= 1 && speed <= 10000) {
             ret = ws2812_set_speed(channel_id, (uint32_t)speed);
-            esp_task_wdt_reset(); // 速度设置后重置看门狗
+            // esp_task_wdt_reset(); // 速度设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid speed: %d", speed);
@@ -1117,10 +1187,10 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // 启用/禁用处理前重置看门狗
+        // esp_task_wdt_reset(); // 启用/禁用处理前重置看门狗
         bool enabled = cJSON_IsTrue(enabled_json);
         ret = ws2812_set_channel_enabled(channel_id, enabled);
-        esp_task_wdt_reset(); // 启用/禁用设置后重置看门狗
+        // esp_task_wdt_reset(); // 启用/禁用设置后重置看门狗
         if (ret != ESP_OK) goto cleanup;
     }
     
@@ -1131,11 +1201,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // 循环持续时间处理前重置看门狗
+        // esp_task_wdt_reset(); // 循环持续时间处理前重置看门狗
         int duration = cycle_duration_json->valueint;
         if (duration >= 1000 && duration <= 60000) {
             ret = ws2812_set_cycle_duration(channel_id, (uint32_t)duration);
-            esp_task_wdt_reset(); // 循环持续时间设置后重置看门狗
+            // esp_task_wdt_reset(); // 循环持续时间设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid cycle duration: %d", duration);
@@ -1152,11 +1222,11 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // LED数量处理前重置看门狗
+        // esp_task_wdt_reset(); // LED数量处理前重置看门狗
         int led_count = led_count_json->valueint;
         if (led_count >= 1 && led_count <= WS2812_MAX_LED_COUNT) {
             ret = ws2812_set_led_count(channel_id, (uint16_t)led_count);
-            esp_task_wdt_reset(); // LED数量设置后重置看门狗
+            // esp_task_wdt_reset(); // LED数量设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         } else {
             ESP_LOGE(TAG, "Invalid LED count: %d", led_count);
@@ -1173,7 +1243,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             ret = ESP_ERR_INVALID_ARG;
             goto cleanup;
         }
-        esp_task_wdt_reset(); // 电量模式处理前重置看门狗
+        // esp_task_wdt_reset(); // 电量模式处理前重置看门狗
         
         bool enable_battery_mode = cJSON_IsTrue(channel_battery_mode_json);
         uint8_t bg_brightness = 10;  // 默认背景亮度
@@ -1188,7 +1258,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         }
         
         ret = ws2812_set_channel_battery_mode(channel_id, enable_battery_mode, bg_brightness);
-        esp_task_wdt_reset(); // 电量模式设置后重置看门狗
+        // esp_task_wdt_reset(); // 电量模式设置后重置看门狗
         if (ret != ESP_OK) goto cleanup;
         
         ESP_LOGI(TAG, "Channel %d battery mode set to: %s, bg_brightness=%d", 
@@ -1197,7 +1267,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     
     // 简化电量显示通道配置（与LCD兼容）
     if (battery_channel_json && cJSON_IsNumber(battery_channel_json)) {
-        esp_task_wdt_reset();
+        // esp_task_wdt_reset();
         int ch = battery_channel_json->valueint;
         uint8_t battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
         
@@ -1209,7 +1279,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         
         // 使用默认设置：启用充电动画，背景亮度20
         ret = ws2812_set_battery_display(battery_channel, true, 10);
-        esp_task_wdt_reset();
+        // esp_task_wdt_reset();
         if (ret != ESP_OK) goto cleanup;
         
         ESP_LOGI(TAG, "Battery display channel set to: %d", battery_channel);
@@ -1218,7 +1288,7 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
     // 原有的详细电量显示配置（向后兼容）
     // battery_display_json already defined above
     if (battery_display_json && cJSON_IsObject(battery_display_json)) {
-        esp_task_wdt_reset(); // 电量显示处理前重置看门狗
+        // esp_task_wdt_reset(); // 电量显示处理前重置看门狗
         
         cJSON *battery_channel_json = cJSON_GetObjectItem(battery_display_json, "channel");
         cJSON *show_charging_json = cJSON_GetObjectItem(battery_display_json, "show_charging_effect");
@@ -1249,14 +1319,14 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         }
         
         ret = ws2812_set_battery_display(battery_channel, show_charging_effect, background_brightness);
-        esp_task_wdt_reset(); // 电量显示设置后重置看门狗
+        // esp_task_wdt_reset(); // 电量显示设置后重置看门狗
         if (ret != ESP_OK) goto cleanup;
     }
     
     // 电量状态更新
     // battery_status_json already defined above
     if (battery_status_json && cJSON_IsObject(battery_status_json)) {
-        esp_task_wdt_reset(); // 电量状态处理前重置看门狗
+        // esp_task_wdt_reset(); // 电量状态处理前重置看门狗
         
         cJSON *percentage_json = cJSON_GetObjectItem(battery_status_json, "percentage");
         cJSON *charging_json = cJSON_GetObjectItem(battery_status_json, "charging");
@@ -1270,13 +1340,13 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             }
             
             ret = ws2812_update_battery_display(percentage, is_charging);
-            esp_task_wdt_reset(); // 电量状态设置后重置看门狗
+            // esp_task_wdt_reset(); // 电量状态设置后重置看门狗
             if (ret != ESP_OK) goto cleanup;
         }
     }
     
 cleanup:
-    esp_task_wdt_reset(); // 函数结束前最后一次重置看门狗
+    // esp_task_wdt_reset(); // 函数结束前最后一次重置看门狗
     cJSON_Delete(json);
     return ret;
 }

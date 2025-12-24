@@ -77,7 +77,6 @@ static int g_battery_percentage = 50;   // 当前电池百分比
 static bool g_charging_status = false;  // 充电状态
 
 // RS485电池数据
-// #if ENABLE_RS485_BATTERY_QUERY
 typedef struct {
     float pack_voltage;      // 总电压 (V)
     float pack_current;      // 电流 (A), 正数充电，负数放电
@@ -95,7 +94,7 @@ typedef struct {
 
 static battery_data_t g_battery_data = {0};
 static bool g_battery_auto_query = true;  // 自动查询使能
-// #endif
+
 
 // 外部控制状态
 static bool battery_display_override = false;  // 外部控制电量显示标志

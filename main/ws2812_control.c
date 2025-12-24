@@ -29,6 +29,9 @@ static led_strip_handle_t led_strips[WS2812_CHANNEL_COUNT] = {NULL};
 static ws2812_channel_t channels[WS2812_CHANNEL_COUNT];
 static SemaphoreHandle_t ws2812_mutex = NULL;
 static bool task_running = false;
+// 广播主色/亮度：当对所有通道设置相同模式/颜色/亮度时，保持广播一致性
+static rgb_color_t broadcast_master_color = {255, 255, 255};
+static uint8_t broadcast_master_brightness = 180;
 
 // 电量显示相关变量
 static ws2812_battery_config_t battery_config = {
@@ -107,42 +110,11 @@ static rgb_color_t apply_brightness(rgb_color_t color, uint8_t brightness) {
     return result;
 }
 
-// 音乐律动模式处理函数
-static void ws2812_handle_music_rhythm(int ch, int32_t volume) {
-    // 更新全局音量变量用于调试
-    music_volume = volume;
-    // ESP_LOGI(TAG, "Music Rhythm: Ch=%d, Vol=%ld", ch, (long)music_volume); // Debug log
-
-    // 简单的节奏检测
-    bool is_beat = false;
-    // 降低阈值，使颜色变化更灵敏
-    if (music_volume > 800) { 
-        uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-        if (current_time - last_beat_time > 150) { // 节拍间隔
-            is_beat = true;
-            last_beat_time = current_time;
-        }
-    }
-
-    // 根据音量和节拍控制灯光
-    // 增加一个放大系数，并保证一个最小亮度，使效果更灵敏
-    uint8_t brightness = (uint8_t)(music_volume * 10 / 100); // 增加灵敏度
-    if (brightness > channels[ch].config.brightness) {
-        brightness = channels[ch].config.brightness;
-    }
-    if (music_volume > 50 && brightness < 10) { // 如果有声音但计算出的亮度过低
-        brightness = 10; // 给一个最小亮度
-    }
-
-    if (is_beat) {
-        // 节拍时随机改变颜色 (使用HSV确保颜色鲜艳)
-        uint16_t hue = rand() % 360;
-        channels[ch].config.color = hsv_to_rgb(hue, 255, 255);
-    }
-
-    rgb_color_t color = apply_brightness(channels[ch].config.color, brightness);
+// 音乐律动模式应用函数
+static void ws2812_apply_music_rhythm(int ch, rgb_color_t color, uint8_t brightness) {
+    rgb_color_t final_color = apply_brightness(color, brightness);
     for (int i = 0; i < channels[ch].led_count; i++) {
-        led_strip_set_pixel(led_strips[ch], i, color.r, color.g, color.b);
+        led_strip_set_pixel(led_strips[ch], i, final_color.r, final_color.g, final_color.b);
     }
     // 音乐模式需要在处理函数内刷新显示
     if (led_strips[ch]) {
@@ -641,6 +613,7 @@ void ws2812_task(void *pvParameters) {
     static uint32_t counters[WS2812_CHANNEL_COUNT] = {0};
     static int directions[WS2812_CHANNEL_COUNT] = {1, 1, 1, 1};
     static uint32_t breath_values[WS2812_CHANNEL_COUNT] = {0};
+    static rgb_color_t rhythm_color = {255, 255, 255}; // 保持律动颜色
     
     task_running = true;
     ESP_LOGI(TAG, "WS2812 multi-channel task started");
@@ -656,8 +629,31 @@ void ws2812_task(void *pvParameters) {
         }
         
         int32_t current_volume = 0;
+        bool is_beat = false;
+        
         if (need_mic) {
             current_volume = get_mic_volume();
+            music_volume = current_volume; // Update global debug var
+            
+            // Global beat detection
+            if (current_volume > 800) { 
+                uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                if (current_time - last_beat_time > 150) { // 节拍间隔
+                    is_beat = true;
+                    last_beat_time = current_time;
+                }
+            }
+            
+            if (is_beat) {
+                uint16_t hue = rand() % 360;
+                rhythm_color = hsv_to_rgb(hue, 255, 255);
+            }
+        }
+        
+        // Calculate base brightness from volume
+        uint8_t base_brightness = (uint8_t)(current_volume * 10 / 100);
+        if (current_volume > 50 && base_brightness < 10) {
+            base_brightness = 10;
         }
 
         // 处理每个通道
@@ -817,7 +813,18 @@ void ws2812_task(void *pvParameters) {
                     break;
                 
                 case WS2812_MODE_MUSIC_RHYTHM:
-                    ws2812_handle_music_rhythm(ch, current_volume);
+                    {
+                        if (is_beat) {
+                            channels[ch].config.color = rhythm_color;
+                        }
+                        
+                        uint8_t ch_brightness = base_brightness;
+                        if (ch_brightness > channels[ch].config.brightness) {
+                            ch_brightness = channels[ch].config.brightness;
+                        }
+                        
+                        ws2812_apply_music_rhythm(ch, rhythm_color, ch_brightness);
+                    }
                     break;
 
                 case WS2812_MODE_BATTERY:

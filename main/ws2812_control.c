@@ -415,6 +415,33 @@ esp_err_t ws2812_set_channel_enabled(uint8_t channel_id, bool enabled) {
     return ESP_ERR_TIMEOUT;
 }
 
+esp_err_t ws2812_set_cycle_duration(uint8_t channel_id, uint32_t duration) {
+    if (channel_id != WS2812_BROADCAST_ID && channel_id >= WS2812_CHANNEL_COUNT) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (duration < 1000 || duration > 60000) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    
+    if (channel_id == WS2812_BROADCAST_ID) {
+        for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+            auto_cycle_durations[ch] = duration;
+        }
+    } else {
+        auto_cycle_durations[channel_id] = duration;
+    }
+    
+    return ESP_OK;
+}
+
+uint32_t ws2812_get_cycle_duration(uint8_t channel_id) {
+    if (channel_id >= WS2812_CHANNEL_COUNT) {
+        return 8000; // Default value
+    }
+    return auto_cycle_durations[channel_id];
+}
+
 ws2812_channel_t ws2812_get_channel_config(uint8_t channel_id) {
     ws2812_channel_t config = {0};
     if (channel_id < WS2812_CHANNEL_COUNT) {
@@ -436,40 +463,6 @@ esp_err_t ws2812_get_all_configs(ws2812_channel_t configs[WS2812_CHANNEL_COUNT])
             configs[ch] = channels[ch];
         }
         xSemaphoreGive(ws2812_mutex);
-        return ESP_OK;
-    }
-    return ESP_ERR_TIMEOUT;
-}
-
-esp_err_t ws2812_set_cycle_duration(uint8_t channel_id, uint32_t duration) {
-    if (duration < 1000) duration = 1000;   // 最小1秒
-    if (duration > 60000) duration = 60000; // 最大60秒
-    
-    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
-        if (channel_id == WS2812_BROADCAST_ID) {
-            // 广播到所有通道
-            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
-                auto_cycle_durations[ch] = duration;
-                auto_cycle_timers[ch] = 0; // 重置计时器
-            }
-            ESP_LOGI(TAG, "Auto-cycle duration set to %ld ms for all channels", duration);
-        } else if (channel_id < WS2812_CHANNEL_COUNT) {
-            // 设置指定通道
-            auto_cycle_durations[channel_id] = duration;
-            auto_cycle_timers[channel_id] = 0; // 重置计时器
-            ESP_LOGI(TAG, "Auto-cycle duration set to %ld ms for channel %d", duration, channel_id);
-        } else {
-            xSemaphoreGive(ws2812_mutex);
-            return ESP_ERR_INVALID_ARG;
-        }
-        xSemaphoreGive(ws2812_mutex);
-        
-        // 自动保存配置
-        esp_err_t save_ret = ws2812_save_config();
-        if (save_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to save config after cycle duration change: %s", esp_err_to_name(save_ret));
-        }
-        
         return ESP_OK;
     }
     return ESP_ERR_TIMEOUT;
@@ -671,7 +664,8 @@ void ws2812_task(void *pvParameters) {
             // Global beat detection
             if (current_volume > 800) { 
                 uint32_t current_time = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                if (current_time - last_beat_time > 150) { // 节拍间隔
+                if (current_time - last_beat_time > 150) // 节拍间隔
+                {
                     is_beat = true;
                     last_beat_time = current_time;
                 }
@@ -1090,6 +1084,21 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
             }
             cJSON_Delete(json);
             return ESP_OK;
+        } else if (strcmp(action->valuestring, "save_config") == 0) {
+            ESP_LOGI(TAG, "Executing save_config command");
+            esp_err_t err = ws2812_save_config();
+            cJSON_Delete(json);
+            return err;
+        } else if (strcmp(action->valuestring, "load_config") == 0) {
+            ESP_LOGI(TAG, "Executing load_config command");
+            esp_err_t err = ws2812_load_config();
+            cJSON_Delete(json);
+            return err;
+        } else if (strcmp(action->valuestring, "test_all_channels") == 0) {
+            ESP_LOGI(TAG, "Executing test_all_channels command");
+            esp_err_t err = ws2812_test_all_channels();
+            cJSON_Delete(json);
+            return err;
         } else if (strcmp(action->valuestring, "ws2812_control") != 0) {
             // 不是WS2812控制命令，直接返回错误
             ESP_LOGE(TAG, "Invalid action: %s", action->valuestring);
@@ -1640,6 +1649,7 @@ esp_err_t ws2812_reset_config(void) {
             channels[ch].config.color = (rgb_color_t){255, 255, 255};
             channels[ch].config.speed = 150;
             channels[ch].config.brightness = 180;
+
             
             // 重置自动循环相关参数
             auto_cycle_durations[ch] = 8000;

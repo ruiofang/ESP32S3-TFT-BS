@@ -43,6 +43,7 @@ static const char* complete_html_page =
 ".advanced-section { background: #f0f0f0; }"
 ".status-info { background: #d4edda; border-left: 4px solid #28a745; padding: 10px; margin: 10px 0; }"
 "input[type=number] { padding: 8px; border-radius: 5px; border: 1px solid #ccc; width: 80px; }"
+".number-input { width: 60px; margin-left: 5px; }"
 ".small-button { padding: 5px 10px; font-size: 12px; margin-left: 5px; }"
 ".config-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }"
 "@media (max-width: 600px) { .config-grid { grid-template-columns: 1fr; } }"
@@ -70,24 +71,29 @@ static const char* complete_html_page =
 "</select>"
 "</div>"
 "<div class='control-row'>"
+"<span class='control-label'>红色(R):</span>"
 "<input type='range' id='broadcast-r' min='0' max='255' value='255'>"
-"<span class='range-value' id='broadcast-r-val'>255</span>R"
+"<input type='number' id='broadcast-r-num' class='number-input' min='0' max='255' value='255'>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>绿色(G):</span>"
 "<input type='range' id='broadcast-g' min='0' max='255' value='255'>"
-"<span class='range-value' id='broadcast-g-val'>255</span>G"
+"<input type='number' id='broadcast-g-num' class='number-input' min='0' max='255' value='255'>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>蓝色(B):</span>"
 "<input type='range' id='broadcast-b' min='0' max='255' value='255'>"
-"<span class='range-value' id='broadcast-b-val'>255</span>B"
-"<span class='control-label'>颜色:</span>"
+"<input type='number' id='broadcast-b-num' class='number-input' min='0' max='255' value='255'>"
+"<span class='control-label'>预览:</span>"
 "<div class='color-preview' id='broadcast-color'></div>"
 "</div>"
 "<div class='control-row'>"
 "<span class='control-label'>亮度:</span>"
 "<input type='range' id='broadcast-brightness' min='0' max='255' value='128'>"
-"<span class='range-value' id='broadcast-brightness-val'>128</span>"
-"</div>"
-"<div class='control-row'>"
-"<span class='control-label'>速度:</span>"
+"<input type='number' id='broadcast-brightness-num' class='number-input' min='0' max='255' value='128'>"
+"<span class='control-label' style='margin-left: 20px;'>速度:</span>"
 "<input type='range' id='broadcast-speed' min='10' max='2000' value='100'>"
-"<span class='range-value' id='broadcast-speed-val'>100</span>ms"
+"<input type='number' id='broadcast-speed-num' class='number-input' min='10' max='2000' value='100'>ms"
 "</div>"
 "<button onclick='applyBroadcast()'>应用到所有通道</button>"
 "</div>"
@@ -123,35 +129,38 @@ static const char* complete_html_page =
 "</select>"
 "</div>"
 "<div class='control-row'>"
+"<span class='control-label'>红色(R):</span>"
 "<input type='range' id='channel-r' min='0' max='255' value='255'>"
-"<span class='range-value' id='channel-r-val'>255</span>R"
+"<input type='number' id='channel-r-num' class='number-input' min='0' max='255' value='255'>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>绿色(G):</span>"
 "<input type='range' id='channel-g' min='0' max='255' value='255'>"
-"<span class='range-value' id='channel-g-val'>255</span>G"
+"<input type='number' id='channel-g-num' class='number-input' min='0' max='255' value='255'>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>蓝色(B):</span>"
 "<input type='range' id='channel-b' min='0' max='255' value='255'>"
-"<span class='range-value' id='channel-b-val'>255</span>B"
-"<span class='control-label'>颜色:</span>"
+"<input type='number' id='channel-b-num' class='number-input' min='0' max='255' value='255'>"
+"<span class='control-label'>预览:</span>"
 "<div class='color-preview' id='channel-color'></div>"
 "</div>"
 "</div>"
 "<div class='control-row'>"
 "<span class='control-label'>亮度:</span>"
 "<input type='range' id='channel-brightness' min='0' max='255' value='128'>"
-"<span class='range-value' id='channel-brightness-val'>128</span>"
-"</div>"
-"<div class='control-row'>"
-"<span class='control-label'>速度:</span>"
+"<input type='number' id='channel-brightness-num' class='number-input' min='0' max='255' value='128'>"
+"<span class='control-label' style='margin-left: 20px;'>速度:</span>"
 "<input type='range' id='channel-speed' min='10' max='2000' value='100'>"
-"<span class='range-value' id='channel-speed-val'>100</span>ms"
+"<input type='number' id='channel-speed-num' class='number-input' min='10' max='2000' value='100'>ms"
 "</div>"
 "<div class='control-row'>"
 "<span class='control-label'>LED数量:</span>"
 "<input type='range' id='channel-led-count' min='1' max='300' value='60'>"
-"<span class='range-value' id='channel-led-count-val'>60</span>"
-"</div>"
-"<div class='control-row'>"
-"<span class='control-label'>循环持续时间:</span>"
+"<input type='number' id='channel-led-count-num' class='number-input' min='1' max='300' value='60'>"
+"<span class='control-label' style='margin-left: 20px;'>循环时间:</span>"
 "<input type='range' id='channel-cycle-duration' min='1000' max='60000' value='8000'>"
-"<span class='range-value' id='channel-cycle-duration-val'>8000</span>ms"
+"<input type='number' id='channel-cycle-duration-num' class='number-input' min='1000' max='60000' value='8000'>ms"
 "</div>"
 "<button onclick='applyChannel()'>应用到选中通道</button>"
 "</div>"
@@ -171,7 +180,7 @@ static const char* complete_html_page =
 "<div class='control-row'>"
 "<span class='control-label'>背景亮度:</span>"
 "<input type='range' id='battery-bg-brightness' min='0' max='255' value='20'>"
-"<span class='range-value' id='battery-bg-brightness-val'>20</span>"
+"<input type='number' id='battery-bg-brightness-num' class='number-input' min='0' max='255' value='20'>"
 "<button onclick='setBatteryDisplay()'>应用显示配置</button>"
 "</div>"
 "</div>"
@@ -191,7 +200,7 @@ static const char* complete_html_page =
 "<div class='control-row'>"
 "<span class='control-label'>电量设置:</span>"
 "<input type='range' id='battery-level' min='0' max='100' value='50'>"
-"<span class='range-value' id='battery-level-val'>50</span>%"
+"<input type='number' id='battery-level-num' class='number-input' min='0' max='100' value='50'>%"
 "<button onclick='setBatteryLevel()'>设置电量</button>"
 "</div>"
 "<div class='control-row'>"
@@ -221,10 +230,18 @@ static const char* complete_html_page =
 
 "</div>"
 "<script>"
-"function updateSliderValue(sliderId, valueId, suffix='') {"
+"function updateSliderValue(sliderId) {"
 "  const slider = document.getElementById(sliderId);"
-"  const valueSpan = document.getElementById(valueId);"
-"  valueSpan.textContent = slider.value + suffix;"
+"  const number = document.getElementById(sliderId + '-num');"
+"  if (number) number.value = slider.value;"
+"  if (sliderId.includes('-r') || sliderId.includes('-g') || sliderId.includes('-b')) {"
+"    updateColorPreview(sliderId.split('-')[0]);"
+"  }"
+"}"
+"function updateNumberValue(sliderId) {"
+"  const slider = document.getElementById(sliderId);"
+"  const number = document.getElementById(sliderId + '-num');"
+"  if (slider) slider.value = number.value;"
 "  if (sliderId.includes('-r') || sliderId.includes('-g') || sliderId.includes('-b')) {"
 "    updateColorPreview(sliderId.split('-')[0]);"
 "  }"
@@ -375,6 +392,40 @@ static const char* complete_html_page =
 "}"
 "function loadChannelConfig() {"
 "  console.log('Loading channel config...');"
+"  var channelId = parseInt(document.getElementById('channel-select').value);"
+"  document.getElementById('status').innerHTML = '状态: 🔄 获取通道配置中...';"
+"  fetch('/api/status', { method: 'GET' })"
+"  .then(function(response) { return response.json(); })"
+"  .then(function(data) {"
+"    if (data.channels) {"
+"      var channel = data.channels.find(function(c) { return c.id === channelId; });"
+"      if (channel) {"
+"        document.getElementById('channel-enabled').checked = channel.enabled;"
+"        document.getElementById('channel-mode').value = channel.mode;"
+"        updateInputPair('channel-r', channel.color.r);"
+"        updateInputPair('channel-g', channel.color.g);"
+"        updateInputPair('channel-b', channel.color.b);"
+"        updateInputPair('channel-brightness', channel.brightness);"
+"        updateInputPair('channel-speed', channel.speed);"
+"        updateInputPair('channel-led-count', channel.led_count);"
+"        updateInputPair('channel-cycle-duration', channel.cycle_duration);"
+"        updateColorPreview('channel');"
+"        document.getElementById('status').innerHTML = '状态: ✅ 通道配置加载成功';"
+"      }"
+"    }"
+"  })"
+"  .catch(function(error) {"
+"    console.error('Error loading config:', error);"
+"    document.getElementById('status').innerHTML = '状态: ❌ 加载配置失败';"
+"  });"
+"}"
+"function updateInputPair(id, value) {"
+"  var slider = document.getElementById(id);"
+"  var number = document.getElementById(id + '-num');"
+"  if (slider && number) {"
+"    slider.value = value;"
+"    number.value = value;"
+"  }"
 "}"
 "function getBatteryStatus() {"
 "  console.log('Getting battery status...');"
@@ -518,16 +569,11 @@ static const char* complete_html_page =
 "  for(var i = 0; i < sliders.length; i++) {"
 "    var id = sliders[i];"
 "    var slider = document.getElementById(id);"
-"    if (slider) {"
-"      var valueId = id + '-val';"
-"      var suffix = id.includes('speed') ? 'ms' : '';"
-"      console.log('Initializing slider:', id, 'with value:', slider.value);"
-"      slider.oninput = (function(sid, vid, suf) {"
-"        return function() { updateSliderValue(sid, vid, suf); };"
-"      })(id, valueId, suffix);"
-"      updateSliderValue(id, valueId, suffix);"
-"    } else {"
-"      console.error('Slider not found:', id);"
+"    var number = document.getElementById(id + '-num');"
+"    if (slider && number) {"
+"      slider.oninput = (function(sid) { return function() { updateSliderValue(sid); }; })(id);"
+"      number.oninput = (function(sid) { return function() { updateNumberValue(sid); }; })(id);"
+"      updateSliderValue(id);"
 "    }"
 "  }"
 "  updateColorPreview('broadcast');"
@@ -961,22 +1007,36 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     // 获取系统状态信息
     cJSON *status = cJSON_CreateObject();
     
-    // 电池信息
-    cJSON *battery_info = cJSON_CreateObject();
-    cJSON_AddNumberToObject(battery_info, "voltage", get_battery_voltage());
-    cJSON_AddNumberToObject(battery_info, "percentage", get_battery_percentage());
-    cJSON_AddBoolToObject(battery_info, "charging", is_charging());
-    cJSON_AddItemToObject(status, "battery", battery_info);
+    // 电池信息 - 直接添加到根对象以匹配前端JS期望
+    cJSON_AddNumberToObject(status, "voltage", get_battery_voltage());
+    cJSON_AddNumberToObject(status, "battery_percentage", get_battery_percentage());
+    cJSON_AddBoolToObject(status, "is_charging", is_charging());
     
     // WS2812通道状态
     cJSON *channels = cJSON_CreateArray();
     for (int i = 0; i < 4; i++) {
         cJSON *channel = cJSON_CreateObject();
+        ws2812_channel_t config = ws2812_get_channel_config(i);
+        uint32_t cycle_duration = ws2812_get_cycle_duration(i);
+
         cJSON_AddNumberToObject(channel, "id", i);
-        cJSON_AddBoolToObject(channel, "enabled", true);  // 简化处理
+        cJSON_AddBoolToObject(channel, "enabled", config.enabled);
+        cJSON_AddNumberToObject(channel, "mode", config.config.mode);
+        cJSON_AddNumberToObject(channel, "led_count", config.led_count);
+        cJSON_AddNumberToObject(channel, "cycle_duration", cycle_duration);
+        
+        cJSON *color = cJSON_CreateObject();
+        cJSON_AddNumberToObject(color, "r", config.config.color.r);
+        cJSON_AddNumberToObject(color, "g", config.config.color.g);
+        cJSON_AddNumberToObject(color, "b", config.config.color.b);
+        cJSON_AddItemToObject(channel, "color", color);
+        
+        cJSON_AddNumberToObject(channel, "brightness", config.config.brightness);
+        cJSON_AddNumberToObject(channel, "speed", config.config.speed);
+
         cJSON_AddItemToArray(channels, channel);
     }
-    cJSON_AddItemToObject(status, "ws2812_channels", channels);
+    cJSON_AddItemToObject(status, "channels", channels);
     
     // 电量显示配置
     ws2812_battery_config_t battery_config = ws2812_get_battery_config();

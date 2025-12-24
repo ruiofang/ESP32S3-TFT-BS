@@ -115,6 +115,13 @@ esp_err_t ws2812_set_channel_enabled(uint8_t channel_id, bool enabled);
 esp_err_t ws2812_set_cycle_duration(uint8_t channel_id, uint32_t duration);
 
 /**
+ * @brief 获取指定通道的自动循环模式持续时间
+ * @param channel_id 通道ID (0-3)
+ * @return 持续时间，单位ms
+ */
+uint32_t ws2812_get_cycle_duration(uint8_t channel_id);
+
+/**
  * @brief 获取指定通道的当前配置
  * @param channel_id 通道ID (0-3)
  * @return 指定通道的WS2812配置，如果通道无效返回默认配置

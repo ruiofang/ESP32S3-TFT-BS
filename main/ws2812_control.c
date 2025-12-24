@@ -225,14 +225,27 @@ esp_err_t ws2812_set_mode(uint8_t channel_id, ws2812_mode_t mode) {
     
     if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (channel_id == WS2812_BROADCAST_ID) {
-            // 广播到所有通道
+            // 广播到所有通道 — 同步主色与亮度
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
                 channels[ch].config.mode = mode;
+                channels[ch].config.color = broadcast_master_color;
+                channels[ch].config.brightness = broadcast_master_brightness;
             }
-            ESP_LOGI(TAG, "Mode set to %d for all channels", mode);
+            ESP_LOGI(TAG, "Mode set to %d for all channels (broadcast)", mode);
         } else if (channel_id < WS2812_CHANNEL_COUNT) {
             // 设置指定通道
             channels[channel_id].config.mode = mode;
+
+            // 如果多个通道使用相同模式，尝试与它们同步颜色/亮度
+            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                if (ch == channel_id) continue;
+                if (channels[ch].config.mode == mode) {
+                    // 同步色/亮度到新设置的通道，优先使用已有通道的色/亮度
+                    channels[channel_id].config.color = channels[ch].config.color;
+                    channels[channel_id].config.brightness = channels[ch].config.brightness;
+                    break;
+                }
+            }
             ESP_LOGI(TAG, "Mode set to %d for channel %d", mode, channel_id);
         } else {
             xSemaphoreGive(ws2812_mutex);
@@ -254,18 +267,28 @@ esp_err_t ws2812_set_mode(uint8_t channel_id, ws2812_mode_t mode) {
 esp_err_t ws2812_set_color(uint8_t channel_id, uint8_t r, uint8_t g, uint8_t b) {
     if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (channel_id == WS2812_BROADCAST_ID) {
-            // 广播到所有通道
+            // 广播到所有通道，并更新广播主色
+            broadcast_master_color.r = r;
+            broadcast_master_color.g = g;
+            broadcast_master_color.b = b;
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
-                channels[ch].config.color.r = r;
-                channels[ch].config.color.g = g;
-                channels[ch].config.color.b = b;
+                channels[ch].config.color = broadcast_master_color;
             }
-            ESP_LOGI(TAG, "Color set to RGB(%d,%d,%d) for all channels", r, g, b);
+            ESP_LOGI(TAG, "Color set to RGB(%d,%d,%d) for all channels (broadcast)", r, g, b);
         } else if (channel_id < WS2812_CHANNEL_COUNT) {
             // 设置指定通道
             channels[channel_id].config.color.r = r;
             channels[channel_id].config.color.g = g;
             channels[channel_id].config.color.b = b;
+
+            // 同步使用相同模式的其他通道（保持一致性）
+            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                if (ch == channel_id) continue;
+                if (channels[ch].config.mode == channels[channel_id].config.mode) {
+                    channels[ch].config.color = channels[channel_id].config.color;
+                }
+            }
+
             ESP_LOGI(TAG, "Color set to RGB(%d,%d,%d) for channel %d", r, g, b, channel_id);
         } else {
             xSemaphoreGive(ws2812_mutex);
@@ -287,14 +310,24 @@ esp_err_t ws2812_set_color(uint8_t channel_id, uint8_t r, uint8_t g, uint8_t b) 
 esp_err_t ws2812_set_brightness(uint8_t channel_id, uint8_t brightness) {
     if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         if (channel_id == WS2812_BROADCAST_ID) {
-            // 广播到所有通道
+            // 广播到所有通道，并更新广播主亮度
+            broadcast_master_brightness = brightness;
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
                 channels[ch].config.brightness = brightness;
             }
-            ESP_LOGI(TAG, "Brightness set to %d for all channels", brightness);
+            ESP_LOGI(TAG, "Brightness set to %d for all channels (broadcast)", brightness);
         } else if (channel_id < WS2812_CHANNEL_COUNT) {
             // 设置指定通道
             channels[channel_id].config.brightness = brightness;
+
+            // 同步相同模式的其他通道亮度
+            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                if (ch == channel_id) continue;
+                if (channels[ch].config.mode == channels[channel_id].config.mode) {
+                    channels[ch].config.brightness = brightness;
+                }
+            }
+
             ESP_LOGI(TAG, "Brightness set to %d for channel %d", brightness, channel_id);
         } else {
             xSemaphoreGive(ws2812_mutex);

@@ -902,8 +902,8 @@ char* create_battery_status_json(void)
     }
 
     // 直接添加电池基本信息到根级别（取消battery对象）
-    cJSON_AddNumberToObject(json, "voltage", (double)g_battery_voltage);
-    cJSON_AddNumberToObject(json, "percentage", external_battery_value);
+    cJSON_AddNumberToObject(json, "voltage", (double)get_battery_voltage());
+    cJSON_AddNumberToObject(json, "percentage", get_battery_percentage());
     
     // 获取有效的充电状态
     bool effective_charging = get_effective_charging_status();
@@ -1198,7 +1198,7 @@ static void update_battery_ui(void)
         } else {
             // 正常显示 - 使用字符串缓冲区格式化电压
             char voltage_str[32];
-            snprintf(voltage_str, sizeof(voltage_str), "%d%% %.1fV", display_percentage, (double)g_battery_voltage);
+            snprintf(voltage_str, sizeof(voltage_str), "%d%% %.1fV", display_percentage, (double)get_battery_voltage());
             lv_label_set_text(battery_label, voltage_str);
             lv_obj_set_style_text_color(battery_label, lv_color_hex(0x808080), 0);  // 灰色
         }
@@ -1386,8 +1386,8 @@ char* get_battery_detailed_info(void)
     }
     
     // 基本状态信息
-    cJSON_AddNumberToObject(json, "voltage", g_battery_voltage);
-    cJSON_AddNumberToObject(json, "percentage", external_battery_value);
+    cJSON_AddNumberToObject(json, "voltage", get_battery_voltage());
+    cJSON_AddNumberToObject(json, "percentage", get_battery_percentage());
     cJSON_AddBoolToObject(json, "charging", get_effective_charging_status());
     
     // 模式信息

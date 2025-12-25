@@ -25,6 +25,7 @@ typedef enum {
     WS2812_MODE_AUTO_CYCLE,     // 自动循环模式
     WS2812_MODE_BATTERY,        // 电量显示模式
     WS2812_MODE_MUSIC_RHYTHM,   // 音乐律动模式
+    WS2812_MODE_MUSIC_RHYTHM_2, // 音乐律动模式2
     WS2812_MODE_MAX
 } ws2812_mode_t;
 
@@ -41,6 +42,8 @@ typedef struct {
     rgb_color_t color;          // 静态颜色
     uint32_t speed;             // 效果速度 (ms)
     uint8_t brightness;         // 亮度 (0-255)
+    uint8_t music_bg_brightness; // 音乐律动背景亮度
+    bool music_colorful_mode;    // 音乐律动是否为彩色模式
 } ws2812_config_t;
 
 // 电量显示配置
@@ -217,5 +220,18 @@ esp_err_t ws2812_update_battery_display(int battery_percentage, bool is_charging
  * @return 电量显示配置结构体
  */
 ws2812_battery_config_t ws2812_get_battery_config(void);
+
+/**
+ * @brief 获取全局音乐律动灵敏度
+ * @return 灵敏度 (0-255)
+ */
+uint8_t ws2812_get_music_sensitivity(void);
+
+/**
+ * @brief 设置全局音乐律动灵敏度
+ * @param sensitivity 灵敏度 (0-255)
+ * @return ESP_OK成功，其他值失败
+ */
+esp_err_t ws2812_set_music_sensitivity(uint8_t sensitivity);
 
 #endif // WS2812_CONTROL_H

@@ -67,7 +67,8 @@ static const char* complete_html_page =
 "<option value='6'>波浪效果</option>"
 "<option value='7'>自动循环</option>"
 "<option value='8'>电量显示</option>"
-"<option value='9'>音乐律动</option>"
+"<option value='9'>音乐律动1</option>"
+"<option value='10'>音乐律动2</option>"
 "</select>"
 "</div>"
 "<div class='control-row'>"
@@ -87,6 +88,15 @@ static const char* complete_html_page =
 "<input type='number' id='broadcast-speed-num' class='number-input' min='10' max='2000' value='100'>ms"
 "</div>"
 "<button onclick='applyBroadcast()'>应用到所有通道</button>"
+"</div>"
+"<div class='channel-group music-section' style='background: #e6e6fa;'>"
+"<div class='channel-title'>🎵 音乐律动全局设置</div>"
+"<div class='control-row'>"
+"<span class='control-label'>灵敏度:</span>"
+"<input type='range' id='global-music-sensitivity' min='0' max='255' value='128' style='width:100px'>"
+"<input type='number' id='global-music-sensitivity-num' class='number-input' min='0' max='255' value='128'>"
+"<button onclick='applyGlobalSensitivity()'>应用灵敏度</button>"
+"</div>"
 "</div>"
 "<div class='channel-group channel-section'>"
 "<div class='channel-title'>🔧 单通道控制</div>"
@@ -116,7 +126,8 @@ static const char* complete_html_page =
 "<option value='6'>波浪效果</option>"
 "<option value='7'>自动循环</option>"
 "<option value='8'>电量显示</option>"
-"<option value='9'>音乐律动</option>"
+"<option value='9'>音乐律动1</option>"
+"<option value='10'>音乐律动2</option>"
 "</select>"
 "</div>"
 "<div class='control-row'>"
@@ -135,6 +146,18 @@ static const char* complete_html_page =
 "<span class='control-label'>速度:</span>"
 "<input type='range' id='channel-speed' min='10' max='2000' value='100' style='width:100px'>"
 "<input type='number' id='channel-speed-num' class='number-input' min='10' max='2000' value='100'>ms"
+"</div>"
+"<div class='control-row' id='music-mode2-controls'>"
+"<span class='control-label'>律动背景:</span>"
+"<input type='range' id='channel-music-bg' min='0' max='255' value='10' style='width:100px'>"
+"<input type='number' id='channel-music-bg-num' class='number-input' min='0' max='255' value='10'>"
+"<span class='control-label'>多彩:</span>"
+"<input type='checkbox' id='channel-music-colorful' checked>"
+"</div>"
+"<div class='control-row'>"
+"<span class='control-label'>灵敏度:</span>"
+"<input type='range' id='channel-music-sensitivity' min='0' max='255' value='128' style='width:100px'>"
+"<input type='number' id='channel-music-sensitivity-num' class='number-input' min='0' max='255' value='128'>"
 "</div>"
 "<div class='control-row'>"
 "<span class='control-label'>LED数量:</span>"
@@ -339,6 +362,20 @@ static const char* complete_html_page =
 "    document.getElementById('status').innerHTML = '状态: ❌ 调试失败';"
 "  });"
 "}"
+"function applyGlobalSensitivity() {"
+"  var sensitivity = parseInt(document.getElementById('global-music-sensitivity').value);"
+"  var data = { music_sensitivity: sensitivity };"
+"  sendRequest('/api/control', data);"
+"}"
+"function loadGlobalSettings() {"
+"  fetch('/api/status', { method: 'GET' })"
+"  .then(function(response) { return response.json(); })"
+"  .then(function(data) {"
+"    if (data.music_sensitivity !== undefined) {"
+"      updateInputPair('global-music-sensitivity', data.music_sensitivity);"
+"    }"
+"  });"
+"}"
 "function applyBroadcast() {"
 "  var data = {"
 "    channel: 255,"
@@ -366,6 +403,8 @@ static const char* complete_html_page =
 "    },"
 "    brightness: parseInt(document.getElementById('channel-brightness').value),"
 "    speed: parseInt(document.getElementById('channel-speed').value),"
+"    music_bg_brightness: parseInt(document.getElementById('channel-music-bg').value),"
+"    music_colorful_mode: document.getElementById('channel-music-colorful').checked,"
 "    led_count: parseInt(document.getElementById('channel-led-count').value),"
 "    cycle_duration: parseInt(document.getElementById('channel-cycle-duration').value)"
 "  };"
@@ -388,6 +427,8 @@ static const char* complete_html_page =
 "        updateInputPair('channel-b', channel.color.b);"
 "        updateInputPair('channel-brightness', channel.brightness);"
 "        updateInputPair('channel-speed', channel.speed);"
+"        updateInputPair('channel-music-bg', channel.music_bg_brightness !== undefined ? channel.music_bg_brightness : 10);"
+"        document.getElementById('channel-music-colorful').checked = channel.music_colorful_mode !== undefined ? channel.music_colorful_mode : true;"
 "        updateInputPair('channel-led-count', channel.led_count);"
 "        updateInputPair('channel-cycle-duration', channel.cycle_duration);"
 "        updateColorPreview('channel');"
@@ -544,9 +585,10 @@ static const char* complete_html_page =
 
 "window.onload = function() {"
 "  console.log('Page loaded, initializing...');"
+"  loadGlobalSettings();"
 "  var sliders = ['broadcast-r', 'broadcast-g', 'broadcast-b', 'broadcast-brightness', 'broadcast-speed',"
 "                 'channel-r', 'channel-g', 'channel-b', 'channel-brightness', 'channel-speed',"
-"                 'channel-led-count', 'channel-cycle-duration', 'battery-level', 'battery-bg-brightness'];"
+"                 'channel-music-bg', 'global-music-sensitivity', 'channel-led-count', 'channel-cycle-duration', 'battery-level', 'battery-bg-brightness'];"
 "  for(var i = 0; i < sliders.length; i++) {"
 "    var id = sliders[i];"
 "    var slider = document.getElementById(id);"
@@ -992,6 +1034,7 @@ static esp_err_t api_status_handler(httpd_req_t *req)
     cJSON_AddNumberToObject(status, "voltage", get_battery_voltage());
     cJSON_AddNumberToObject(status, "battery_percentage", get_battery_percentage());
     cJSON_AddBoolToObject(status, "is_charging", is_charging());
+    cJSON_AddNumberToObject(status, "music_sensitivity", ws2812_get_music_sensitivity());
     
     // WS2812通道状态
     cJSON *channels = cJSON_CreateArray();
@@ -1014,6 +1057,8 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         
         cJSON_AddNumberToObject(channel, "brightness", config.config.brightness);
         cJSON_AddNumberToObject(channel, "speed", config.config.speed);
+        cJSON_AddNumberToObject(channel, "music_bg_brightness", config.config.music_bg_brightness);
+        cJSON_AddBoolToObject(channel, "music_colorful_mode", config.config.music_colorful_mode);
 
         cJSON_AddItemToArray(channels, channel);
     }

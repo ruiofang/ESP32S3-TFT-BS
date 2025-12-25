@@ -19,7 +19,7 @@ static const char *TAG = "WS2812_CONTROL";
 // NVS存储相关定义
 #define WS2812_NVS_NAMESPACE "ws2812_cfg"
 #define WS2812_NVS_KEY_PREFIX "ch_"
-#define WS2812_CONFIG_VERSION 1
+#define WS2812_CONFIG_VERSION 3
 
 // GPIO引脚定义
 static const int ws2812_gpio_pins[WS2812_CHANNEL_COUNT] = WS2812_GPIO_PINS;
@@ -59,6 +59,7 @@ static int current_auto_mode_indices[WS2812_CHANNEL_COUNT] = {0};
 // 音乐律动模式相关变量
 static int32_t music_volume = 0;
 static uint32_t last_beat_time = 0;
+static uint8_t global_music_sensitivity = 128; // 全局音乐灵敏度，默认128
 
 // HSV转RGB函数
 static rgb_color_t hsv_to_rgb(uint16_t h, uint8_t s, uint8_t v) {
@@ -110,18 +111,6 @@ static rgb_color_t apply_brightness(rgb_color_t color, uint8_t brightness) {
     return result;
 }
 
-// 音乐律动模式应用函数
-static void ws2812_apply_music_rhythm(int ch, rgb_color_t color, uint8_t brightness) {
-    rgb_color_t final_color = apply_brightness(color, brightness);
-    for (int i = 0; i < channels[ch].led_count; i++) {
-        led_strip_set_pixel(led_strips[ch], i, final_color.r, final_color.g, final_color.b);
-    }
-    // 音乐模式需要在处理函数内刷新显示
-    if (led_strips[ch]) {
-        led_strip_refresh(led_strips[ch]);
-    }
-}
-
 esp_err_t ws2812_init(void) {
     ESP_LOGI(TAG, "Initializing WS2812 multi-channel system (%d channels)", WS2812_CHANNEL_COUNT);
     
@@ -142,6 +131,8 @@ esp_err_t ws2812_init(void) {
         channels[ch].config.color = (rgb_color_t){255, 255, 255};
         channels[ch].config.speed = 150;
         channels[ch].config.brightness = 180;
+        channels[ch].config.music_bg_brightness = 10;
+        channels[ch].config.music_colorful_mode = true;
         
         ESP_LOGI(TAG, "Initializing channel %d on GPIO %d", ch, ws2812_gpio_pins[ch]);
         
@@ -641,6 +632,8 @@ void ws2812_task(void *pvParameters) {
     static uint32_t breath_values[WS2812_CHANNEL_COUNT] = {0};
     static rgb_color_t rhythm_color = {255, 255, 255}; // 保持律动颜色
     
+    static int32_t max_vol_dynamic = 3000; // 动态音量最大值
+    
     task_running = true;
     ESP_LOGI(TAG, "WS2812 multi-channel task started");
     
@@ -648,7 +641,7 @@ void ws2812_task(void *pvParameters) {
         // 检查是否有通道处于音乐律动模式
         bool need_mic = false;
         for (int i = 0; i < WS2812_CHANNEL_COUNT; i++) {
-            if (channels[i].enabled && channels[i].config.mode == WS2812_MODE_MUSIC_RHYTHM) {
+            if (channels[i].enabled && (channels[i].config.mode == WS2812_MODE_MUSIC_RHYTHM || channels[i].config.mode == WS2812_MODE_MUSIC_RHYTHM_2)) {
                 need_mic = true;
                 break;
             }
@@ -675,6 +668,13 @@ void ws2812_task(void *pvParameters) {
                 uint16_t hue = rand() % 360;
                 rhythm_color = hsv_to_rgb(hue, 255, 255);
             }
+            
+            // 更新动态最大音量
+            int32_t vol_check = current_volume - 500;
+            if (vol_check < 0) vol_check = 0;
+            if (vol_check > max_vol_dynamic) max_vol_dynamic = vol_check;
+            else max_vol_dynamic -= 5; // 衰减速度
+            if (max_vol_dynamic < 1000) max_vol_dynamic = 1000;
         }
         
         // Calculate base brightness from volume
@@ -841,16 +841,79 @@ void ws2812_task(void *pvParameters) {
                 
                 case WS2812_MODE_MUSIC_RHYTHM:
                     {
-                        if (is_beat) {
-                            channels[ch].config.color = rhythm_color;
+                        // 律动模式1：背景色可配置，前景色随节拍变化
+                        
+                        // 应用灵敏度调节 (128为1.0x)
+                        uint32_t sensitive_vol = (current_volume * global_music_sensitivity) / 128;
+                        
+                        // 计算前景亮度（随音量变化）
+                        uint8_t ch_brightness = (uint8_t)(sensitive_vol * 10 / 100);
+                        if (sensitive_vol > 50 && ch_brightness < 10) {
+                            ch_brightness = 10;
                         }
                         
-                        uint8_t ch_brightness = base_brightness;
                         if (ch_brightness > channels[ch].config.brightness) {
                             ch_brightness = channels[ch].config.brightness;
                         }
                         
-                        ws2812_apply_music_rhythm(ch, rhythm_color, ch_brightness);
+                        // 前景色 (律动颜色)
+                        rgb_color_t fg_color = apply_brightness(rhythm_color, ch_brightness);
+                        
+                        // 背景色 (用户配置颜色 + 背景亮度)
+                        rgb_color_t bg_color = apply_brightness(current_config.color, current_config.music_bg_brightness);
+                        
+                        // 混合颜色 (饱和加法)
+                        rgb_color_t final_color;
+                        final_color.r = (fg_color.r + bg_color.r > 255) ? 255 : (fg_color.r + bg_color.r);
+                        final_color.g = (fg_color.g + bg_color.g > 255) ? 255 : (fg_color.g + bg_color.g);
+                        final_color.b = (fg_color.b + bg_color.b > 255) ? 255 : (fg_color.b + bg_color.b);
+                        
+                        for (int i = 0; i < channels[ch].led_count; i++) {
+                            led_strip_set_pixel(led_strips[ch], i, final_color.r, final_color.g, final_color.b);
+                        }
+                    }
+                    break;
+
+                case WS2812_MODE_MUSIC_RHYTHM_2:
+                    {
+                        // 简单的音量映射，假设噪音底噪约500
+                        int32_t vol = current_volume - 500;
+                        if (vol < 0) vol = 0;
+                        
+                        // 应用灵敏度调节
+                        vol = (vol * global_music_sensitivity) / 128;
+                        
+                        // 使用全局动态最大音量
+                        int leds_lit = (vol * channels[ch].led_count) / max_vol_dynamic;
+                        if (leds_lit > channels[ch].led_count) leds_lit = channels[ch].led_count;
+                        
+                        // 背景颜色 (使用配置颜色但亮度为music_bg_brightness)
+                        rgb_color_t bg_color = apply_brightness(current_config.color, current_config.music_bg_brightness);
+                        
+                        // 前景颜色
+                        rgb_color_t fg_color_base = current_config.color;
+                        
+                        for (int i = 0; i < channels[ch].led_count; i++) {
+                            if (i < leds_lit) {
+                                // 亮灯部分
+                                if (current_config.music_colorful_mode) {
+                                    // 彩色模式：使用彩虹色
+                                    // 随位置变化的色相
+                                    uint16_t hue = (i * 255 / channels[ch].led_count); 
+                                    rgb_color_t rainbow = hsv_to_rgb(hue, 255, 255);
+                                    // 应用配置的亮度
+                                    rainbow = apply_brightness(rainbow, current_config.brightness);
+                                    led_strip_set_pixel(led_strips[ch], i, rainbow.r, rainbow.g, rainbow.b);
+                                } else {
+                                    // 单色模式：使用配置颜色
+                                    rgb_color_t c = apply_brightness(fg_color_base, current_config.brightness);
+                                    led_strip_set_pixel(led_strips[ch], i, c.r, c.g, c.b);
+                                }
+                            } else {
+                                // 背景部分
+                                led_strip_set_pixel(led_strips[ch], i, bg_color.r, bg_color.g, bg_color.b);
+                            }
+                        }
                     }
                     break;
 
@@ -1032,11 +1095,7 @@ void ws2812_task(void *pvParameters) {
             }
             
             // 刷新LED显示
-            if (effective_mode == WS2812_MODE_MUSIC_RHYTHM) {
-                // 音乐模式下，由其自己的处理函数刷新
-            } else {
-                led_strip_refresh(led_strips[ch]);
-            }
+            led_strip_refresh(led_strips[ch]);
         }
         
         // 降低刷新频率以减少闪烁，特别是对电量显示模式
@@ -1394,6 +1453,63 @@ esp_err_t ws2812_handle_json_command(const char *json_command) {
         }
     }
     
+    // 音乐背景亮度设置
+    cJSON *music_bg_brightness_json = cJSON_GetObjectItem(json, "music_bg_brightness");
+    if (music_bg_brightness_json && cJSON_IsNumber(music_bg_brightness_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Music bg brightness command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        int bg_brightness = music_bg_brightness_json->valueint;
+        if (bg_brightness >= 0 && bg_brightness <= 255) {
+            if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                if (channel_id == WS2812_BROADCAST_ID) {
+                    for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                        channels[ch].config.music_bg_brightness = (uint8_t)bg_brightness;
+                    }
+                } else {
+                    channels[channel_id].config.music_bg_brightness = (uint8_t)bg_brightness;
+                }
+                xSemaphoreGive(ws2812_mutex);
+                ws2812_save_config();
+            }
+        }
+    }
+
+    cJSON *music_colorful_mode_json = cJSON_GetObjectItem(json, "music_colorful_mode");
+    if (music_colorful_mode_json && cJSON_IsBool(music_colorful_mode_json)) {
+        if (!has_channel) {
+            ESP_LOGE(TAG, "Music colorful mode command requires channel parameter");
+            ret = ESP_ERR_INVALID_ARG;
+            goto cleanup;
+        }
+        bool colorful = cJSON_IsTrue(music_colorful_mode_json);
+        if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+            if (channel_id == WS2812_BROADCAST_ID) {
+                for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                    channels[ch].config.music_colorful_mode = colorful;
+                }
+            } else {
+                channels[channel_id].config.music_colorful_mode = colorful;
+            }
+            xSemaphoreGive(ws2812_mutex);
+            ws2812_save_config();
+        }
+    }
+
+    cJSON *music_sensitivity_json = cJSON_GetObjectItem(json, "music_sensitivity");
+    if (music_sensitivity_json && cJSON_IsNumber(music_sensitivity_json)) {
+        int sensitivity = music_sensitivity_json->valueint;
+        if (sensitivity >= 0 && sensitivity <= 255) {
+            if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                global_music_sensitivity = (uint8_t)sensitivity;
+                xSemaphoreGive(ws2812_mutex);
+                ws2812_save_config();
+            }
+        }
+    }
+    
 cleanup:
     // esp_task_wdt_reset(); // 函数结束前最后一次重置看门狗
     cJSON_Delete(json);
@@ -1470,6 +1586,13 @@ esp_err_t ws2812_save_config(void) {
         ret = nvs_set_blob(nvs_handle, "battery_config", &battery_config, sizeof(ws2812_battery_config_t));
         if (ret != ESP_OK) {
             ESP_LOGE(TAG, "Failed to save battery config: %s", esp_err_to_name(ret));
+            goto cleanup;
+        }
+
+        // 保存全局音乐灵敏度
+        ret = nvs_set_u8(nvs_handle, "music_sens", global_music_sensitivity);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to save music sensitivity: %s", esp_err_to_name(ret));
             goto cleanup;
         }
         
@@ -1555,6 +1678,13 @@ esp_err_t ws2812_load_config(void) {
             battery_config.background_brightness = 20;
             load_success = false;
         }
+
+        // 加载全局音乐灵敏度
+        ret = nvs_get_u8(nvs_handle, "music_sens", &global_music_sensitivity);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to load music sensitivity, using default: 128");
+            global_music_sensitivity = 128;
+        }
         
         // 加载每个通道的配置
         for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
@@ -1596,7 +1726,7 @@ esp_err_t ws2812_load_config(void) {
             // brightness字段是uint8_t类型，范围自然限制在0-255，无需检查上限
             
             if (channels[ch].led_count < 1 || channels[ch].led_count > WS2812_MAX_LED_COUNT) {
-                ESP_LOGW(TAG, "Invalid LED count for channel %d, resetting to default", ch);
+                               ESP_LOGW(TAG, "Invalid LED count for channel %d, resetting to default", ch);
                 channels[ch].led_count = WS2812_LED_COUNT_DEFAULT;
                 load_success = false;
             }
@@ -1649,6 +1779,8 @@ esp_err_t ws2812_reset_config(void) {
             channels[ch].config.color = (rgb_color_t){255, 255, 255};
             channels[ch].config.speed = 150;
             channels[ch].config.brightness = 180;
+            channels[ch].config.music_bg_brightness = 10;
+            channels[ch].config.music_colorful_mode = true;
 
             
             // 重置自动循环相关参数
@@ -1663,5 +1795,24 @@ esp_err_t ws2812_reset_config(void) {
     }
     
     ESP_LOGE(TAG, "Failed to acquire mutex for resetting config");
+    return ESP_ERR_TIMEOUT;
+}
+
+uint8_t ws2812_get_music_sensitivity(void) {
+    return global_music_sensitivity;
+}
+
+esp_err_t ws2812_set_music_sensitivity(uint8_t sensitivity) {
+    if (xSemaphoreTake(ws2812_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+        global_music_sensitivity = sensitivity;
+        xSemaphoreGive(ws2812_mutex);
+        
+        // 自动保存配置
+        esp_err_t save_ret = ws2812_save_config();
+        if (save_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to save config after sensitivity change: %s", esp_err_to_name(save_ret));
+        }
+        return ESP_OK;
+    }
     return ESP_ERR_TIMEOUT;
 }

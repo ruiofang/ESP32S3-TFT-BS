@@ -669,8 +669,8 @@ void ws2812_task(void *pvParameters) {
                 rhythm_color = hsv_to_rgb(hue, 255, 255);
             }
             
-            // 更新动态最大音量
-            int32_t vol_check = current_volume - 500;
+            // 更新动态最大音量-底噪调整
+            int32_t vol_check = current_volume - 100;
             if (vol_check < 0) vol_check = 0;
             if (vol_check > max_vol_dynamic) max_vol_dynamic = vol_check;
             else max_vol_dynamic -= 5; // 衰减速度
@@ -843,8 +843,12 @@ void ws2812_task(void *pvParameters) {
                     {
                         // 律动模式1：背景色可配置，前景色随节拍变化
                         
+                        // 扣除底噪，确保静音时显示背景色
+                        int32_t clean_vol = current_volume - 100;
+                        if (clean_vol < 0) clean_vol = 0;
+
                         // 应用灵敏度调节 (128为1.0x)
-                        uint32_t sensitive_vol = (current_volume * global_music_sensitivity) / 128;
+                        uint32_t sensitive_vol = (clean_vol * global_music_sensitivity) / 128;
                         
                         // 计算前景亮度（随音量变化）
                         uint8_t ch_brightness = (uint8_t)(sensitive_vol * 10 / 100);
@@ -876,8 +880,8 @@ void ws2812_task(void *pvParameters) {
 
                 case WS2812_MODE_MUSIC_RHYTHM_2:
                     {
-                        // 简单的音量映射，假设噪音底噪约500
-                        int32_t vol = current_volume - 500;
+                        // 简单的音量映射，假设噪音底噪约100
+                        int32_t vol = current_volume - 100;
                         if (vol < 0) vol = 0;
                         
                         // 应用灵敏度调节

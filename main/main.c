@@ -413,7 +413,28 @@ static void background_processing_task(void *pvParameters)
         if (uart_command_queue != NULL && xQueueReceive(uart_command_queue, &cmd, 0) == pdTRUE) {
             // 处理复杂的WS2812命令等
             if (strncmp(cmd.command, "JSON:", 5) == 0) {
-                ws2812_handle_json_command(cmd.command + 5);
+                const char *json_str = cmd.command + 5;
+                ws2812_handle_json_command(json_str);
+
+                // 同步处理电池相关字段 (与 web_server api_unified_handler 对齐)
+                // ws2812_handle_json_command 仅更新 WS2812 LED，
+                // 还需更新 LCD 显示和信号存活标记
+                cJSON *jcmd = cJSON_Parse(json_str);
+                if (jcmd) {
+                    cJSON *jvolt = cJSON_GetObjectItem(jcmd, "voltage");
+                    if (jvolt && cJSON_IsNumber(jvolt)) {
+                        set_external_voltage((float)jvolt->valuedouble);
+                    }
+                    cJSON *jbatt = cJSON_GetObjectItem(jcmd, "battery");
+                    if (jbatt && cJSON_IsNumber(jbatt)) {
+                        set_external_battery_percentage(jbatt->valueint);
+                    }
+                    cJSON *jchg = cJSON_GetObjectItem(jcmd, "charging");
+                    if (jchg && cJSON_IsBool(jchg)) {
+                        set_external_charging_status(cJSON_IsTrue(jchg));
+                    }
+                    cJSON_Delete(jcmd);
+                }
             }
         }
         
@@ -696,6 +717,9 @@ static void update_battery_status_from_rs485(void)
     if (!g_battery_data.data_valid) {
         return;
     }
+    
+    // 标记收到有效电池数据，避免信号丢失检测误报 "NO SIGNAL"
+    mark_battery_signal_alive();
     
     // 更新电压 - RS485数据优先级最高
     g_battery_voltage = g_battery_data.pack_voltage;

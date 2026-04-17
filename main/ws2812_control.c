@@ -43,6 +43,20 @@ static int current_battery_percentage = 50;
 static bool current_is_charging = false;
 static bool battery_display_needs_refresh = false; // 电量显示刷新标志
 
+// 无信号覆盖：由 main.c 的 no_signal_blink_timer 控制；启用时 ws2812_task 直接把所有通道涂成 override 色，跳过模式渲染
+static volatile bool g_no_signal_override_enabled = false;
+static volatile uint8_t g_no_signal_override_r = 0;
+static volatile uint8_t g_no_signal_override_g = 0;
+static volatile uint8_t g_no_signal_override_b = 0;
+
+void ws2812_set_no_signal_override(bool enable, uint8_t r, uint8_t g, uint8_t b)
+{
+    g_no_signal_override_r = r;
+    g_no_signal_override_g = g;
+    g_no_signal_override_b = b;
+    g_no_signal_override_enabled = enable;
+}
+
 // 自动循环模式相关变量 - 每个通道独立
 static uint32_t auto_cycle_timers[WS2812_CHANNEL_COUNT] = {0};
 static uint32_t auto_cycle_durations[WS2812_CHANNEL_COUNT] = {8000, 8000, 8000, 8000};
@@ -638,6 +652,27 @@ void ws2812_task(void *pvParameters) {
     ESP_LOGI(TAG, "WS2812 multi-channel task started");
     
     while (task_running) {
+        // --- 无信号覆盖：只让"电量显示通道"闪烁，其它通道保持原状 ---
+        if (g_no_signal_override_enabled) {
+            uint8_t r = g_no_signal_override_r;
+            uint8_t g = g_no_signal_override_g;
+            uint8_t b = g_no_signal_override_b;
+            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                bool is_batt_ch = (channels[ch].config.mode == WS2812_MODE_BATTERY) ||
+                                  (battery_config.battery_channel == ch);
+                if (!is_batt_ch || !channels[ch].enabled || led_strips[ch] == NULL) {
+                    continue;
+                }
+                for (int i = 0; i < channels[ch].led_count; i++) {
+                    led_strip_set_pixel(led_strips[ch], i, r, g, b);
+                }
+                led_strip_refresh(led_strips[ch]);
+            }
+            // 覆盖激活时跳过正常渲染；下一轮由定时器翻转颜色
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         // 检查是否有通道处于音乐律动模式
         bool need_mic = false;
         for (int i = 0; i < WS2812_CHANNEL_COUNT; i++) {

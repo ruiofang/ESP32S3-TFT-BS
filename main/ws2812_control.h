@@ -216,6 +216,14 @@ esp_err_t ws2812_set_channel_battery_mode(uint8_t channel_id, bool enable_batter
 esp_err_t ws2812_update_battery_display(int battery_percentage, bool is_charging);
 
 /**
+ * @brief 信号丢失覆盖：启用后绕过所有模式渲染，直接把所有通道涂成指定颜色；
+ *        不写 NVS，不修改用户配置；禁用后恢复正常模式渲染。
+ * @param enable  true=启用覆盖，false=关闭覆盖
+ * @param r,g,b   覆盖颜色
+ */
+void ws2812_set_no_signal_override(bool enable, uint8_t r, uint8_t g, uint8_t b);
+
+/**
  * @brief 获取电量显示配置
  * @return 电量显示配置结构体
  */

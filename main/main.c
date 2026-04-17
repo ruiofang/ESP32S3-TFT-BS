@@ -65,7 +65,7 @@
 
 typedef enum {
     BATT_READ_MODE_JSON = 0,     // JSON 被动模式 (UART 115200)
-    BATT_READ_MODE_RS485 = 1,    // RS485 电池协议 (DD/77 起止) 主动查询 (UART 9600)
+    BATT_READ_MODE_RS485_1 = 1,    // RS485 电池协议 (DD/77 起止) 主动查询 (UART 9600)
     BATT_READ_MODE_RS485_2 = 2,  // RS485-2 电池协议 (0xAA 帧头, 小端) 主动查询 (UART 9600)
     BATT_READ_MODE_MAX
 } battery_read_mode_t;
@@ -76,7 +76,7 @@ static inline const char *battery_read_mode_name(battery_read_mode_t m)
 {
     switch (m) {
         case BATT_READ_MODE_JSON:    return "JSON";
-        case BATT_READ_MODE_RS485:   return "RS485";
+        case BATT_READ_MODE_RS485_1: return "RS485-1";
         case BATT_READ_MODE_RS485_2: return "RS485-2";
         default: return "?";
     }
@@ -237,11 +237,11 @@ static void no_signal_blink_timer_callback(void *arg)
 
     if (lost) {
         g_no_signal_blink_on = !g_no_signal_blink_on;
-        // 驱动 WS2812 红色闪烁 (广播到所有通道)
+        // 只让"电量显示通道"红闪；其它通道保持当前效果
         if (g_no_signal_blink_on) {
-            ws2812_set_color(WS2812_BROADCAST_ID, 255, 0, 0);
+            ws2812_set_no_signal_override(true, 255, 0, 0);
         } else {
-            ws2812_set_color(WS2812_BROADCAST_ID, 0, 0, 0);
+            ws2812_set_no_signal_override(true, 0, 0, 0);
         }
         // 通知 LCD 刷新
         ui_update_pending = true;
@@ -250,9 +250,8 @@ static void no_signal_blink_timer_callback(void *arg)
         }
         was_lost = true;
     } else if (was_lost) {
-        // 刚刚从无信号恢复：熄灭红灯，下一轮 background_processing_task
-        // 会按正常模式重新驱动 WS2812；UI 也需要刷新回正常显示。
-        ws2812_set_color(WS2812_BROADCAST_ID, 0, 0, 0);
+        // 刚刚从无信号恢复：关闭覆盖，让 ws2812_task 按原模式继续渲染
+        ws2812_set_no_signal_override(false, 0, 0, 0);
         g_no_signal_blink_on = false;
         ui_update_pending = true;
         if (lvgl_task_handle != NULL) {
@@ -1369,7 +1368,7 @@ static void apply_battery_read_mode(battery_read_mode_t mode)
     g_battery_read_mode = mode;
 
     uint32_t baud = 115200;   // JSON 默认
-    if (mode == BATT_READ_MODE_RS485 || mode == BATT_READ_MODE_RS485_2) baud = 9600;
+    if (mode == BATT_READ_MODE_RS485_1 || mode == BATT_READ_MODE_RS485_2) baud = 9600;
 
     // 切换波特率并刷新缓冲，避免残留数据
     esp_err_t err = uart_set_baudrate(UART_NUM_1, baud);
@@ -2333,7 +2332,7 @@ void app_main(void)
     // 按恢复的模式设置 UART 波特率 (uart1_init 使用编译时默认波特率)
     {
         uint32_t baud = 115200;
-        if (g_battery_read_mode == BATT_READ_MODE_RS485 ||
+        if (g_battery_read_mode == BATT_READ_MODE_RS485_1 ||
             g_battery_read_mode == BATT_READ_MODE_RS485_2) baud = 9600;
         uart_set_baudrate(UART_NUM_1, baud);
         uart_flush_input(UART_NUM_1);

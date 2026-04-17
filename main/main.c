@@ -1955,6 +1955,9 @@ void set_external_voltage(float voltage)
         external_voltage_value = voltage;
         voltage_override = true;
         
+        // 通知LVGL任务立即处理UI更新
+        notify_ui_update_needed();
+        
         // 只有参数真正改变时才保存到NVS
         schedule_nvs_save();
     }

@@ -55,9 +55,22 @@ JSON:{"channel": 0, "mode": 1}
 - **无需手动添加终止符**
 
 ### 2. 通讯方式
-- **串口通讯**：115200波特率，8N1
-- **网络通讯**：WiFi热点模式，HTTP接口
+- **串口通讯 (UART1, GPIO16 TX / GPIO17 RX)**：波特率由运行时模式决定
+  - `JSON` 模式：**115200 8N1** (被动接收 JSON 命令)
+  - `RS485-1` / `RS485-2` 模式：**9600 8N1** (主动轮询电池协议)
+- **网络通讯**：WiFi 热点模式，HTTP 接口
 - **实时响应**：命令执行后立即返回状态
+
+### 3. 运行时电池读取模式 (BOOT 键切换)
+设备支持三种电池数据获取模式，按下板上 **BOOT (GPIO0)** 按键循环切换，当前模式会持久化到 NVS，重启后保持。
+
+| 模式 | 名称 | UART1 波特率 | 行为 |
+|------|------|---------------|------|
+| 0 | `JSON`    | 115200 | 被动接收上位机/外部设备推送的 JSON 命令；不主动发起查询 |
+| 1 | `RS485-1` | 9600   | 主动轮询标准电池协议 (0xDD/0x77 帧格式，周期 3000ms) |
+| 2 | `RS485-2` | 9600   | 主动轮询客户定制协议 (0xAA 帧头，周期 2000ms，首次会发送握手帧 0x00) |
+
+屏幕右上角会显示 `MODE: JSON / RS485-1 / RS485-2`。切换模式时，固件会自动完成 TX 波特率切换并刷新串口缓冲，无须手动重启。
 
 ---
 
@@ -274,7 +287,7 @@ http://192.168.4.1/  // 设备默认IP地址
 
 #### 控制接口
 ```
-POST /control
+POST /api/control
 Content-Type: application/json
 
 {
@@ -286,7 +299,28 @@ Content-Type: application/json
 
 #### 状态查询接口
 ```
-GET /status
+GET /api/status
+GET /api/status?channel=0          # 可选通道参数
+```
+
+#### 统一电池/业务接口
+```
+POST /api/unified
+Content-Type: application/json
+
+{"voltage": 24.5, "battery": 75, "charging": true}
+```
+
+#### 电池专用接口
+```
+GET  /api/battery/status       # 查询电池状态 (电压/电量/充电/RS485详细数据)
+POST /api/battery/control      # 设置电池相关参数
+```
+
+#### 其它辅助接口
+```
+POST /api/test                 # 测试命令
+POST /api/simple               # 简单回环
 ```
 
 返回示例：
@@ -306,12 +340,8 @@ GET /status
 }
 ```
 
-### 5.2 WebSocket接口（实时通讯）
-```
-ws://192.168.4.1/ws
-```
-
-支持双向实时通讯，可接收设备状态变化推送。
+### 5.2 WebSocket接口
+当前固件未启用 WebSocket，请使用上述 HTTP 接口轮询 `/api/status` 或 `/api/battery/status` 获取实时数据。
 
 ---
 
@@ -408,4 +438,11 @@ ws://192.168.4.1/ws
 
 ---
 
-*文档版本：v2.1 | 更新日期：2025-01-19*
+*文档版本：v2.2 | 更新日期：2026-04-17*
+
+## 更新记录
+- **v2.2 (2026-04-17)**
+  - RS485 电池查询改为运行时模式切换，移除编译期宏 `ENABLE_RS485_BATTERY_QUERY`
+  - 新增独立 `rs485_1_query_task`，让 `RS485-1` 模式能主动发送查询帧
+  - `apply_battery_read_mode()` 切换波特率前等待 TX 完成，修复从 RS485-x 切回 JSON 后 UART 不接收的问题
+  - 修正 HTTP 接口路径 (`/api/*`) 与实际代码一致；移除不存在的 WebSocket 接口描述

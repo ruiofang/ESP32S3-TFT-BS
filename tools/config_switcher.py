@@ -37,29 +37,27 @@ class BatteryConfigSwitcher:
             return False
     
     def modify_config(self, rs485_enabled, json_enabled):
-        """修改配置宏定义"""
+        """修改配置宏定义 (RS485 电池查询已改为运行时模式切换，此处仅保留 JSON 开关)"""
         if not os.path.exists(self.main_c_path):
             print(f"错误: 未找到文件 {self.main_c_path}")
             return False
-        
+
         # 读取文件内容
         with open(self.main_c_path, 'r', encoding='utf-8') as f:
             content = f.read()
-        
-        # 修改RS485配置
-        rs485_pattern = r'#define\s+ENABLE_RS485_BATTERY_QUERY\s+\d+'
-        rs485_replacement = f'#define ENABLE_RS485_BATTERY_QUERY  {1 if rs485_enabled else 0}'
-        content = re.sub(rs485_pattern, rs485_replacement, content)
-        
+
+        if not rs485_enabled:
+            print("提示: RS485 电池查询已为运行时模式切换，无法通过宏禁用；请使用 BOOT 键在 JSON 模式下运行。")
+
         # 修改JSON配置
         json_pattern = r'#define\s+ENABLE_JSON_PASSIVE_MODE\s+\d+'
         json_replacement = f'#define ENABLE_JSON_PASSIVE_MODE    {1 if json_enabled else 0}'
         content = re.sub(json_pattern, json_replacement, content)
-        
+
         # 写回文件
         with open(self.main_c_path, 'w', encoding='utf-8') as f:
             f.write(content)
-        
+
         return True
     
     def show_current_config(self):
@@ -71,29 +69,15 @@ class BatteryConfigSwitcher:
         with open(self.main_c_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        # 提取当前配置
-        rs485_match = re.search(r'#define\s+ENABLE_RS485_BATTERY_QUERY\s+(\d+)', content)
+        # 提取当前配置 (RS485 现在由运行时模式决定，此处不再解析)
         json_match = re.search(r'#define\s+ENABLE_JSON_PASSIVE_MODE\s+(\d+)', content)
-        
-        if rs485_match and json_match:
-            rs485_enabled = int(rs485_match.group(1)) == 1
+
+        if json_match:
             json_enabled = int(json_match.group(1)) == 1
-            
+
             print("\n当前配置:")
-            print(f"  RS485电池查询: {'启用' if rs485_enabled else '禁用'}")
+            print("  RS485电池查询: 运行时切换 (BOOT键: JSON / RS485-1 / RS485-2)")
             print(f"  JSON被动控制: {'启用' if json_enabled else '禁用'}")
-            
-            # 确定模式
-            if rs485_enabled and json_enabled:
-                mode = "混合模式"
-            elif rs485_enabled:
-                mode = "仅RS485模式"
-            elif json_enabled:
-                mode = "仅JSON模式"
-            else:
-                mode = "基本模式"
-            
-            print(f"  工作模式: {mode}")
         else:
             print("无法解析当前配置")
     

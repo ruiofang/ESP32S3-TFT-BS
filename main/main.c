@@ -36,7 +36,7 @@
 #define LCD_COLOR_BLACK   0x0000
 
 // 功能模式选择 (通过宏定义控制)
-#define ENABLE_RS485_BATTERY_QUERY  0  // 1=启用RS485电池查询, 0=禁用
+// 注: RS485 电池查询不再使用编译期开关，运行时通过模式切换 (JSON / RS485-1 / RS485-2) 决定
 #define ENABLE_JSON_PASSIVE_MODE    1  // 1=启用JSON被动控制, 0=禁用
 // 电池监控任务使能开关（为避免WDT问题可禁用）
 #define ENABLE_BATTERY_MONITOR_TASK 0  // 1=启用电池监控任务, 0=禁用
@@ -44,11 +44,8 @@
 // UART1 配置 (统一串口)
 #define UART1_TXD_PIN       16
 #define UART1_RXD_PIN       17
-#if ENABLE_RS485_BATTERY_QUERY
-    #define UART1_BAUD_RATE     9600   // RS485电池协议标准波特率
-#else
-    #define UART1_BAUD_RATE     115200 // JSON控制标准波特率
-#endif
+// 编译期默认波特率 (启动时 apply_battery_read_mode() 会按运行时模式重新设置)
+#define UART1_BAUD_RATE     115200
 #define UART_BUF_SIZE       2048  // 缓冲区大小
 
 // 电池监控周期定义 (仅用于任务延时)
@@ -276,14 +273,12 @@ static int get_animated_battery_percentage(int base_percentage)
 {
     // 统一充电判断逻辑：被动控制 OR RS485检测到充电
     bool is_charging_display = (charging_status_override && external_charging_status);
-    
-#if ENABLE_RS485_BATTERY_QUERY
+
     // 如果RS485检测到充电，也启用充电动画
     if (g_battery_data.data_valid && g_battery_data.pack_current > 0.05f) {
         is_charging_display = true;
     }
-#endif
-    
+
     if (!is_charging_display || !charging_animation_enabled) {
         return base_percentage;
     }
@@ -315,14 +310,12 @@ static void charging_animation_timer_callback(void *arg)
 {
     // 统一充电判断逻辑：被动控制 OR RS485检测到充电
     bool is_charging_display = (charging_status_override && external_charging_status);
-    
-#if ENABLE_RS485_BATTERY_QUERY
+
     // 如果RS485检测到充电，也启用充电动画
     if (g_battery_data.data_valid && g_battery_data.pack_current > 0.05f) {
         is_charging_display = true;
     }
-#endif
-    
+
     if (!charging_animation_enabled || !is_charging_display) {
         return;
     }
@@ -451,6 +444,7 @@ static lv_obj_t *mode_label;           // 电池读取模式标签 (BOOT 键切�
 static void update_battery_ui(void);
 static void apply_battery_read_mode(battery_read_mode_t mode);
 static void boot_button_task(void *pvParameters);
+static void rs485_1_query_task(void *pvParameters);
 static void rs485_2_query_task(void *pvParameters);
 void set_external_battery_level(int level);
 void set_external_battery_percentage(int percentage);
@@ -490,9 +484,7 @@ static void uart1_init(void)
     ESP_LOGI(TAG, "UART1 initialized - TX:%d, RX:%d, Baud:%d", 
              UART1_TXD_PIN, UART1_RXD_PIN, UART1_BAUD_RATE);
 
-#if ENABLE_RS485_BATTERY_QUERY
-    ESP_LOGI(TAG, "RS485 Battery Query: Enabled");
-#endif
+    ESP_LOGI(TAG, "RS485 Battery Query: runtime-selectable (mode switches baudrate)");
 #if ENABLE_JSON_PASSIVE_MODE
     ESP_LOGI(TAG, "JSON Passive Control: Enabled");
 #endif
@@ -515,11 +507,6 @@ static uint16_t calculate_checksum(const uint8_t* data, size_t len)
  */
 static bool send_battery_query(uint8_t cmd)
 {
-#if !ENABLE_RS485_BATTERY_QUERY
-    ESP_LOGW(TAG, "RS485 battery query is disabled");
-    return false;
-#endif
-
     uint8_t frame[8];
     size_t frame_len = 0;
     
@@ -671,10 +658,6 @@ static bool parse_battery_info_response(const uint8_t* data, size_t len, battery
  */
 static bool read_battery_response(uint8_t expected_cmd, battery_data_t* battery_data)
 {
-#if !ENABLE_RS485_BATTERY_QUERY
-    return false;
-#endif
-
     uint8_t buffer[128];
     int bytes_read = uart_read_bytes(UART_NUM_1, buffer, sizeof(buffer), pdMS_TO_TICKS(BATTERY_TIMEOUT_MS));
     
@@ -698,10 +681,6 @@ static bool read_battery_response(uint8_t expected_cmd, battery_data_t* battery_
  */
 static bool query_battery_info(void)
 {
-#if !ENABLE_RS485_BATTERY_QUERY
-    return false;
-#endif
-
     if (!send_battery_query(BATTERY_CMD_INFO)) {
         return false;
     }
@@ -714,10 +693,6 @@ static bool query_battery_info(void)
  */
 static void update_battery_status_from_rs485(void)
 {
-#if !ENABLE_RS485_BATTERY_QUERY
-    return;
-#endif
-
     if (!g_battery_data.data_valid) {
         return;
     }
@@ -1263,6 +1238,42 @@ static void batt2_parse_info(const uint8_t *d, uint8_t len)
 }
 
 /**
+ * @brief RS485-1 主动查询任务
+ *        仅当当前模式为 BATT_READ_MODE_RS485_1 时才持有 UART 进行收发；
+ *        其它模式下进入长睡眠，不干扰 UART 通道。
+ */
+static void rs485_1_query_task(void *pvParameters)
+{
+    (void)pvParameters;
+    uint32_t fail_count = 0;
+
+    while (1) {
+        if (g_battery_read_mode != BATT_READ_MODE_RS485_1) {
+            fail_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        uart_flush_input(UART_NUM_1);
+        if (query_battery_info()) {
+            update_battery_status_from_rs485();
+            fail_count = 0;
+            ui_update_pending = true;
+        } else {
+            fail_count++;
+            ESP_LOGW(TAG, "RS485-1: query failed (%u)", (unsigned)fail_count);
+            // 连续多次失败时，标记数据过期
+            if (fail_count >= 3) {
+                g_battery_data.data_valid = false;
+                ui_update_pending = true;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BATTERY_QUERY_PERIOD));
+    }
+}
+
+/**
  * @brief RS485-2 主动查询任务
  *        仅当当前模式为 BATT_READ_MODE_RS485_2 时才持有 UART 进行收发；
  *        其它模式下进入长睡眠，不干扰 UART 通道。
@@ -1369,6 +1380,9 @@ static void apply_battery_read_mode(battery_read_mode_t mode)
 
     uint32_t baud = 115200;   // JSON 默认
     if (mode == BATT_READ_MODE_RS485_1 || mode == BATT_READ_MODE_RS485_2) baud = 9600;
+
+    // 等待当前 TX 发送完成，避免在半个字节期间改波特率
+    uart_wait_tx_done(UART_NUM_1, pdMS_TO_TICKS(100));
 
     // 切换波特率并刷新缓冲，避免残留数据
     esp_err_t err = uart_set_baudrate(UART_NUM_1, baud);
@@ -1556,13 +1570,11 @@ static void update_battery_ui(void)
         
         // 统一充电判断逻辑：被动控制 OR RS485检测到充电
         bool is_charging_display = (charging_status_override && external_charging_status);
-        
-#if ENABLE_RS485_BATTERY_QUERY
+
         if (g_battery_data.data_valid && g_battery_data.pack_current > 0.05f) {
             is_charging_display = true;
         }
-#endif
-        
+
         lv_color_t bar_color;
         if (is_charging_display) {
             // 充电显示模式 - 使用统一的充电颜色（动画通过进度条长度实现）
@@ -1594,12 +1606,10 @@ static void update_battery_ui(void)
     if (battery_label) {
         // 统一充电判断逻辑：被动控制 OR RS485检测到充电
         bool is_charging_display = (charging_status_override && external_charging_status);
-#if ENABLE_RS485_BATTERY_QUERY
         if (g_battery_data.data_valid && g_battery_data.pack_current > 0.05f) {
             is_charging_display = true;
         }
-#endif
-        
+
         if (is_charging_display) {
             // 充电显示（动画和字体统一）
             lv_label_set_text_fmt(battery_label, "%d%% [charging]", display_percentage);
@@ -1618,8 +1628,7 @@ static void update_battery_ui(void)
     if (info_label) {
         // 根据控制指令区分显示模式信息
         bool is_charging_display = charging_status_override && external_charging_status;
-        
-#if ENABLE_RS485_BATTERY_QUERY
+
         if (g_battery_data.data_valid) {
             // 显示RS485电池信息，根据电流正负显示状态
             char info_text[128];
@@ -1670,30 +1679,6 @@ static void update_battery_ui(void)
                 lv_obj_set_style_text_color(info_label, lv_color_hex(0xFF0000), 0);  // 红色表示通信异常
             }
         }
-#else
-        // RS485功能禁用时的显示
-        if (battery_display_override || charging_status_override) {
-            // 外部控制模式
-            char mode_text[128];
-            if (is_charging_display) {
-                snprintf(mode_text, sizeof(mode_text), "手动充电模式 | 电量:%d%% | 动画:%s", 
-                        display_percentage, charging_animation_enabled ? "开" : "关");
-                lv_obj_set_style_text_color(info_label, lv_color_hex(0xFFAA00), 0);  // 橙色表示充电模式
-            } else {
-                snprintf(mode_text, sizeof(mode_text), "手动模式 | 电量:%d%% | JSON控制", display_percentage);
-                lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示普通模式
-            }
-            lv_label_set_text(info_label, mode_text);
-        } else {
-            // 完全自动模式
-#if ENABLE_JSON_PASSIVE_MODE
-            lv_label_set_text(info_label, "自动模式 | JSON控制可用 | 仅显示模式");
-#else
-            lv_label_set_text(info_label, "基本模式 | 无外部控制");
-#endif
-            lv_obj_set_style_text_color(info_label, lv_color_hex(0x888888), 0);  // 灰色表示自动模式
-        }
-#endif
         
         // 强制重新绘制标签
         lv_obj_invalidate(info_label);
@@ -1806,10 +1791,9 @@ char* get_battery_detailed_info(void)
     cJSON_AddBoolToObject(json, "charging", get_effective_charging_status());
     
     // 模式信息
-    cJSON_AddBoolToObject(json, "rs485_enabled", ENABLE_RS485_BATTERY_QUERY);
+    cJSON_AddBoolToObject(json, "rs485_enabled", true);
     cJSON_AddBoolToObject(json, "json_enabled", ENABLE_JSON_PASSIVE_MODE);
-    
-#if ENABLE_RS485_BATTERY_QUERY
+
     // RS485通信状态
     cJSON_AddBoolToObject(json, "rs485_connected", g_battery_data.data_valid);
     cJSON_AddBoolToObject(json, "auto_query", g_battery_auto_query);
@@ -1837,13 +1821,7 @@ char* get_battery_detailed_info(void)
         
         cJSON_AddItemToObject(json, "rs485_data", battery_detail);
     }
-#else
-    // RS485功能禁用时的状态
-    cJSON_AddBoolToObject(json, "rs485_connected", false);
-    cJSON_AddBoolToObject(json, "auto_query", false);
-    cJSON_AddStringToObject(json, "rs485_status", "disabled");
-#endif
-    
+
     char *json_string = cJSON_Print(json);
     cJSON_Delete(json);
     
@@ -1855,12 +1833,8 @@ char* get_battery_detailed_info(void)
  */
 void set_battery_auto_query(bool enable)
 {
-#if ENABLE_RS485_BATTERY_QUERY
     g_battery_auto_query = enable;
     ESP_LOGI(TAG, "Battery auto query %s", enable ? "enabled" : "disabled");
-#else
-    ESP_LOGW(TAG, "Battery auto query not available (RS485 disabled)");
-#endif
 }
 
 /**
@@ -1868,9 +1842,8 @@ void set_battery_auto_query(bool enable)
  */
 bool trigger_battery_query(void)
 {
-#if ENABLE_RS485_BATTERY_QUERY
     ESP_LOGI(TAG, "Manual battery query triggered");
-    
+
     if (query_battery_info()) {
         update_battery_status_from_rs485();
         ESP_LOGI(TAG, "Manual battery query successful");
@@ -1879,10 +1852,6 @@ bool trigger_battery_query(void)
         ESP_LOGW(TAG, "Manual battery query failed");
         return false;
     }
-#else
-    ESP_LOGW(TAG, "Manual battery query not available (RS485 disabled)");
-    return false;
-#endif
 }
 
 /**
@@ -1999,20 +1968,12 @@ static void increase_lvgl_tick(void *arg)
  */
 static void battery_monitor_task(void *pvParameters)
 {
-#if ENABLE_RS485_BATTERY_QUERY
     ESP_LOGI(TAG, "Battery monitor task started (RS485 Auto Query Mode)");
-#else
-    ESP_LOGI(TAG, "Battery monitor task started (Passive Mode - No RS485 Query)");
-#endif
-    
+
     TickType_t last_wake_time = xTaskGetTickCount();
-    
-#if ENABLE_RS485_BATTERY_QUERY
     TickType_t last_query_time = 0;
-#endif
-    
+
     while (1) {
-#if ENABLE_RS485_BATTERY_QUERY
         // RS485电池查询（如果启用自动查询）
         if (g_battery_auto_query) {
             TickType_t current_time = xTaskGetTickCount();
@@ -2037,7 +1998,6 @@ static void battery_monitor_task(void *pvParameters)
         
         // 备用电压模拟（当RS485数据无效时）
         if (!g_battery_data.data_valid) {
-#endif
             if (voltage_override) {
                 // 使用外部设置的电压值
                 g_battery_voltage = external_voltage_value;
@@ -2045,10 +2005,8 @@ static void battery_monitor_task(void *pvParameters)
                 // 使用模拟电压 (在实际应用中，这里应该是从ADC读取)
                 g_battery_voltage = simulate_battery_voltage();
             }
-#if ENABLE_RS485_BATTERY_QUERY
         }
-#endif
-        
+
         // 等待下一次更新
         vTaskDelayUntil(&last_wake_time, pdMS_TO_TICKS(BATTERY_UPDATE_PERIOD));
     }
@@ -2397,41 +2355,34 @@ void app_main(void)
     // 创建 BOOT 按键任务 (切换电池读取模式)
     xTaskCreate(boot_button_task, "boot_btn", 2560, NULL, 3, NULL);
 
+    // 创建 RS485-1 主动查询任务 (仅在 RS485-1 模式下工作)
+    xTaskCreate(rs485_1_query_task, "rs485_1", 3584, NULL, 3, NULL);
+
     // 创建 RS485-2 主动查询任务 (仅在 RS485-2 模式下工作)
     xTaskCreate(rs485_2_query_task, "rs485_2", 3072, NULL, 3, NULL);
     
     ESP_LOGI(TAG, "All tasks created successfully");
-#if ENABLE_RS485_BATTERY_QUERY && ENABLE_JSON_PASSIVE_MODE
-    ESP_LOGI(TAG, "Battery Monitor System Ready! (RS485 + JSON Hybrid Mode)");
-#elif ENABLE_RS485_BATTERY_QUERY
-    ESP_LOGI(TAG, "Battery Monitor System Ready! (RS485 Auto Query Mode)");
-#elif ENABLE_JSON_PASSIVE_MODE
-    ESP_LOGI(TAG, "Battery Monitor System Ready! (JSON Passive Mode)");
+#if ENABLE_JSON_PASSIVE_MODE
+    ESP_LOGI(TAG, "Battery Monitor System Ready! (RS485 + JSON Hybrid Mode, runtime selectable)");
 #else
-    ESP_LOGI(TAG, "Battery Monitor System Ready! (Basic Mode)");
+    ESP_LOGI(TAG, "Battery Monitor System Ready! (RS485 Mode, runtime selectable)");
 #endif
     ESP_LOGI(TAG, "UART1 Communication: TX Pin=%d, RX Pin=%d, Baud=%d", 
              UART1_TXD_PIN, UART1_RXD_PIN, UART1_BAUD_RATE);
-#if ENABLE_RS485_BATTERY_QUERY
     ESP_LOGI(TAG, "RS485 Mode: Standard UART communication");
-#endif
     ESP_LOGI(TAG, "WS2812 Multi-Channel System: %d channels on GPIO 18-21, configurable LEDs per channel", 
              WS2812_CHANNEL_COUNT);
-#if ENABLE_RS485_BATTERY_QUERY
     ESP_LOGI(TAG, "Battery Auto Query: %s (Period: %dms, Timeout: %dms)", 
              g_battery_auto_query ? "Enabled" : "Disabled", BATTERY_QUERY_PERIOD, BATTERY_TIMEOUT_MS);
-#endif
     ESP_LOGI(TAG, "Charging Animation: %s (Period: %dms, Full Battery Threshold: %d%%)", 
              charging_animation_enabled ? "Enabled" : "Disabled", CHARGING_ANIM_PERIOD, BATTERY_FULL_THRESHOLD);
     ESP_LOGI(TAG, "Command formats:");
 #if ENABLE_JSON_PASSIVE_MODE
     ESP_LOGI(TAG, "  Battery Query: BATTERY or BATTERY:JSON or {\"query\": \"battery\"}");
     ESP_LOGI(TAG, "  Battery Control: {\"battery\": 75} or BATTERY:75");
-#if ENABLE_RS485_BATTERY_QUERY
     ESP_LOGI(TAG, "  Battery Detail: {\"query\": \"battery_detail\"}");
     ESP_LOGI(TAG, "  Manual Query: {\"trigger_battery_query\": true}");
     ESP_LOGI(TAG, "  Auto Query Control: {\"battery_auto_query\": true/false}");
-#endif
     ESP_LOGI(TAG, "  Charging Animation: {\"charging_animation\": true/false}");
     ESP_LOGI(TAG, "  Simulate Charging: {\"simulate_charging\": true/false}");
     ESP_LOGI(TAG, "  WS2812 JSON: {\"channel\": 0, \"mode\": 1, \"color\": {\"r\": 255, \"g\": 0, \"b\": 0}}");

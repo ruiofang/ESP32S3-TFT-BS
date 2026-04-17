@@ -1265,22 +1265,28 @@ esp_err_t wifi_init_ap(void)
                                                         NULL,
                                                         NULL));
 
+    /* 基于芯片 MAC 生成唯一 SSID：ESP32_Light_XXXX (取 MAC 后 2 字节, 同一芯片固定) */
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    char ssid_buf[32] = {0};
+    int ssid_len = snprintf(ssid_buf, sizeof(ssid_buf), "ESP32_Light_%02X%02X", mac[4], mac[5]);
+
     wifi_config_t wifi_config = {
         .ap = {
-            .ssid =  WIFI_SSID,
-            .ssid_len = strlen(WIFI_SSID),
             .channel = WIFI_CHANNEL,
             .password = WIFI_PASS,
             .max_connection = WIFI_MAX_STA_CONN,
             .authmode = WIFI_AUTH_WPA_WPA2_PSK
         },
     };
+    memcpy(wifi_config.ap.ssid, ssid_buf, ssid_len);
+    wifi_config.ap.ssid_len = ssid_len;
 
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    ESP_LOGI(TAG, "WiFi AP initialized. SSID: %s, Password: %s", wifi_config.ap.ssid, wifi_config.ap.password);
+    ESP_LOGI(TAG, "WiFi AP initialized. SSID: %s, Password: %s", ssid_buf, wifi_config.ap.password);
     
     return ESP_OK;
 }

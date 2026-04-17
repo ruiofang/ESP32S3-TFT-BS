@@ -58,6 +58,39 @@
 #define BATTERY_QUERY_PERIOD 3000   // 电池查询周期 (ms)
 #define BATTERY_TIMEOUT_MS   500    // 电池响应超时 (ms)
 
+// ---- BOOT 按键 & 运行时读取模式 ----
+#define BOOT_BUTTON_GPIO            0       // ESP32-S3 BOOT 按键
+#define BOOT_BUTTON_POLL_MS         30      // 去抖/轮询周期
+#define BOOT_BUTTON_DEBOUNCE_MS     50      // 稳定时间
+
+typedef enum {
+    BATT_READ_MODE_JSON = 0,     // JSON 被动模式 (UART 115200)
+    BATT_READ_MODE_RS485 = 1,    // RS485 电池协议 (DD/77 起止) 主动查询 (UART 9600)
+    BATT_READ_MODE_RS485_2 = 2,  // RS485-2 电池协议 (0xAA 帧头, 小端) 主动查询 (UART 9600)
+    BATT_READ_MODE_MAX
+} battery_read_mode_t;
+
+static battery_read_mode_t g_battery_read_mode = BATT_READ_MODE_JSON;
+
+static inline const char *battery_read_mode_name(battery_read_mode_t m)
+{
+    switch (m) {
+        case BATT_READ_MODE_JSON:    return "JSON";
+        case BATT_READ_MODE_RS485:   return "RS485";
+        case BATT_READ_MODE_RS485_2: return "RS485-2";
+        default: return "?";
+    }
+}
+
+// ---- RS485-2 协议 (参考 doc/通讯协议-20250113-客户(蓝牙 485协议).pdf) ----
+// 帧格式: 帧头(0xAA) + 命令(1B) + 数据长度(1B, <100) + 数据(LEN B) + 校验(2B, 小端, CMD+LEN+DATA 累加和)
+#define BATT2_FRAME_HEAD             0xAA
+#define BATT2_CMD_HANDSHAKE          0x00
+#define BATT2_CMD_BATTERY_INFO       0x21
+#define BATT2_QUERY_PERIOD_MS        2000    // 主动查询周期
+#define BATT2_RESP_TIMEOUT_MS        800     // 单次应答超时 (协议规定 1s)
+#define BATT2_MAX_DATA_LEN           100
+
 // 电池通信协议定义
 #define BATTERY_FRAME_START  0xDD   // 起始位
 #define BATTERY_FRAME_END    0x77   // 结束位
@@ -127,8 +160,27 @@ typedef struct {
 } uart_command_t;
 
 static QueueHandle_t uart_command_queue = NULL;
-static bool nvs_save_pending = false;          // NVS保存待处理标志
+static bool nvs_save_pending = false;          // NVS保存待处理标志 (已停用，保留以兼容)
 static esp_timer_handle_t nvs_save_timer = NULL;
+
+// ---- 电池信号丢失检测 ----
+#define BATTERY_SIGNAL_TIMEOUT_MS   15000   // 超过此时间无外部电量/充电/电压数据 -> 视为信号丢失
+#define BATTERY_NO_SIGNAL_BLINK_MS  500     // 丢失态红闪周期 (ms)
+static TickType_t g_last_signal_tick = 0;  // 上次收到外部电池数据的 tick, 0 表示从未收到
+static bool g_no_signal_blink_on = false;  // 红闪当前相位
+static esp_timer_handle_t no_signal_blink_timer = NULL;
+
+static inline bool is_battery_signal_lost(void)
+{
+    if (g_last_signal_tick == 0) return true;  // 启动后从未收到数据
+    return (xTaskGetTickCount() - g_last_signal_tick) > pdMS_TO_TICKS(BATTERY_SIGNAL_TIMEOUT_MS);
+}
+
+static inline void mark_battery_signal_alive(void)
+{
+    g_last_signal_tick = xTaskGetTickCount();
+    if (g_last_signal_tick == 0) g_last_signal_tick = 1; // 避免与"从未收到"标记冲突
+}
 
 // 电池状态缓存（避免每次重新创建JSON）
 static char cached_battery_json[256] = "";
@@ -155,25 +207,58 @@ static bool get_effective_charging_status(void)
 }
 
 /**
- * @brief NVS延时保存定时器回调
+ * @brief NVS延时保存定时器回调 (已停用 — 电池数据不再持久化以减少 Flash 磨损)
  */
 static void nvs_save_timer_callback(void *arg)
 {
-    if (nvs_save_pending) {
-        save_battery_state_to_nvs();
-        nvs_save_pending = false;
-    }
+    (void)arg;
+    // 不再执行保存
 }
 
 /**
- * @brief 请求延时保存到NVS（避免频繁写入）
+ * @brief 请求延时保存到NVS (已停用 — 电池状态不存储)
  */
 static void schedule_nvs_save(void)
 {
-    nvs_save_pending = true;
-    if (nvs_save_timer != NULL) {
-        esp_timer_stop(nvs_save_timer);
-        esp_timer_start_once(nvs_save_timer, 500000); // 500ms延时
+    // 电池电量/充电/电压等状态为易失数据，不写入 NVS。
+    // 保留空函数以兼容既有调用点，避免大面积改动。
+}
+
+/**
+ * @brief 无信号红色闪烁定时器回调
+ *        每 BATTERY_NO_SIGNAL_BLINK_MS 触发一次；仅当信号丢失时驱动闪烁，
+ *        信号恢复后立即关闭红灯并刷新 UI。
+ */
+static void no_signal_blink_timer_callback(void *arg)
+{
+    (void)arg;
+    static bool was_lost = false;
+    bool lost = is_battery_signal_lost();
+
+    if (lost) {
+        g_no_signal_blink_on = !g_no_signal_blink_on;
+        // 驱动 WS2812 红色闪烁 (广播到所有通道)
+        if (g_no_signal_blink_on) {
+            ws2812_set_color(WS2812_BROADCAST_ID, 255, 0, 0);
+        } else {
+            ws2812_set_color(WS2812_BROADCAST_ID, 0, 0, 0);
+        }
+        // 通知 LCD 刷新
+        ui_update_pending = true;
+        if (lvgl_task_handle != NULL) {
+            xTaskNotifyGive(lvgl_task_handle);
+        }
+        was_lost = true;
+    } else if (was_lost) {
+        // 刚刚从无信号恢复：熄灭红灯，下一轮 background_processing_task
+        // 会按正常模式重新驱动 WS2812；UI 也需要刷新回正常显示。
+        ws2812_set_color(WS2812_BROADCAST_ID, 0, 0, 0);
+        g_no_signal_blink_on = false;
+        ui_update_pending = true;
+        if (lvgl_task_handle != NULL) {
+            xTaskNotifyGive(lvgl_task_handle);
+        }
+        was_lost = false;
     }
 }
 
@@ -310,7 +395,9 @@ static void background_processing_task(void *pvParameters)
         
         // 定期处理WS2812更新（避免过于频繁）
         if (current_time - last_ws2812_update > pdMS_TO_TICKS(50)) {  // 最多20Hz更新
-            if (battery_display_override || charging_status_override) {
+            // 信号丢失时由 no_signal_blink_timer 独占 WS2812 (红闪)，这里跳过
+            if (!is_battery_signal_lost() &&
+                (battery_display_override || charging_status_override)) {
                 ws2812_update_battery_display(external_battery_value, external_charging_status);
             }
             last_ws2812_update = current_time;
@@ -359,9 +446,13 @@ static void background_processing_task(void *pvParameters)
 static lv_obj_t *battery_bar;          // 电池条
 static lv_obj_t *battery_label;        // 电池百分比标签
 static lv_obj_t *info_label;           // 信息标签
+static lv_obj_t *mode_label;           // 电池读取模式标签 (BOOT 键切换)
 
 // 函数声明
 static void update_battery_ui(void);
+static void apply_battery_read_mode(battery_read_mode_t mode);
+static void boot_button_task(void *pvParameters);
+static void rs485_2_query_task(void *pvParameters);
 void set_external_battery_level(int level);
 void set_external_battery_percentage(int percentage);
 void set_external_charging_status(bool charging);
@@ -1062,6 +1153,286 @@ static lv_color_t get_full_battery_color(uint32_t animation_step)
     }
 }
 
+/* ============================================================
+ * RS485-2 电池协议 (0xAA 帧头, 小端, 累加和校验)
+ * 协议来源: doc/通讯协议-20250113-客户(蓝牙 485协议).pdf
+ * ============================================================ */
+
+static uint16_t batt2_checksum(const uint8_t *p, size_t len)
+{
+    uint16_t s = 0;
+    while (len--) s += *p++;
+    return s;
+}
+
+// 发送一条无数据的查询指令: 0xAA CMD 0x00 SUM_L SUM_H
+static bool batt2_send_query(uint8_t cmd)
+{
+    uint8_t frame[5];
+    frame[0] = BATT2_FRAME_HEAD;
+    frame[1] = cmd;
+    frame[2] = 0x00;
+    uint16_t sum = batt2_checksum(&frame[1], 2);   // CMD + LEN
+    frame[3] = (uint8_t)(sum & 0xFF);
+    frame[4] = (uint8_t)((sum >> 8) & 0xFF);
+    int n = uart_write_bytes(UART_NUM_1, frame, sizeof(frame));
+    return n == (int)sizeof(frame);
+}
+
+// 读取一帧应答; 成功时将 payload 拷贝到 data_out (容量 cap), out_len 返回实际长度
+static bool batt2_read_response(uint8_t expected_cmd,
+                                uint8_t *data_out, size_t cap, uint8_t *out_len)
+{
+    // 先逐字节同步到帧头 0xAA (最多扫描 32 字节)
+    uint8_t b = 0;
+    int scan = 0;
+    while (scan < 32) {
+        int n = uart_read_bytes(UART_NUM_1, &b, 1, pdMS_TO_TICKS(BATT2_RESP_TIMEOUT_MS));
+        if (n != 1) return false;
+        if (b == BATT2_FRAME_HEAD) break;
+        scan++;
+    }
+    if (b != BATT2_FRAME_HEAD) return false;
+
+    // 读 CMD + LEN
+    uint8_t hdr[2];
+    int n = uart_read_bytes(UART_NUM_1, hdr, 2, pdMS_TO_TICKS(BATT2_RESP_TIMEOUT_MS));
+    if (n != 2) return false;
+    uint8_t cmd = hdr[0];
+    uint8_t len = hdr[1];
+    if (cmd != expected_cmd) {
+        ESP_LOGW(TAG, "RS485-2: cmd mismatch got 0x%02X want 0x%02X", cmd, expected_cmd);
+        return false;
+    }
+    if (len > BATT2_MAX_DATA_LEN) return false;
+
+    uint8_t buf[BATT2_MAX_DATA_LEN + 2];
+    size_t need = (size_t)len + 2; // payload + 2B checksum
+    n = uart_read_bytes(UART_NUM_1, buf, need, pdMS_TO_TICKS(BATT2_RESP_TIMEOUT_MS));
+    if (n != (int)need) return false;
+
+    // 校验: sum(CMD, LEN, DATA), 小端比较
+    uint16_t sum = (uint16_t)cmd + (uint16_t)len;
+    for (uint8_t i = 0; i < len; i++) sum += buf[i];
+    uint16_t recv = (uint16_t)buf[len] | ((uint16_t)buf[len + 1] << 8);
+    if (sum != recv) {
+        ESP_LOGW(TAG, "RS485-2: checksum err calc=0x%04X recv=0x%04X", sum, recv);
+        return false;
+    }
+
+    if (data_out && cap > 0) {
+        size_t copy = len < cap ? len : cap;
+        memcpy(data_out, buf, copy);
+    }
+    if (out_len) *out_len = len;
+    return true;
+}
+
+// 解析 0x21 电池信息 (26 字节, 小端)
+// [0..3]voltage(mV) [4..7]current(mA,有符号) [8]SOC% [9]SOH%
+// [10..13]remain(mAh) [14..17]full(mAh) [18..19]cycles
+// [20..23]temp1..4 [24]MOS_temp [25]env_temp
+static void batt2_parse_info(const uint8_t *d, uint8_t len)
+{
+    if (len < 26) {
+        ESP_LOGW(TAG, "RS485-2: info len=%u < 26", len);
+        return;
+    }
+    uint32_t mv = (uint32_t)d[0] | ((uint32_t)d[1] << 8) |
+                  ((uint32_t)d[2] << 16) | ((uint32_t)d[3] << 24);
+    int32_t  ma = (int32_t)((uint32_t)d[4] | ((uint32_t)d[5] << 8) |
+                            ((uint32_t)d[6] << 16) | ((uint32_t)d[7] << 24));
+    uint8_t soc = d[8];
+    uint8_t soh = d[9];
+    uint32_t remain_mah = (uint32_t)d[10] | ((uint32_t)d[11] << 8) |
+                         ((uint32_t)d[12] << 16) | ((uint32_t)d[13] << 24);
+    uint32_t full_mah   = (uint32_t)d[14] | ((uint32_t)d[15] << 8) |
+                         ((uint32_t)d[16] << 16) | ((uint32_t)d[17] << 24);
+    uint16_t cycles     = (uint16_t)d[18] | ((uint16_t)d[19] << 8);
+
+    float voltage_v = (float)mv / 1000.0f;
+    float current_a = (float)ma / 1000.0f;
+
+    // 喂入现有显示/WS2812/信号存活管线
+    set_external_voltage(voltage_v);
+    if (soc <= 100) set_external_battery_level(soc);
+    set_external_charging_status(current_a > 0.05f);
+
+    ESP_LOGI(TAG, "RS485-2: %.3fV %.3fA SOC=%u%% SOH=%u%% %u/%u mAh cycles=%u",
+             voltage_v, current_a, soc, soh,
+             (unsigned)remain_mah, (unsigned)full_mah, (unsigned)cycles);
+}
+
+/**
+ * @brief RS485-2 主动查询任务
+ *        仅当当前模式为 BATT_READ_MODE_RS485_2 时才持有 UART 进行收发；
+ *        其它模式下进入长睡眠，不干扰 UART 通道。
+ */
+static void rs485_2_query_task(void *pvParameters)
+{
+    (void)pvParameters;
+    bool handshaked = false;
+    uint32_t fail_count = 0;
+
+    while (1) {
+        if (g_battery_read_mode != BATT_READ_MODE_RS485_2) {
+            handshaked = false;
+            fail_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        // 首次进入或多次失败后重新握手, 避免 BMS 处于休眠
+        if (!handshaked || fail_count >= 3) {
+            uart_flush_input(UART_NUM_1);
+            batt2_send_query(BATT2_CMD_HANDSHAKE);
+            uint8_t tmp[8]; uint8_t tl = 0;
+            (void)batt2_read_response(BATT2_CMD_HANDSHAKE, tmp, sizeof(tmp), &tl);
+            handshaked = true;
+            fail_count = 0;
+            vTaskDelay(pdMS_TO_TICKS(50));
+        }
+
+        uart_flush_input(UART_NUM_1);
+        bool ok = false;
+        if (batt2_send_query(BATT2_CMD_BATTERY_INFO)) {
+            uint8_t data[BATT2_MAX_DATA_LEN]; uint8_t rl = 0;
+            if (batt2_read_response(BATT2_CMD_BATTERY_INFO, data, sizeof(data), &rl)) {
+                batt2_parse_info(data, rl);
+                ok = true;
+            }
+        }
+        if (!ok) {
+            fail_count++;
+            ESP_LOGW(TAG, "RS485-2: query failed (%u)", (unsigned)fail_count);
+        } else {
+            fail_count = 0;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BATT2_QUERY_PERIOD_MS));
+    }
+}
+
+/**
+ * @brief 应用指定的电池读取模式：同步 UART 波特率并通知 UI 刷新
+ */
+/* ============================================================
+ * 读取模式持久化 (独立 NVS 命名空间, 只存一个 u8, 对 Flash 压力极小)
+ * ============================================================ */
+#define MODE_NVS_NAMESPACE   "batt_mode"
+#define MODE_NVS_KEY         "mode"
+
+static void save_battery_read_mode_to_nvs(battery_read_mode_t mode)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(MODE_NVS_NAMESPACE, NVS_READWRITE, &h);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "save mode: nvs_open failed: %s", esp_err_to_name(err));
+        return;
+    }
+    uint8_t cur = 0xFF;
+    nvs_get_u8(h, MODE_NVS_KEY, &cur);
+    if (cur != (uint8_t)mode) {
+        err = nvs_set_u8(h, MODE_NVS_KEY, (uint8_t)mode);
+        if (err == ESP_OK) err = nvs_commit(h);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "save mode: write failed: %s", esp_err_to_name(err));
+        } else {
+            ESP_LOGI(TAG, "Battery read mode saved to NVS: %s",
+                     battery_read_mode_name(mode));
+        }
+    }
+    nvs_close(h);
+}
+
+static battery_read_mode_t load_battery_read_mode_from_nvs(void)
+{
+    nvs_handle_t h;
+    if (nvs_open(MODE_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) {
+        return BATT_READ_MODE_JSON;
+    }
+    uint8_t v = 0;
+    battery_read_mode_t m = BATT_READ_MODE_JSON;
+    if (nvs_get_u8(h, MODE_NVS_KEY, &v) == ESP_OK && v < BATT_READ_MODE_MAX) {
+        m = (battery_read_mode_t)v;
+    }
+    nvs_close(h);
+    return m;
+}
+
+/**
+ * @brief 应用指定的电池读取模式：同步 UART 波特率并通知 UI 刷新
+ */
+static void apply_battery_read_mode(battery_read_mode_t mode)
+{
+    if (mode >= BATT_READ_MODE_MAX) mode = BATT_READ_MODE_JSON;
+    g_battery_read_mode = mode;
+
+    uint32_t baud = 115200;   // JSON 默认
+    if (mode == BATT_READ_MODE_RS485 || mode == BATT_READ_MODE_RS485_2) baud = 9600;
+
+    // 切换波特率并刷新缓冲，避免残留数据
+    esp_err_t err = uart_set_baudrate(UART_NUM_1, baud);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "uart_set_baudrate(%u) failed: %s", (unsigned)baud, esp_err_to_name(err));
+    }
+    uart_flush_input(UART_NUM_1);
+
+    // 持久化 (仅在值变化时真正写 Flash)
+    save_battery_read_mode_to_nvs(mode);
+
+    ESP_LOGI(TAG, "Battery read mode -> %s (UART1 baud=%u)",
+             battery_read_mode_name(mode), (unsigned)baud);
+
+    // 通知 LVGL 任务立刻刷新模式标签
+    ui_update_pending = true;
+    if (lvgl_task_handle != NULL) {
+        xTaskNotifyGive(lvgl_task_handle);
+    }
+}
+
+/**
+ * @brief BOOT 键轮询任务：下降沿 + 去抖，触发模式循环切换
+ */
+static void boot_button_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    gpio_config_t io_cfg = {
+        .pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_cfg);
+
+    bool last_level = true;            // 按下为低
+    TickType_t last_change = xTaskGetTickCount();
+    bool pending_release = false;      // 防止长按重复触发
+
+    while (1) {
+        bool level = gpio_get_level(BOOT_BUTTON_GPIO) ? true : false;
+        TickType_t now = xTaskGetTickCount();
+
+        if (level != last_level) {
+            last_change = now;
+            last_level = level;
+        } else if ((now - last_change) >= pdMS_TO_TICKS(BOOT_BUTTON_DEBOUNCE_MS)) {
+            if (!level && !pending_release) {
+                // 稳定在低 -> 按下事件（仅触发一次，直到松开）
+                battery_read_mode_t next = (battery_read_mode_t)((g_battery_read_mode + 1) % BATT_READ_MODE_MAX);
+                apply_battery_read_mode(next);
+                pending_release = true;
+            } else if (level && pending_release) {
+                pending_release = false;
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(BOOT_BUTTON_POLL_MS));
+    }
+}
+
 /**
  * @brief 创建简洁的电池电量条界面（横屏布局 428x142）
  */
@@ -1126,7 +1497,14 @@ static void create_battery_ui(void)
     // }
     // lv_obj_set_style_text_font(info_label, &lv_font_montserrat_12, 0);
     // lv_obj_align(info_label, LV_ALIGN_BOTTOM_MID, 0, -15);
-    
+
+    // 电池读取模式标签 - 屏幕左上角，BOOT 键切换
+    mode_label = lv_label_create(scr);
+    lv_label_set_text_fmt(mode_label, "MODE: %s", battery_read_mode_name(g_battery_read_mode));
+    lv_obj_set_style_text_color(mode_label, lv_color_hex(0xAAAAAA), 0);
+    lv_obj_set_style_text_font(mode_label, &lv_font_montserrat_14, 0);
+    lv_obj_align(mode_label, LV_ALIGN_TOP_LEFT, 8, 6);
+
     ESP_LOGI(TAG, "Simplified battery UI created successfully (428x142) with %d%%", initial_percentage);
 }
 
@@ -1135,6 +1513,35 @@ static void create_battery_ui(void)
  */
 static void update_battery_ui(void)
 {
+    // 始终刷新模式标签（BOOT 键切换后立即可见）
+    if (mode_label) {
+        lv_label_set_text_fmt(mode_label, "MODE: %s", battery_read_mode_name(g_battery_read_mode));
+        lv_obj_invalidate(mode_label);
+    }
+
+    // ---- 信号丢失优先：显示红色闪烁的报警画面 ----
+    if (is_battery_signal_lost()) {
+        bool blink_on = g_no_signal_blink_on;
+        if (battery_bar) {
+            // 进度条满格红色 / 熄灭 交替，形成闪烁
+            lv_bar_set_value(battery_bar, 100, LV_ANIM_OFF);
+            lv_obj_set_style_bg_color(battery_bar,
+                blink_on ? lv_color_hex(0xFF0000) : lv_color_hex(0x000000),
+                LV_PART_INDICATOR);
+        }
+        if (battery_label) {
+            lv_label_set_text(battery_label, blink_on ? "NO SIGNAL" : "");
+            lv_obj_set_style_text_color(battery_label, lv_color_hex(0xFFFFFF), 0);
+            lv_obj_invalidate(battery_label);
+        }
+        if (info_label) {
+            lv_label_set_text(info_label, "Battery data lost - check UART/host");
+            lv_obj_set_style_text_color(info_label, lv_color_hex(0xFF0000), 0);
+            lv_obj_invalidate(info_label);
+        }
+        return;
+    }
+
     // 获取要显示的电量值和充电状态
     int base_percentage = external_battery_value;  // 始终使用external_battery_value
     // 应用充电动画效果
@@ -1301,6 +1708,9 @@ static void update_battery_ui(void)
 void set_external_battery_level(int level)
 {
     if (level >= 0 && level <= 100) {
+        // 标记收到外部数据 (即使值未变化也表示通信正常)
+        mark_battery_signal_alive();
+
         // 检查参数是否真正发生变化
         bool battery_changed = (external_battery_value != level);
         bool override_changed = !battery_display_override;
@@ -1329,6 +1739,9 @@ void set_external_battery_level(int level)
  */
 void set_external_charging_status(bool charging)
 {
+    // 标记收到外部数据
+    mark_battery_signal_alive();
+
     // 检查参数是否真正发生变化
     bool charging_changed = (external_charging_status != charging);
     bool override_changed = !charging_status_override;
@@ -1539,6 +1952,9 @@ bool is_charging(void)
  */
 void set_external_voltage(float voltage)
 {
+    // 标记收到外部数据
+    mark_battery_signal_alive();
+
     // 检查电压值是否真正发生变化（使用小的容差避免浮点精度问题）
     bool voltage_changed = (fabs(external_voltage_value - voltage) > 0.01f);
     bool override_changed = !voltage_override;
@@ -1664,6 +2080,18 @@ static void uart_command_task(void *pvParameters)
     uint32_t idle_cycles = 0;
     
     while (1) {
+        // RS485 / RS485-2 主动查询模式下，UART 由查询任务独占，避免并发读导致数据被瓜分
+        if (g_battery_read_mode != BATT_READ_MODE_JSON) {
+#if ENABLE_JSON_PASSIVE_MODE
+            in_json = false;
+            command_pos = 0;
+            json_brace_count = 0;
+            parse_last_activity = xTaskGetTickCount();
+#endif
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         int len = uart_read_bytes(UART_NUM_1, data, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
 
         if (len < 0) {
@@ -1878,15 +2306,38 @@ void app_main(void)
         ESP_LOGI(TAG, "UART command queue created (size: %d)", UART_QUEUE_SIZE);
     }
     
-    // 创建NVS延时保存定时器
-    const esp_timer_create_args_t nvs_timer_args = {
-        .callback = &nvs_save_timer_callback,
-        .name = "nvs_save"
+    // 创建NVS延时保存定时器 (已停用，不再创建)
+    // const esp_timer_create_args_t nvs_timer_args = {
+    //     .callback = &nvs_save_timer_callback,
+    //     .name = "nvs_save"
+    // };
+    // ESP_ERROR_CHECK(esp_timer_create(&nvs_timer_args, &nvs_save_timer));
+
+    // 创建"无信号"红色闪烁定时器 (持续运行，内部按信号状态决定是否驱动)
+    const esp_timer_create_args_t blink_timer_args = {
+        .callback = &no_signal_blink_timer_callback,
+        .name = "nosig_blink"
     };
-    ESP_ERROR_CHECK(esp_timer_create(&nvs_timer_args, &nvs_save_timer));
+    ESP_ERROR_CHECK(esp_timer_create(&blink_timer_args, &no_signal_blink_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(no_signal_blink_timer,
+                                             BATTERY_NO_SIGNAL_BLINK_MS * 1000));
     
+    // 从 NVS 恢复上次的电池读取模式 (默认 JSON)
+    g_battery_read_mode = load_battery_read_mode_from_nvs();
+    ESP_LOGI(TAG, "Battery read mode restored: %s",
+             battery_read_mode_name(g_battery_read_mode));
+
     // 初始化UART1 (统一串口)
     uart1_init();
+
+    // 按恢复的模式设置 UART 波特率 (uart1_init 使用编译时默认波特率)
+    {
+        uint32_t baud = 115200;
+        if (g_battery_read_mode == BATT_READ_MODE_RS485 ||
+            g_battery_read_mode == BATT_READ_MODE_RS485_2) baud = 9600;
+        uart_set_baudrate(UART_NUM_1, baud);
+        uart_flush_input(UART_NUM_1);
+    }
 
     // 初始化LED
     led_init();
@@ -1943,6 +2394,12 @@ void app_main(void)
     
     // 创建WS2812控制任务
     xTaskCreate(ws2812_task, "ws2812", 4096, NULL, 2, NULL);
+
+    // 创建 BOOT 按键任务 (切换电池读取模式)
+    xTaskCreate(boot_button_task, "boot_btn", 2560, NULL, 3, NULL);
+
+    // 创建 RS485-2 主动查询任务 (仅在 RS485-2 模式下工作)
+    xTaskCreate(rs485_2_query_task, "rs485_2", 3072, NULL, 3, NULL);
     
     ESP_LOGI(TAG, "All tasks created successfully");
 #if ENABLE_RS485_BATTERY_QUERY && ENABLE_JSON_PASSIVE_MODE

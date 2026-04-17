@@ -44,7 +44,14 @@ class SerialManager:
 
     def open(self, port, baud):
         self.close()
-        self.ser = serial.Serial(port, baud, timeout=0.1)
+        # 先不打开，手动控制 DTR/RTS 避免 CH340X 触发 ESP32 复位
+        self.ser = serial.Serial()
+        self.ser.port = port
+        self.ser.baudrate = baud
+        self.ser.timeout = 0.1
+        self.ser.dtr = False
+        self.ser.rts = False
+        self.ser.open()
         return True
 
     def close(self):

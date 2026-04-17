@@ -414,26 +414,75 @@ static void background_processing_task(void *pvParameters)
             // 处理复杂的WS2812命令等
             if (strncmp(cmd.command, "JSON:", 5) == 0) {
                 const char *json_str = cmd.command + 5;
-                ws2812_handle_json_command(json_str);
 
-                // 同步处理电池相关字段 (与 web_server api_unified_handler 对齐)
-                // ws2812_handle_json_command 仅更新 WS2812 LED，
-                // 还需更新 LCD 显示和信号存活标记
+                // 只解析一次 JSON，避免双重 cJSON_Parse 浪费内存和 CPU
                 cJSON *jcmd = cJSON_Parse(json_str);
                 if (jcmd) {
+                    // 先处理电池相关字段 (voltage / battery / charging)
+                    bool has_battery_fields = false;
                     cJSON *jvolt = cJSON_GetObjectItem(jcmd, "voltage");
-                    if (jvolt && cJSON_IsNumber(jvolt)) {
-                        set_external_voltage((float)jvolt->valuedouble);
-                    }
                     cJSON *jbatt = cJSON_GetObjectItem(jcmd, "battery");
+                    cJSON *jchg  = cJSON_GetObjectItem(jcmd, "charging");
+
+                    if (jvolt && cJSON_IsNumber(jvolt)) {
+                        float v = (float)jvolt->valuedouble;
+                        mark_battery_signal_alive();
+                        bool changed = (fabsf(external_voltage_value - v) > 0.01f) || !voltage_override;
+                        if (changed) {
+                            external_voltage_value = v;
+                            voltage_override = true;
+                        }
+                        has_battery_fields = true;
+                    }
                     if (jbatt && cJSON_IsNumber(jbatt)) {
-                        set_external_battery_percentage(jbatt->valueint);
+                        int level = jbatt->valueint;
+                        if (level >= 0 && level <= 100) {
+                            mark_battery_signal_alive();
+                            bool changed = (external_battery_value != level) || !battery_display_override;
+                            if (changed) {
+                                external_battery_value = level;
+                                battery_display_override = true;
+                                ws2812_update_battery_display(external_battery_value, external_charging_status);
+                            }
+                            has_battery_fields = true;
+                        }
                     }
-                    cJSON *jchg = cJSON_GetObjectItem(jcmd, "charging");
                     if (jchg && cJSON_IsBool(jchg)) {
-                        set_external_charging_status(cJSON_IsTrue(jchg));
+                        bool charging = cJSON_IsTrue(jchg);
+                        mark_battery_signal_alive();
+                        bool changed = (external_charging_status != charging) || !charging_status_override;
+                        if (changed) {
+                            external_charging_status = charging;
+                            charging_status_override = true;
+                            bool is_chg_disp = charging_status_override && external_charging_status;
+                            if (is_chg_disp) start_charging_animation();
+                            else stop_charging_animation();
+                            ws2812_update_battery_display(external_battery_value, external_charging_status);
+                        }
+                        has_battery_fields = true;
                     }
+
+                    // 电池字段处理完毕后统一触发一次 UI 刷新
+                    if (has_battery_fields) {
+                        notify_ui_update_needed();
+                    }
+
+                    // 判断是否还包含 WS2812 相关字段，避免对纯电池命令做无用处理
+                    bool has_ws2812_fields = (cJSON_GetObjectItem(jcmd, "channel") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "mode") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "color") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "brightness") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "battery_channel") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "battery_display") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "battery_status") != NULL ||
+                                              cJSON_GetObjectItem(jcmd, "action") != NULL);
+                    if (has_ws2812_fields) {
+                        ws2812_handle_json_command(json_str);
+                    }
+
                     cJSON_Delete(jcmd);
+                } else {
+                    ESP_LOGW(TAG, "JSON parse failed for: %.64s", json_str);
                 }
             }
         }
@@ -2372,7 +2421,7 @@ void app_main(void)
     
     // 创建后台处理任务
     if (uart_command_queue != NULL) {
-        xTaskCreate(background_processing_task, "background", 4096, NULL, 1, NULL);  // 较低优先级的后台处理
+        xTaskCreate(background_processing_task, "background", 6144, NULL, 1, NULL);  // 较低优先级的后台处理
         ESP_LOGI(TAG, "Background processing task created");
     }
     

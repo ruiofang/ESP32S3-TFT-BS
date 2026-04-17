@@ -389,11 +389,14 @@ static void uart1_init(void)
         .source_clk = UART_SCLK_DEFAULT,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, UART_BUF_SIZE * 2, 0, 0, NULL, 0));
+    // 使用更大的 RX ring（4x 缓冲），避免高波特率或突发数据下 ring-full 卡死
+    ESP_ERROR_CHECK(uart_driver_install(UART_NUM_1, UART_BUF_SIZE * 4, UART_BUF_SIZE, 0, NULL, 0));
     ESP_ERROR_CHECK(uart_param_config(UART_NUM_1, &uart_config));
-    
+
     // 配置普通UART模式
     ESP_ERROR_CHECK(uart_set_pin(UART_NUM_1, UART1_TXD_PIN, UART1_RXD_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+    // 清空可能存在的遗留数据
+    uart_flush_input(UART_NUM_1);
     ESP_LOGI(TAG, "UART1 initialized - TX:%d, RX:%d, Baud:%d", 
              UART1_TXD_PIN, UART1_RXD_PIN, UART1_BAUD_RATE);
 
@@ -1654,14 +1657,34 @@ static void uart_command_task(void *pvParameters)
     int command_pos = 0;
     int json_brace_count = 0;
     bool in_json = false;
+    TickType_t parse_last_activity = xTaskGetTickCount();
+    const TickType_t PARSE_TIMEOUT_TICKS = pdMS_TO_TICKS(2000); // 解析空闲超时 2s
 #endif
+    // RX 持续无数据计数，用于探测并恢复驱动异常
+    uint32_t idle_cycles = 0;
     
     while (1) {
         int len = uart_read_bytes(UART_NUM_1, data, UART_BUF_SIZE - 1, pdMS_TO_TICKS(100));
-        
+
+        if (len < 0) {
+            // 驱动错误（FIFO 溢出/buffer full 等）-> 刷新 RX 恢复
+            ESP_LOGW(TAG, "uart_read_bytes error %d, flushing UART1", len);
+            uart_flush_input(UART_NUM_1);
+#if ENABLE_JSON_PASSIVE_MODE
+            in_json = false;
+            command_pos = 0;
+            json_brace_count = 0;
+            parse_last_activity = xTaskGetTickCount();
+#endif
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
         if (len > 0) {
+            idle_cycles = 0;
 #if ENABLE_JSON_PASSIVE_MODE
             data[len] = '\0';
+            parse_last_activity = xTaskGetTickCount();
             
             for (int i = 0; i < len; i++) {
                 char c = (char)data[i];
@@ -1687,16 +1710,32 @@ static void uart_command_task(void *pvParameters)
                     }
                     json_brace_count--;
                     
-                    if (json_brace_count == 0) {
+                    if (json_brace_count <= 0) {
                         // 完整的JSON命令接收完毕
                         command_buffer[command_pos] = '\0';
-                        
-                        // 处理JSON命令...
-                        // (这里包含完整的JSON处理逻辑)
-                        
+
+                        // 投递到后台处理队列（非阻塞），保持 UART 任务流畅
+                        if (uart_command_queue != NULL) {
+                            uart_command_t qcmd;
+                            // 加 "JSON:" 前缀交给 background_processing_task 处理
+                            int prefix_len = 5;
+                            int json_len = command_pos;
+                            if (json_len > (int)sizeof(qcmd.command) - prefix_len - 1) {
+                                json_len = sizeof(qcmd.command) - prefix_len - 1;
+                            }
+                            memcpy(qcmd.command, "JSON:", prefix_len);
+                            memcpy(qcmd.command + prefix_len, command_buffer, json_len);
+                            qcmd.command[prefix_len + json_len] = '\0';
+                            qcmd.length = prefix_len + json_len;
+                            if (xQueueSend(uart_command_queue, &qcmd, 0) != pdTRUE) {
+                                ESP_LOGW(TAG, "UART cmd queue full, JSON dropped");
+                            }
+                        }
+
                         // 重置状态
                         in_json = false;
                         command_pos = 0;
+                        json_brace_count = 0;
                     }
                 } else if (in_json) {
                     // JSON内部的其他字符
@@ -1721,6 +1760,10 @@ static void uart_command_task(void *pvParameters)
                         }
                     } else if (command_pos < sizeof(command_buffer) - 1) {
                         command_buffer[command_pos++] = c;
+                    } else {
+                        // 非 JSON 行过长，丢弃并复位，防止残留
+                        ESP_LOGW(TAG, "Line buffer overflow, resetting");
+                        command_pos = 0;
                     }
                 }
             }
@@ -1728,6 +1771,30 @@ static void uart_command_task(void *pvParameters)
             // 仅RS485模式 - 忽略接收到的数据或记录日志
             ESP_LOGD(TAG, "Received %d bytes (RS485 mode, ignoring JSON commands)", len);
 #endif
+        } else {
+            // len == 0: 超时无数据
+            idle_cycles++;
+#if ENABLE_JSON_PASSIVE_MODE
+            // 若解析状态挂起过久(例如收到半个 JSON 就断开)，复位避免"卡死"
+            if ((in_json || command_pos > 0) &&
+                (xTaskGetTickCount() - parse_last_activity) > PARSE_TIMEOUT_TICKS) {
+                ESP_LOGW(TAG, "UART1 parse state stale (%dms), resetting",
+                         (int)((xTaskGetTickCount() - parse_last_activity) * portTICK_PERIOD_MS));
+                in_json = false;
+                command_pos = 0;
+                json_brace_count = 0;
+                parse_last_activity = xTaskGetTickCount();
+            }
+#endif
+            // 长时间无数据 -> 周期性刷新驱动 RX 以兜底异常状态(约每 30s)
+            if (idle_cycles >= 300) {
+                idle_cycles = 0;
+                size_t buffered = 0;
+                if (uart_get_buffered_data_len(UART_NUM_1, &buffered) == ESP_OK && buffered > 0) {
+                    ESP_LOGW(TAG, "UART1 idle but %u bytes stuck in buffer, flushing", (unsigned)buffered);
+                    uart_flush_input(UART_NUM_1);
+                }
+            }
         }
         vTaskDelay(pdMS_TO_TICKS(10));
     }

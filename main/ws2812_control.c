@@ -57,6 +57,22 @@ void ws2812_set_no_signal_override(bool enable, uint8_t r, uint8_t g, uint8_t b)
     g_no_signal_override_enabled = enable;
 }
 
+// Claude 状态覆盖：把所有已启用通道涂成同一颜色
+static volatile bool g_claude_override_enabled = false;
+static volatile uint8_t g_claude_override_r = 0;
+static volatile uint8_t g_claude_override_g = 0;
+static volatile uint8_t g_claude_override_b = 0;
+static volatile uint8_t g_claude_override_bright = 255;
+
+void ws2812_set_claude_override(bool enable, uint8_t r, uint8_t g, uint8_t b, uint8_t brightness)
+{
+    g_claude_override_r = r;
+    g_claude_override_g = g;
+    g_claude_override_b = b;
+    g_claude_override_bright = brightness;
+    g_claude_override_enabled = enable;
+}
+
 // 自动循环模式相关变量 - 每个通道独立
 static uint32_t auto_cycle_timers[WS2812_CHANNEL_COUNT] = {0};
 static uint32_t auto_cycle_durations[WS2812_CHANNEL_COUNT] = {8000, 8000, 8000, 8000};
@@ -652,6 +668,23 @@ void ws2812_task(void *pvParameters) {
     ESP_LOGI(TAG, "WS2812 multi-channel task started");
     
     while (task_running) {
+        // --- Claude 状态覆盖：所有已启用通道同色显示 (优先级低于无信号覆盖) ---
+        if (g_claude_override_enabled && !g_no_signal_override_enabled) {
+            uint8_t br = g_claude_override_bright;
+            uint16_t r = ((uint16_t)g_claude_override_r * br) / 255;
+            uint16_t g = ((uint16_t)g_claude_override_g * br) / 255;
+            uint16_t b = ((uint16_t)g_claude_override_b * br) / 255;
+            for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+                if (!channels[ch].enabled || led_strips[ch] == NULL) continue;
+                for (int i = 0; i < channels[ch].led_count; i++) {
+                    led_strip_set_pixel(led_strips[ch], i, (uint8_t)r, (uint8_t)g, (uint8_t)b);
+                }
+                led_strip_refresh(led_strips[ch]);
+            }
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
         // --- 无信号覆盖：只让"电量显示通道"闪烁，其它通道保持原状 ---
         if (g_no_signal_override_enabled) {
             uint8_t r = g_no_signal_override_r;

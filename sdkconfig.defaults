@@ -1,0 +1,42 @@
+# Project default sdkconfig - applied via `idf.py reconfigure`.
+# These keys ensure BLE (NimBLE) stays enabled for the Claude status mode.
+
+# ---- Target ----
+CONFIG_IDF_TARGET="esp32s3"
+
+# ---- Flash / partition ----
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# ---- BLE (NimBLE, peripheral only) ----
+# Memory footprint is tuned down to leave DRAM for WiFi (softAP runs concurrently).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=128
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=4608
+# Disable NimBLE bonding storage in NVS so no stale keys persist between flashes
+# CONFIG_BT_NIMBLE_NVS_PERSIST is not set
+CONFIG_BT_NIMBLE_LOG_LEVEL_INFO=y
+
+# SM stays enabled but configured at runtime for "just works, no bonding".
+# Disabling SM entirely caused some hosts (Linux BlueZ) to still emit pairing
+# requests that we couldn't respond to, dropping the link with HCI 0x05.
+CONFIG_BT_NIMBLE_SECURITY_ENABLE=y
+
+# ---- BLE controller: shrink to 1 peripheral activity, no scan duplication cache ----
+CONFIG_BT_CTRL_BLE_MAX_ACT=2
+CONFIG_BT_CTRL_ADV_DUP_FILT_MAX=4
+CONFIG_BT_CTRL_BLE_ADV_REPORT_FLOW_CTRL_NUM=8
+CONFIG_BT_CTRL_BLE_ADV_REPORT_DISCARD_THRSHOLD=4
+CONFIG_BT_CTRL_SCAN_DUPL_CACHE_SIZE=4
+
+# ---- WiFi: trim buffers so BT controller has DRAM headroom ----
+CONFIG_ESP_WIFI_STATIC_RX_BUFFER_NUM=6
+CONFIG_ESP_WIFI_DYNAMIC_RX_BUFFER_NUM=16
+CONFIG_ESP_WIFI_DYNAMIC_TX_BUFFER_NUM=16

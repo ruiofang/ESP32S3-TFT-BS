@@ -1,16 +1,35 @@
 idf_component_register(
-    SRCS 
+    SRCS
         "main.c"
         "web_server.c"
         "ws2812_control.c"
         "i2s_mic.c"
+        "claude_mode.c"
         "APP/lvgl_demo.c"
         "Lib/cJSON/cJSON.c"
-    INCLUDE_DIRS 
+    INCLUDE_DIRS
         "."
         "APP"
         "Lib"
         "Lib/cJSON"
+    PRIV_REQUIRES
+        bt
+        spiffs
+        nvs_flash
+        vfs
+        esp_timer
+        esp_event
+        esp_wifi
+        esp_netif
+        esp_http_server
+        driver
+        esp_driver_i2s
+        esp_driver_rmt
+        esp_driver_gpio
+        esp_driver_uart
+        esp_hw_support
+        log
+        BSP
 )
 
 # 自动烧录到flash

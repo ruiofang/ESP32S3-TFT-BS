@@ -224,6 +224,16 @@ esp_err_t ws2812_update_battery_display(int battery_percentage, bool is_charging
 void ws2812_set_no_signal_override(bool enable, uint8_t r, uint8_t g, uint8_t b);
 
 /**
+ * @brief Claude 状态覆盖：启用后所有已启用通道用同一颜色显示 Claude 当前状态；
+ *        不写 NVS，不修改用户配置；禁用后恢复正常模式渲染。
+ *        优先级高于普通模式渲染，低于信号丢失覆盖。
+ * @param enable     true=启用覆盖，false=关闭覆盖
+ * @param r,g,b      覆盖颜色
+ * @param brightness 亮度系数 (0-255)
+ */
+void ws2812_set_claude_override(bool enable, uint8_t r, uint8_t g, uint8_t b, uint8_t brightness);
+
+/**
  * @brief 获取电量显示配置
  * @return 电量显示配置结构体
  */

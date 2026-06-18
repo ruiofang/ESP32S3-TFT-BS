@@ -74,24 +74,27 @@ void lv_port_disp_init(void)
     // LV_ATTRIBUTE_MEM_ALIGN
     // static uint8_t buf_2_2[MY_DISP_HOR_RES * 10 * BYTE_PER_PIXEL];
     
-    // 动态分配LVGL缓冲区到PSRAM
-    uint32_t buf_size = MY_DISP_HOR_RES * 10 * BYTE_PER_PIXEL;
-    uint8_t* buf_2_1 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    uint8_t* buf_2_2 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    
+    // LVGL 缓冲: 放在内部 DMA-capable RAM, 让 SPI 可以直接 DMA 传输,
+    // 避免每帧分配 ~8KB 的 bounce buffer (BLE/WiFi 运行后内部 RAM 紧张)。
+    // 4 行 ~3.4 KB/buffer x 2 = 6.8 KB, 在 32 KB DRAM 里可控。
+    uint32_t buf_size = MY_DISP_HOR_RES * 4 * BYTE_PER_PIXEL;
+    uint8_t* buf_2_1 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+    uint8_t* buf_2_2 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_DMA | MALLOC_CAP_8BIT);
+
     if (buf_2_1 == NULL || buf_2_2 == NULL) {
-        ESP_LOGE(TAG, "Failed to allocate LVGL buffers in PSRAM, trying internal RAM");
+        ESP_LOGE(TAG, "Failed to allocate LVGL buffers in DMA RAM, trying PSRAM");
         if (buf_2_1) free(buf_2_1);
         if (buf_2_2) free(buf_2_2);
-        buf_2_1 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_8BIT);
-        buf_2_2 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_8BIT);
+        buf_2_1 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        buf_2_2 = (uint8_t*)heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
         if (buf_2_1 == NULL || buf_2_2 == NULL) {
             ESP_LOGE(TAG, "Failed to allocate LVGL buffers");
             return;
         }
-        ESP_LOGW(TAG, "LVGL buffers allocated in internal RAM");
+        ESP_LOGW(TAG, "LVGL buffers allocated in PSRAM (SPI will need bounce buffer)");
     } else {
-        ESP_LOGI(TAG, "LVGL buffers allocated in PSRAM");
+        ESP_LOGI(TAG, "LVGL buffers allocated in internal DMA RAM (%u bytes each)",
+                 (unsigned)buf_size);
     }
     
     lv_display_set_buffers(disp, buf_2_1, buf_2_2, buf_size, LV_DISPLAY_RENDER_MODE_PARTIAL);

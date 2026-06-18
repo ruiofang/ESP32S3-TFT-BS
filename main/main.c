@@ -14,6 +14,7 @@
 #include "driver/gpio.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
+#include "esp_system.h"
 #include "lvgl.h"
 #include "Lib/cJSON/cJSON.h"
 #include "i2s_mic.h"
@@ -22,6 +23,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "battery_control.h"
+#include "claude_mode.h"
 
 #define TAG "BATTERY_MONITOR"
 
@@ -62,12 +64,19 @@
 
 typedef enum {
     BATT_READ_MODE_JSON = 0,     // JSON 被动模式 (UART 115200)
-    BATT_READ_MODE_RS485_1 = 1,    // RS485 电池协议 (DD/77 起止) 主动查询 (UART 9600)
+    BATT_READ_MODE_RS485_1 = 1,  // RS485 电池协议 (DD/77 起止) 主动查询 (UART 9600)
     BATT_READ_MODE_RS485_2 = 2,  // RS485-2 电池协议 (0xAA 帧头, 小端) 主动查询 (UART 9600)
+    BATT_READ_MODE_CLAUDE = 3,   // Claude 状态模式 (BLE NUS 接收 PC 推送)
     BATT_READ_MODE_MAX
 } battery_read_mode_t;
 
 static battery_read_mode_t g_battery_read_mode = BATT_READ_MODE_JSON;
+
+// CLAUDE 模式切换请求 (跨任务通信)
+// boot_button_task / app_main 只设置请求, LVGL 任务负责调用实际的 enter/exit
+// (LVGL widget API 和 NimBLE 初始化都需要在单线程/大栈环境下进行)
+// 0=无请求, 1=请求进入, 2=请求退出
+static volatile int g_claude_mode_request = 0;
 
 static inline const char *battery_read_mode_name(battery_read_mode_t m)
 {
@@ -75,6 +84,7 @@ static inline const char *battery_read_mode_name(battery_read_mode_t m)
         case BATT_READ_MODE_JSON:    return "JSON";
         case BATT_READ_MODE_RS485_1: return "RS485-1";
         case BATT_READ_MODE_RS485_2: return "RS485-2";
+        case BATT_READ_MODE_CLAUDE:  return "CLAUDE";
         default: return "?";
     }
 }
@@ -509,6 +519,7 @@ static lv_obj_t *battery_bar;          // 电池条
 static lv_obj_t *battery_label;        // 电池百分比标签
 static lv_obj_t *info_label;           // 信息标签
 static lv_obj_t *mode_label;           // 电池读取模式标签 (BOOT 键切换)
+static lv_obj_t *battery_container = NULL; // 电池条容器 (用于 CLAUDE 模式整体隐藏)
 
 // 函数声明
 static void update_battery_ui(void);
@@ -1449,9 +1460,23 @@ static battery_read_mode_t load_battery_read_mode_from_nvs(void)
 static void apply_battery_read_mode(battery_read_mode_t mode)
 {
     if (mode >= BATT_READ_MODE_MAX) mode = BATT_READ_MODE_JSON;
+    battery_read_mode_t prev = g_battery_read_mode;
+
+    // CLAUDE <-> 其它模式切换需要 WiFi 和 BLE 不同的初始化路径,
+    // ESP32-S3 内部 DRAM 不足以让两者共存; 选择保存模式后软重启,
+    // 让新一轮启动按目标模式做对应的初始化 (跳过 WiFi 或跳过 BLE).
+    if ((mode == BATT_READ_MODE_CLAUDE) != (prev == BATT_READ_MODE_CLAUDE)) {
+        save_battery_read_mode_to_nvs(mode);
+        ESP_LOGI(TAG, "Switching %s -> %s, rebooting to re-init radios cleanly...",
+                 battery_read_mode_name(prev), battery_read_mode_name(mode));
+        vTaskDelay(pdMS_TO_TICKS(300));
+        esp_restart();
+        return;  // unreachable
+    }
+
     g_battery_read_mode = mode;
 
-    uint32_t baud = 115200;   // JSON 默认
+    uint32_t baud = 115200;   // JSON / CLAUDE 默认
     if (mode == BATT_READ_MODE_RS485_1 || mode == BATT_READ_MODE_RS485_2) baud = 9600;
 
     // 等待当前 TX 发送完成，避免在半个字节期间改波特率
@@ -1536,7 +1561,7 @@ static void create_battery_ui(void)
     // lv_obj_align(title_label, LV_ALIGN_TOP_MID, 0, 15);
     
     // 创建电量条容器 - 简洁的白色边框
-    lv_obj_t *battery_container = lv_obj_create(scr);
+    battery_container = lv_obj_create(scr);
     lv_obj_set_size(battery_container, 380, 30);  // 横长的电量条
     lv_obj_set_style_bg_color(battery_container, lv_color_hex(0x000000), 0);  // 透明背景
     lv_obj_set_style_bg_opa(battery_container, 0, 0);  // 完全透明
@@ -1604,6 +1629,21 @@ static void update_battery_ui(void)
         lv_label_set_text_fmt(mode_label, "MODE: %s", battery_read_mode_name(g_battery_read_mode));
         lv_obj_invalidate(mode_label);
     }
+
+    // ---- CLAUDE 模式: 隐藏电池控件, Claude 面板独占下方区域 ----
+    if (g_battery_read_mode == BATT_READ_MODE_CLAUDE) {
+        if (battery_container) lv_obj_add_flag(battery_container, LV_OBJ_FLAG_HIDDEN);
+        if (battery_label)     lv_obj_add_flag(battery_label,     LV_OBJ_FLAG_HIDDEN);
+        if (info_label)        lv_obj_add_flag(info_label,        LV_OBJ_FLAG_HIDDEN);
+        return;
+    }
+    // 非 CLAUDE 模式: 恢复电池控件可见 (从 CLAUDE 切回时)
+    if (battery_container && lv_obj_has_flag(battery_container, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_clear_flag(battery_container, LV_OBJ_FLAG_HIDDEN);
+    if (battery_label && lv_obj_has_flag(battery_label, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_clear_flag(battery_label, LV_OBJ_FLAG_HIDDEN);
+    if (info_label && lv_obj_has_flag(info_label, LV_OBJ_FLAG_HIDDEN))
+        lv_obj_clear_flag(info_label, LV_OBJ_FLAG_HIDDEN);
 
     // ---- 信号丢失优先：显示红色闪烁的报警画面 ----
     if (is_battery_signal_lost()) {
@@ -2280,20 +2320,33 @@ static void lvgl_task(void *pvParameters)
     while (1) {
         // 处理LVGL定时器
         lv_timer_handler();
-        
+
         // 检查是否有待处理的UI更新
         if (ui_update_pending) {
             update_battery_ui();
             ui_update_pending = false;
         }
-        
+
+        // Claude 模式切换请求 (由 BOOT 键 / 启动恢复触发, 在 LVGL 任务里完成
+        // 真正的 widget 显示/隐藏和 BLE 栈延迟初始化, 避免跨任务动 LVGL)
+        if (g_claude_mode_request == 1) {
+            g_claude_mode_request = 0;
+            claude_mode_enter();
+        } else if (g_claude_mode_request == 2) {
+            g_claude_mode_request = 0;
+            claude_mode_exit();
+        }
+
+        // Claude 模式: 每轮检查是否有新的状态快照需要刷新
+        claude_mode_lvgl_refresh();
+
         // 每10次处理一次，避免过于频繁
         cnt++;
         if (cnt >= 10) {
             cnt = 0;
             LED_TOGGLE();
         }
-        
+
         // 等待任务通知或超时，实现更快的响应
         ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));  // 等待通知或10ms超时
     }
@@ -2323,12 +2376,22 @@ void app_main(void)
     // 初始化I2S麦克风
     ESP_ERROR_CHECK(i2s_mic_init());
 
-    // 创建Web服务器任务
-    httpd_handle_t web_server_handle = web_server_init();
-    if (web_server_handle == NULL) {
-        ESP_LOGE(TAG, "Failed to initialize web server");
+    // 提前读取持久化模式: CLAUDE 模式跳过 WiFi 初始化, 把 DRAM 留给 BLE 控制器
+    // (ESP32-S3 内部 DRAM 只有 ~32 KiB, WiFi + BLE + LVGL 三者无法共存)
+    g_battery_read_mode = load_battery_read_mode_from_nvs();
+    ESP_LOGI(TAG, "Battery read mode restored: %s",
+             battery_read_mode_name(g_battery_read_mode));
+
+    if (g_battery_read_mode != BATT_READ_MODE_CLAUDE) {
+        // 非 CLAUDE 模式: 启动 WiFi softAP + Web 服务器
+        httpd_handle_t web_server_handle = web_server_init();
+        if (web_server_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to initialize web server");
+        } else {
+            ESP_LOGI(TAG, "Web server initialized successfully");
+        }
     } else {
-        ESP_LOGI(TAG, "Web server initialized successfully");
+        ESP_LOGW(TAG, "CLAUDE mode: skipping WiFi/Web init to reserve DRAM for BLE");
     }
 
     // 初始化高性能UART处理
@@ -2355,10 +2418,7 @@ void app_main(void)
     ESP_ERROR_CHECK(esp_timer_start_periodic(no_signal_blink_timer,
                                              BATTERY_NO_SIGNAL_BLINK_MS * 1000));
     
-    // 从 NVS 恢复上次的电池读取模式 (默认 JSON)
-    g_battery_read_mode = load_battery_read_mode_from_nvs();
-    ESP_LOGI(TAG, "Battery read mode restored: %s",
-             battery_read_mode_name(g_battery_read_mode));
+    // 模式已在更早处加载 (用于决定是否启动 WiFi), 这里不再重复读取 NVS
 
     // 初始化UART1 (统一串口)
     uart1_init();
@@ -2394,14 +2454,23 @@ void app_main(void)
     
     // 创建电池监控UI界面
     create_battery_ui();
-    
+
+    // 初始化 Claude 状态模块 (只创建 LVGL 控件, BLE 延迟到进入时再初始化) - UI 默认隐藏
+    if (claude_mode_init(lv_scr_act()) != ESP_OK) {
+        ESP_LOGW(TAG, "claude_mode_init failed; CLAUDE mode unavailable");
+    }
+    // 如果上次模式就是 CLAUDE, 让 LVGL 任务在自己的上下文里完成进入
+    if (g_battery_read_mode == BATT_READ_MODE_CLAUDE) {
+        g_claude_mode_request = 1;
+    }
+
     // 将首次刷新交给 LVGL 任务，避免在主任务中进行绘制导致栈溢出
     ui_update_pending = true;
     ESP_LOGI(TAG, "Queued initial UI update to LVGL task");
     
     // 创建LVGL相关任务 - 增加栈大小
     xTaskCreate(lvgl_tick_task, "lvgl_tick", 3072, NULL, 4, NULL);  // 增加栈大小
-    xTaskCreate(lvgl_task, "lvgl", 6144, NULL, 3, &lvgl_task_handle);  // 增加栈大小并保存句柄
+    xTaskCreate(lvgl_task, "lvgl", 8192, NULL, 3, &lvgl_task_handle);  // 增加栈大小并保存句柄
     
     // 创建电池监控任务 - 可禁用以避免WDT问题
 #if ENABLE_BATTERY_MONITOR_TASK

@@ -3,6 +3,12 @@
 基于ESP32-S3的TFT显示屏、WS2812 RGB灯带控制系统和电池管理系统
 
 ## 更新日志
+## test3 2026-06-18
+- 新增 **CLAUDE 状态模式**：通过 BLE (NimBLE Nordic UART Service) 接收 PC 推送的 Claude Code 运行状态；LCD 用 LVGL 面板显示 状态/工具/模型/token 计数/消息；WS2812 用颜色映射当前状态（idle=绿 / thinking=蓝 / tool=青 / writing=品红 / waiting=黄 / error=红 / done=白 / 未连接=灰）；
+- BOOT 按键循环扩展为 4 种模式：`JSON → RS485-1 → RS485-2 → CLAUDE → JSON ...`；模式持久化到 NVS，重启自动恢复；
+- 新增 PC 端桥接脚本 `tools/claude_status_bridge.py` 与钩子助手 `tools/claude_hook_post.py`，通过 Claude Code Hooks 自动推送状态；
+- BLE 设备名为 `ESP32_Claude_XXXX`（XXXX = MAC 后 2 字节），无 PIN，直接连接。
+
 ## test2.5 2026-04-17
 - WiFi AP SSID 改为基于芯片 MAC 自动生成：`ESP32_Light_XXXX`（后 2 字节，同一芯片固定，不同芯片唯一）；密码仍为 `12345678`；
 - BOOT 按键（GPIO0）循环切换电池读取模式：JSON(115200) → RS485-1(9600, 0xDD 协议) → RS485-2(9600, 0xAA 协议)，LCD 左上角实时显示当前模式；
@@ -248,12 +254,75 @@ python test_esp32_functions.py
 │   ├── ws2812_control.c    # WS2812控制实现
 │   ├── ws2812_control.h    # WS2812控制头文件
 │   ├── battery_control.h   # 电池管理头文件
+│   ├── claude_mode.c       # CLAUDE 模式: BLE NUS + LVGL 状态面板
+│   ├── claude_mode.h       # CLAUDE 模式头文件
 │   ├── APP/                # 应用程序模块
 │   └── Lib/                # 第三方库
 ├── components/             # ESP-IDF组件
+├── tools/
+│   ├── claude_status_bridge.py     # PC -> BLE 桥接守护脚本
+│   ├── claude_hook_post.py         # Claude Code 钩子助手
+│   └── claude_hooks_settings.example.json  # 钩子配置示例
 ├── build/                  # 编译输出目录
 └── managed_components/     # 管理的组件
 ```
+
+## CLAUDE 状态模式 (test3+)
+
+### 启用方式
+1. 编译固件（首次启用 BLE 需要重新生成 sdkconfig）：
+   ```bash
+   idf.py reconfigure   # 拉取 sdkconfig.defaults 里的 BLE 选项
+   idf.py build flash monitor
+   ```
+2. 短按 BOOT 键循环模式，直到 LCD 左上角显示 `MODE: CLAUDE`。
+3. 设备开始广播 BLE 设备 `ESP32_Claude_XXXX`，LCD 显示 `BLE: ADV / Waiting for BLE host...`，WS2812 进入灰色待机色。
+
+> **WiFi 与 BLE 互斥**: ESP32-S3 内部 DRAM 只有 ~32 KiB，无法同时塞下 WiFi softAP + BT 控制器 + LVGL DMA 缓冲。因此 CLAUDE 模式下 WiFi 软热点 / Web 控制面板会关闭，只有 BLE 工作；其它模式（JSON / RS485-1 / RS485-2）下 WiFi 工作，BLE 不初始化。
+>
+> **切换需要软重启**: 在 CLAUDE ↔ 其它模式之间切换时设备会自动 `esp_restart()` 重新启动（约 1 秒），按目标模式做对应的射频初始化。JSON / RS485-1 / RS485-2 三者之间切换仍然热生效，无重启。
+
+### PC 端
+```bash
+# 安装依赖
+pip install bleak
+
+# 启动桥接守护进程
+python3 tools/claude_status_bridge.py --listen-port 8765
+
+# 手动单次测试
+python3 tools/claude_status_bridge.py --once \
+    --json '{"state":"thinking","tool":"Read","msg":"hello world"}'
+```
+桥接进程会自动扫描 `ESP32_Claude_*` 设备并连接。
+
+### 接入 Claude Code Hooks
+复制 `tools/claude_hooks_settings.example.json` 中的 `hooks` 段合并到 `~/.claude/settings.json`，并把 `/ABS/PATH/` 替换为本仓库的绝对路径。这样 Claude Code 的每个生命周期事件（提交 prompt / 调用工具 / 工具完成 / 通知 / Stop）都会通过桥接转推到设备。
+
+可选环境变量：`CLAUDE_BRIDGE_HOST`、`CLAUDE_BRIDGE_PORT`、`CLAUDE_MODEL`、`CLAUDE_TOKENS_IN`、`CLAUDE_TOKENS_OUT`。
+
+### 通用协议 (PC 端可直接对接其它来源)
+ESP32 暴露标准 NUS：
+- 服务 UUID: `6E400001-B5A3-F393-E0A9-E50E24DCCA9E`
+- RX（写入）: `6E400002-B5A3-F393-E0A9-E50E24DCCA9E`
+- TX（通知）: `6E400003-B5A3-F393-E0A9-E50E24DCCA9E`
+
+往 RX 写入一行 JSON（可换行结尾或括号配平即解析）：
+```json
+{"state":"thinking","tool":"Read","model":"Opus 4.7","ti":12345,"to":678,"msg":"Reading main.c"}
+```
+字段说明：
+
+| 字段  | 类型   | 说明 |
+| ----- | ------ | ---- |
+| state | string | `idle / thinking / tool / writing / waiting / error / done` |
+| tool  | string | 当前工具名 (≤23 字符) |
+| model | string | 模型名 (≤23 字符) |
+| ti    | int    | 累计输入 token |
+| to    | int    | 累计输出 token |
+| msg   | string | 简短消息 (≤63 字符) |
+
+未提供的字段保留上次值，可做增量更新。
 
 ## 开发环境
 - **ESP-IDF**: v5.4.2

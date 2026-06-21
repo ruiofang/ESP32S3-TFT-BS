@@ -6,6 +6,7 @@ idf_component_register(
         "i2s_mic.c"
         "claude_mode.c"
         "APP/lvgl_demo.c"
+        "APP/claude_status_font_14.c"
         "Lib/cJSON/cJSON.c"
     INCLUDE_DIRS
         "."

@@ -1,38 +1,38 @@
 {
-  "_comment": "Drop these blocks into ~/.claude/settings.json (or merge with existing hooks). Replace /ABS/PATH with the absolute path to claude_hook_post.py.",
+  "_comment": "Recommended: run tools/install_claude_status_hooks.py on each computer. It installs ~/.local/bin/esp32-claude-hook and writes these global hooks without hard-coding the repository path here.",
   "hooks": {
     "UserPromptSubmit": [
       {
         "hooks": [
-          { "type": "command", "command": "/ABS/PATH/tools/claude_hook_post.py user_prompt" }
+          { "type": "command", "command": "~/.local/bin/esp32-claude-hook user_prompt" }
         ]
       }
     ],
     "PreToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "/ABS/PATH/tools/claude_hook_post.py pre_tool" }
+          { "type": "command", "command": "~/.local/bin/esp32-claude-hook pre_tool" }
         ]
       }
     ],
     "PostToolUse": [
       {
         "hooks": [
-          { "type": "command", "command": "/ABS/PATH/tools/claude_hook_post.py post_tool" }
+          { "type": "command", "command": "~/.local/bin/esp32-claude-hook post_tool" }
         ]
       }
     ],
     "Notification": [
       {
         "hooks": [
-          { "type": "command", "command": "/ABS/PATH/tools/claude_hook_post.py notification" }
+          { "type": "command", "command": "~/.local/bin/esp32-claude-hook notification" }
         ]
       }
     ],
     "Stop": [
       {
         "hooks": [
-          { "type": "command", "command": "/ABS/PATH/tools/claude_hook_post.py stop" }
+          { "type": "command", "command": "~/.local/bin/esp32-claude-hook stop" }
         ]
       }
     ]

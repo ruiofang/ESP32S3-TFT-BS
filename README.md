@@ -8,6 +8,7 @@
 - BOOT 按键循环扩展为 4 种模式：`JSON → RS485-1 → RS485-2 → CLAUDE → JSON ...`；模式持久化到 NVS，重启自动恢复；
 - 新增 PC 端桥接脚本 `tools/claude_status_bridge.py` 与钩子助手 `tools/claude_hook_post.py`，通过 Claude Code Hooks 自动推送状态；
 - BLE 设备名为 `ESP32_Claude_XXXX`（XXXX = MAC 后 2 字节），无 PIN，直接连接。
+/usr/bin/python3 tools/claude_status_bridge.py --connect-on-start -v
 
 ## test2.5 2026-04-17
 - WiFi AP SSID 改为基于芯片 MAC 自动生成：`ESP32_Light_XXXX`（后 2 字节，同一芯片固定，不同芯片唯一）；密码仍为 `12345678`；

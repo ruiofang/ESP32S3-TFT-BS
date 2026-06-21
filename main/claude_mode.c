@@ -117,6 +117,8 @@ static lv_obj_t *s_model_label = NULL;     // 模型 + token
 static lv_obj_t *s_msg_label = NULL;       // 消息
 static lv_obj_t *s_link_label = NULL;      // BLE 连接状态
 
+LV_FONT_DECLARE(claude_status_font_14);
+
 // -----------------------------------------------------------------------------
 // 状态 -> 字符串 / 解析
 // -----------------------------------------------------------------------------
@@ -274,7 +276,7 @@ static void ui_build(lv_obj_t *parent)
     lv_obj_set_width(s_msg_label, 408);
     lv_label_set_text(s_msg_label, "Waiting for BLE host...");
     lv_obj_set_style_text_color(s_msg_label, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_set_style_text_font(s_msg_label, &lv_font_montserrat_12, 0);
+    lv_obj_set_style_text_font(s_msg_label, &claude_status_font_14, 0);
     lv_obj_align(s_msg_label, LV_ALIGN_BOTTOM_LEFT, 4, -4);
 
     // BLE 连接状态 (面板右下角)
@@ -538,22 +540,25 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
 // -----------------------------------------------------------------------------
 static void on_host_sync(void)
 {
-    // 使用随机静态地址广播: 启动时生成一次, 这样对端 (Linux BlueZ 等)
-    // 看到的是一台全新设备, 不会用之前公共 BD 地址下保存的过期 LTK
-    // 去尝试加密而失败 (那是 HCI 0x05 / reason=517 断开的常见根因)
-    ble_addr_t addr;
-    int rc = ble_hs_id_gen_rnd(0, &addr);
-    if (rc != 0) {
-        ESP_LOGE(TAG, "gen rnd addr rc=%d", rc);
-        return;
-    }
+    // 使用固定 static random 地址: 从 BT MAC 派生, 每次重启保持一致;
+    // 最高字节 bit7..6 必须为 11 才符合 BLE static random 地址规范。
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_BT);
+    ble_addr_t addr = {0};
+    addr.val[5] = (mac[0] & 0x3F) | 0xC0;
+    addr.val[4] = mac[1];
+    addr.val[3] = mac[2];
+    addr.val[2] = mac[3];
+    addr.val[1] = mac[4];
+    addr.val[0] = mac[5];
+    int rc = 0;
     rc = ble_hs_id_set_rnd(addr.val);
     if (rc != 0) {
         ESP_LOGE(TAG, "set rnd addr rc=%d", rc);
         return;
     }
     s_own_addr_type = BLE_OWN_ADDR_RANDOM;
-    ESP_LOGI(TAG, "Advertising with random static addr %02X:%02X:%02X:%02X:%02X:%02X",
+    ESP_LOGI(TAG, "Advertising with fixed static random addr %02X:%02X:%02X:%02X:%02X:%02X",
              addr.val[5], addr.val[4], addr.val[3],
              addr.val[2], addr.val[1], addr.val[0]);
 
@@ -587,20 +592,16 @@ static esp_err_t ble_stack_init(void)
     ble_hs_cfg.reset_cb = on_host_reset;
     ble_hs_cfg.sync_cb  = on_host_sync;
     ble_hs_cfg.store_status_cb = ble_store_util_status_rr;
-    // Security Manager 配置: just-works + 允许绑定(对端 LE Secure Connections)
-    // - sm_bonding=1: GNOME Bluetooth GUI 等会强制 pair-and-trust,
-    //   不接受绑定会导致握手失败 -> 89ms HCI 0x05 断开
-    // - sm_sc=1: 现代 BlueZ 偏好 LE Secure Connections (而不是 legacy)
-    // - 我方无键无显示, 配对自动按 just-works 走, 不需要用户确认
-    // - 密钥实际不持久化 (CONFIG_BT_NIMBLE_NVS_PERSIST=n), 每次重启等于"全新设备",
-    //   不会卡在 BlueZ 旧 bond 上
+    // Security Manager 配置: just-works, 不 bonding。
+    // 固定 BLE 地址下如果 bonding 但 ESP 端不持久化密钥, 主机容易留下过期 bond。
+    // NUS 字符不要求加密, Claude bridge 通过 GATT 直接写入即可。
     ble_hs_cfg.sm_io_cap = BLE_HS_IO_NO_INPUT_OUTPUT;
-    ble_hs_cfg.sm_bonding = 1;
+    ble_hs_cfg.sm_bonding = 0;
     ble_hs_cfg.sm_mitm    = 0;
     ble_hs_cfg.sm_sc      = 1;
     ble_hs_cfg.sm_keypress = 0;
-    ble_hs_cfg.sm_our_key_dist   = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
-    ble_hs_cfg.sm_their_key_dist = BLE_SM_PAIR_KEY_DIST_ENC | BLE_SM_PAIR_KEY_DIST_ID;
+    ble_hs_cfg.sm_our_key_dist   = 0;
+    ble_hs_cfg.sm_their_key_dist = 0;
 
     ble_svc_gap_init();
     ble_svc_gatt_init();

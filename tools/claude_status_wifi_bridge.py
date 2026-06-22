@@ -30,6 +30,7 @@ import os
 import signal
 import socket
 import sys
+import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Optional
@@ -41,6 +42,7 @@ DISCOVERY_TIMEOUT = 8.0       # seconds before warning
 SEND_RETRY = 2
 CONNECT_TIMEOUT = 3.0
 HEARTBEAT_INTERVAL = 4.0
+IDLE_FALLBACK_CHECK_INTERVAL = 1.0
 MSG_BYTE_LIMIT = 24
 
 log = logging.getLogger("claude-wifi-bridge")
@@ -406,8 +408,12 @@ class StatusAggregator:
         self.tokens_in: int = 0
         self.tokens_out: int = 0
         self.msg: str = ""
+        self._last_event_monotonic: float = time.monotonic()
+        self._idle_fallback_sent: bool = False
 
     def update(self, patch: dict) -> dict:
+        self._last_event_monotonic = time.monotonic()
+        self._idle_fallback_sent = False
         if "state" in patch:
             self.state = clip_utf8(patch["state"], 24)
         if "tool" in patch:
@@ -426,6 +432,32 @@ class StatusAggregator:
                 pass
         if "msg" in patch:
             self.msg = compact_message(patch["msg"])
+        return {
+            "state": self.state,
+            "tool": self.tool,
+            "model": self.model,
+            "ti": self.tokens_in,
+            "to": self.tokens_out,
+            "msg": self.msg,
+        }
+
+    def maybe_idle_fallback(self, idle_timeout_sec: float) -> Optional[dict]:
+        """Return an idle payload once when no hook event arrives for too long."""
+        if idle_timeout_sec <= 0:
+            return None
+        if self._idle_fallback_sent:
+            return None
+        if (time.monotonic() - self._last_event_monotonic) < idle_timeout_sec:
+            return None
+
+        if self.state.lower() == "idle":
+            self._idle_fallback_sent = True
+            return None
+
+        self.state = "idle"
+        self.tool = ""
+        self.msg = "No recent activity"
+        self._idle_fallback_sent = True
         return {
             "state": self.state,
             "tool": self.tool,
@@ -509,6 +541,7 @@ DEFAULT_CONFIG = {
     "listen_port": 8765,            # TCP 监听端口
     "source_name": "copilot",      # 发给 ESP32 的绑定名称
     "connect_on_start": False,      # 启动时立即发一条 idle 给设备 (顺便完成发现)
+    "idle_timeout_sec": 45,         # 多久没收到 hook 事件就自动回落到 idle (<=0 关闭)
     "verbose": False,               # 打开 DEBUG 日志
 }
 
@@ -553,6 +586,42 @@ async def heartbeat_loop(stop: asyncio.Event, link: EspTargetFanout) -> None:
             await link.send_ping()
 
 
+async def idle_fallback_loop(
+    stop: asyncio.Event,
+    link: EspTargetFanout,
+    agg: StatusAggregator,
+    idle_timeout_sec: float,
+) -> None:
+    if idle_timeout_sec <= 0:
+        return
+
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=IDLE_FALLBACK_CHECK_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            payload = agg.maybe_idle_fallback(idle_timeout_sec)
+            if not payload:
+                continue
+            try:
+                await link.send_json(payload)
+                log.info("no hook updates for %.0fs -> fallback to idle", idle_timeout_sec)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("idle fallback send failed: %s", exc)
+
+
+async def send_shutdown_status(link: EspTargetFanout) -> None:
+    """Best-effort tail status to reduce stale thinking/tool display on ESP32."""
+    for payload in (
+        {"state": "done", "msg": "Bridge shutting down"},
+        {"state": "idle", "msg": "Bridge offline"},
+    ):
+        try:
+            await link.send_json(payload)
+        except Exception as exc:  # noqa: BLE001
+            log.debug("shutdown status send skipped: %s", exc)
+
+
 def load_config() -> SimpleNamespace:
     """读取同目录配置. 文件缺失则写默认模板."""
     if not os.path.exists(CONFIG_PATH):
@@ -594,8 +663,13 @@ async def amain() -> int:
 
     log.info("配置文件: %s", CONFIG_PATH)
     target_configs = build_target_configs(args)
+    idle_timeout_sec = float(getattr(args, "idle_timeout_sec", 45) or 0)
     log.info("listen=%s:%d targets=%d source=%s",
              args.listen_host, args.listen_port, len(target_configs), args.source_name)
+    if idle_timeout_sec > 0:
+        log.info("idle fallback timeout: %.0fs", idle_timeout_sec)
+    else:
+        log.info("idle fallback timeout: disabled")
     for config in target_configs:
         log.info("target %s id=%s static_ip=%s tcp_port=%d",
                  config.label,
@@ -627,6 +701,7 @@ async def amain() -> int:
         run_tcp_server(args.listen_host, args.listen_port, link, agg, started)
     )
     heartbeat_task = asyncio.create_task(heartbeat_loop(stop, link))
+    idle_task = asyncio.create_task(idle_fallback_loop(stop, link, agg, idle_timeout_sec))
     try:
         await started
     except OSError as exc:
@@ -634,6 +709,7 @@ async def amain() -> int:
             log.error("%s:%d is already in use; stop the existing bridge first",
                       args.listen_host, args.listen_port)
             heartbeat_task.cancel()
+            idle_task.cancel()
             try:
                 await server_task
             except OSError:
@@ -642,18 +718,27 @@ async def amain() -> int:
                 await heartbeat_task
             except asyncio.CancelledError:
                 pass
+            try:
+                await idle_task
+            except asyncio.CancelledError:
+                pass
             await link.close()
             return 1
         raise
     except Exception:
         server_task.cancel()
         heartbeat_task.cancel()
+        idle_task.cancel()
         try:
             await server_task
         except asyncio.CancelledError:
             pass
         try:
             await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        try:
+            await idle_task
         except asyncio.CancelledError:
             pass
         await link.close()
@@ -667,14 +752,20 @@ async def amain() -> int:
             log.warning("initial TCP send failed (%s); will retry on first hook", exc)
 
     await stop.wait()
+    await send_shutdown_status(link)
     server_task.cancel()
     heartbeat_task.cancel()
+    idle_task.cancel()
     try:
         await server_task
     except asyncio.CancelledError:
         pass
     try:
         await heartbeat_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await idle_task
     except asyncio.CancelledError:
         pass
     await link.close()

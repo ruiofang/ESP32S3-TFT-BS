@@ -8,6 +8,6 @@
   "listen_port": 8765,
   "source_name": "Ruio",
   "connect_on_start": true,
-  "idle_timeout_sec": 30,
+  "idle_timeout_sec": 0,
   "verbose": false
 }

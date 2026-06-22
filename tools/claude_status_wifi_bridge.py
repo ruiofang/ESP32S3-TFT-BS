@@ -326,6 +326,9 @@ class EspTcpTarget:
             "label": self.config.label or "",
         }
         writer.write((json.dumps(bind_msg, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
+        # Re-sync visible state immediately after (re)connect so ESP32 does not stay OFFLINE
+        # when no fresh hook event has arrived yet.
+        writer.write((json.dumps({"state": "idle", "tool": "", "msg": "Bridge linked"}, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
         await writer.drain()
         log.info("TCP linked: %s -> %s:%d", self.display_name, self.peer_ip, self.peer_port)
 
@@ -348,9 +351,11 @@ class EspTcpTarget:
 
     async def send_ping(self) -> None:
         async with self._lock:
-            if self._writer is None:
-                return
             try:
+                # Keepalive should also recover broken links proactively.
+                await self._connect_locked()
+                if self._writer is None:
+                    return
                 msg = {
                     "q": "ping",
                     "id": self.discovered_id or self.device_id or "",
@@ -358,8 +363,8 @@ class EspTcpTarget:
                 }
                 self._writer.write((json.dumps(msg, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
                 await self._writer.drain()
-            except (OSError, ConnectionError) as exc:
-                log.warning("ping %s failed: %s", self.display_name, exc)
+            except (OSError, asyncio.TimeoutError, ConnectionError) as exc:
+                log.warning("ping/reconnect %s failed: %s", self.display_name, exc)
                 self._drop_connection()
 
     async def close(self) -> None:

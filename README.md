@@ -3,6 +3,14 @@
 基于ESP32-S3的TFT显示屏、WS2812 RGB灯带控制系统和电池管理系统
 
 ## 更新日志
+## test4 2026-06-22
+- 新增 **CLAUDE_WIFI 模式** (第 5 种 BOOT 循环模式)：通过 **WiFi UDP** 接收 PC 推送的 Claude 状态，与 BLE 路径共用同一套 LCD 面板 / WS2812 状态色 / 状态机，提供给没有 BLE 适配器或需要远程推送的场景；
+- 配网流程：首次进入时自动起 AP `ESP32_Claude_XXXX` (密码 `claude123`)，浏览器打开 `http://192.168.4.1/` 选 SSID → 输密码 → 保存 → 设备重启进 STA；STA 连接成功后 LCD 显示 `WiFi: <IP>` 和 `ID:XXXX`；
+- WiFi 配网网页分页设计（主页 / WiFi / 高级），并提供 `/wifiscan` AP 扫描接口，列表点击即可填入 SSID；
+- **BOOT 长按 (≥2.5s)**：在 CLAUDE_WIFI 模式下清除已保存 WiFi 凭据并重启回 AP 配网，方便换网；短按仍循环模式（改为释放时触发以便与长按区分）；
+- 设备号 = MAC 后 4 位 hex (`ESP32_Claude_XXXX` 的 `XXXX`)，PC 桥通过 UDP 广播 `{"q":"discover","id":"XXXX"}` 完成配对，之后单播状态 JSON 到固定端口 **8266**；
+- 新增 PC 桥 `tools/claude_status_wifi_bridge.py`，无命令行参数，所有配置走同目录 `claude_wifi_bridge.json`（首次运行自动写默认模板）；Claude Code Hooks 配置无需改变。
+
 ## test3 2026-06-18
 - 新增 **CLAUDE 状态模式**：通过 BLE (NimBLE Nordic UART Service) 接收 PC 推送的 Claude Code 运行状态；LCD 用 LVGL 面板显示 状态/工具/模型/token 计数/消息；WS2812 用颜色映射当前状态（idle=绿 / thinking=蓝 / tool=青 / writing=品红 / waiting=黄 / error=红 / done=白 / 未连接=灰）；
 - BOOT 按键循环扩展为 4 种模式：`JSON → RS485-1 → RS485-2 → CLAUDE → JSON ...`；模式持久化到 NVS，重启自动恢复；
@@ -257,12 +265,15 @@ python test_esp32_functions.py
 │   ├── battery_control.h   # 电池管理头文件
 │   ├── claude_mode.c       # CLAUDE 模式: BLE NUS + LVGL 状态面板
 │   ├── claude_mode.h       # CLAUDE 模式头文件
+│   ├── claude_wifi_mode.c  # CLAUDE_WIFI 模式: WiFi (STA/AP 配网) + UDP 监听
+│   ├── claude_wifi_mode.h  # CLAUDE_WIFI 模式头文件
 │   ├── APP/                # 应用程序模块
 │   └── Lib/                # 第三方库
 ├── components/             # ESP-IDF组件
 ├── tools/
-│   ├── claude_status_bridge.py     # PC -> BLE 桥接守护脚本
-│   ├── claude_hook_post.py         # Claude Code 钩子助手
+│   ├── claude_status_bridge.py        # PC -> BLE 桥接守护脚本
+│   ├── claude_status_wifi_bridge.py   # PC -> WiFi UDP 桥接守护脚本
+│   ├── claude_hook_post.py            # Claude Code 钩子助手
 │   └── claude_hooks_settings.example.json  # 钩子配置示例
 ├── build/                  # 编译输出目录
 └── managed_components/     # 管理的组件
@@ -324,6 +335,61 @@ ESP32 暴露标准 NUS：
 | msg   | string | 简短消息 (≤63 字符) |
 
 未提供的字段保留上次值，可做增量更新。
+
+## CLAUDE_WIFI 状态模式 (test4+)
+
+与 BLE 路径共用同一个状态面板和 WS2812 配色，但通过 **WiFi UDP** 代替 BLE NUS 传输，适合手头没有蓝牙适配器、或希望走家庭网络远程推送的场景。
+
+### 启用方式
+1. 短按 BOOT 循环到 LCD 显示 `MODE: CLAUDE_WIFI` (期间会软重启切换射频)；
+2. 首次进入没有 STA 凭据时设备自动起 AP `ESP32_Claude_XXXX` (密码 `claude123`)，LCD 显示 `AP: ESP32_Claude_XXXX`；
+3. 手机/电脑连这个热点，浏览器打开 `http://192.168.4.1/` → 进入 **WiFi** 页 → 点 *扫描* → 选 SSID → 输密码 → *保存并连接*；
+4. 设备保存凭据后自动重启进 STA 模式，连接成功 LCD 显示 `WiFi: <IP>` 与 `ID:<XXXX>` (设备号 = MAC 后 4 位 hex，与 BLE 命名规则一致)。
+
+### 重新配网 / 换 AP
+- 在 CLAUDE_WIFI 模式下按住 **BOOT 键 ≥ 2.5 秒**，设备清除已保存凭据并重启回到 AP 配网态；
+- 或在 STA 已连接状态下访问 `http://<设备IP>/tools` 页，点击「清除已保存 WiFi 凭据」。
+
+### PC 端
+桥不接受命令行参数，所有设置走同目录 `tools/claude_wifi_bridge.json`。首次运行会自动写一份默认模板：
+
+```bash
+python3 tools/claude_status_wifi_bridge.py
+# -> 提示已创建 tools/claude_wifi_bridge.json, 编辑后重跑
+```
+
+`claude_wifi_bridge.json` 字段：
+
+| 字段 | 默认 | 说明 |
+| ---- | ---- | ---- |
+| `device_id`        | `""`              | LCD 上 `ID:XXXX` 的设备号；留空 = 配对任意应答设备 |
+| `static_ip`        | `null`            | 填了就跳过广播发现，直接单播这个 IP |
+| `broadcast`        | `255.255.255.255` | 默认广播地址（会与本地每个接口的 /24 定向广播一起 fan-out） |
+| `listen_host`      | `127.0.0.1`       | TCP 监听地址（Claude Code 钩子连这里） |
+| `listen_port`      | `8765`            | TCP 监听端口 |
+| `connect_on_start` | `false`           | 启动时立即发一条 idle，顺便完成发现 |
+| `verbose`          | `false`           | 打开 DEBUG 日志 |
+
+桥广播 `{"q":"discover","id":"XXXX"}` 到 `255.255.255.255` + 本地各子网 `192.168.x.255`，匹配设备号的设备回 `{"r":"discover","ip":"...","port":8266}`，之后单播状态 JSON。Claude Code Hooks 仍指向 `localhost:8765`，与 BLE 桥配置可二选一。
+
+### UDP 协议 (端口 8266)
+| 方向 | 帧 | 说明 |
+| ---- | -- | ---- |
+| PC → ESP | `{"q":"discover"}` 或 `{"q":"discover","id":"XXXX"}` | 设备广播发现；id 不匹配时丢弃 |
+| ESP → PC | `{"r":"discover","id":"XXXX","name":"ESP32_Claude_XXXX","ip":"...","port":8266}` | 发现应答 |
+| PC → ESP | `{"q":"ping","id":"XXXX"}` | 存活检测 |
+| ESP → PC | `{"r":"pong","id":"XXXX"}` | ping 应答 |
+| PC → ESP | `{"state":"thinking","tool":"Read",...}` | 状态推送，字段同 BLE 协议 |
+
+### 配网页接口
+- `GET /` — 主页 (设备号 / IP / 端口 / 当前模式)
+- `GET /wifi` (`/wificfg` 别名) — WiFi 配网表单 + AP 扫描列表
+- `GET /wifiscan` — 返回 `[{"s":"SSID","r":-50,"a":3}, ...]` 的 AP 列表 (`a` = authmode, 0 = open)
+- `GET /tools` — 高级页，含「清除已保存 WiFi 凭据」按钮
+- `POST /wificfg` — 保存 SSID / 密码，写 NVS 后软重启
+- `POST /wificlear` — 清除凭据后软重启
+
+> **CLAUDE_WIFI 与 CLAUDE/BLE 互斥**：与 CLAUDE (BLE) 模式同理，CLAUDE_WIFI ↔ CLAUDE 之间切换会触发软重启重新选择射频；CLAUDE_WIFI ↔ JSON/RS485 之间切换也会软重启，因为 WiFi 接口初始化路径不同。
 
 ## 开发环境
 - **ESP-IDF**: v5.4.2

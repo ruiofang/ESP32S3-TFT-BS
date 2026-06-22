@@ -94,7 +94,12 @@ static claude_status_t s_snapshot = {
 };
 static SemaphoreHandle_t s_lock;       // 保护 s_snapshot
 static volatile bool s_dirty;          // LVGL 任务需要刷新
-static volatile bool s_active;         // 是否处于 Claude 模式
+static volatile bool s_active;         // 是否处于 Claude (BLE) 模式
+static volatile bool s_ext_ws2812;     // 由 WiFi 路径请求驱动 WS2812
+// 由 WiFi 路径覆写的链路标签 (BLE 模式下保持空字符串, 由本文件 refresh 自管)
+static char s_ext_link_text[32] = "";
+static uint32_t s_ext_link_color = 0xAAAAAA;
+static volatile bool s_ext_link_set = false;
 
 // BLE 句柄
 static uint16_t s_conn_handle = BLE_HS_CONN_HANDLE_NONE;
@@ -331,8 +336,11 @@ void claude_mode_lvgl_refresh(void)
     // 消息
     lv_label_set_text(s_msg_label, st.msg[0] ? st.msg : "");
 
-    // BLE 链路状态
-    if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
+    // 链路状态: 优先显示外部 (WiFi) 覆写文本; 否则按 BLE 状态自管
+    if (s_ext_link_set) {
+        lv_label_set_text(s_link_label, s_ext_link_text);
+        lv_obj_set_style_text_color(s_link_label, lv_color_hex(s_ext_link_color), 0);
+    } else if (s_conn_handle != BLE_HS_CONN_HANDLE_NONE) {
         lv_label_set_text(s_link_label, "BLE: LINKED");
         lv_obj_set_style_text_color(s_link_label, lv_color_hex(0x00FF80), 0);
     } else if (s_advertising) {
@@ -343,8 +351,8 @@ void claude_mode_lvgl_refresh(void)
         lv_obj_set_style_text_color(s_link_label, lv_color_hex(0x666666), 0);
     }
 
-    // 同步驱动 WS2812 颜色
-    if (s_active) {
+    // 同步驱动 WS2812 颜色 (BLE 模式自动启用; WiFi 模式由外部启用)
+    if (s_active || s_ext_ws2812) {
         const rgb_t *c = &kStateTable[st.state].color;
         ws2812_set_claude_override(true, c->r, c->g, c->b, 200);
     }
@@ -698,4 +706,54 @@ void claude_mode_exit(void)
 bool claude_mode_is_active(void)
 {
     return s_active;
+}
+
+// -----------------------------------------------------------------------------
+// 外部传输 (WiFi UDP) 用的辅助 API
+// -----------------------------------------------------------------------------
+void claude_mode_panel_show(bool show)
+{
+    if (!s_panel) return;
+    if (show) lv_obj_clear_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+    else      lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
+}
+
+void claude_mode_set_link_text(const char *text, uint32_t color_rgb)
+{
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    if (text && *text) {
+        strncpy(s_ext_link_text, text, sizeof(s_ext_link_text) - 1);
+        s_ext_link_text[sizeof(s_ext_link_text) - 1] = '\0';
+        s_ext_link_color = color_rgb;
+        s_ext_link_set = true;
+    } else {
+        s_ext_link_text[0] = '\0';
+        s_ext_link_set = false;
+    }
+    s_dirty = true;
+    xSemaphoreGive(s_lock);
+}
+
+void claude_mode_drive_ws2812(bool enable)
+{
+    s_ext_ws2812 = enable;
+    if (!enable && !s_active) {
+        ws2812_set_claude_override(false, 0, 0, 0, 0);
+    }
+    // 触发一次刷新, 立刻反映状态色
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(20)) == pdTRUE) {
+        s_dirty = true;
+        xSemaphoreGive(s_lock);
+    }
+}
+
+void claude_mode_set_ready_msg(const char *msg)
+{
+    if (!msg) msg = "";
+    if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;
+    s_snapshot.state = CLAUDE_STATE_DISCONNECTED;
+    strncpy(s_snapshot.msg, msg, sizeof(s_snapshot.msg) - 1);
+    s_snapshot.msg[sizeof(s_snapshot.msg) - 1] = '\0';
+    s_dirty = true;
+    xSemaphoreGive(s_lock);
 }

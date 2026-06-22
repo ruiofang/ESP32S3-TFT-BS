@@ -71,6 +71,31 @@ const char *claude_state_name(claude_state_t s);
  */
 void claude_mode_feed_json(const char *json, size_t len);
 
+/**
+ * @brief 由其它传输 (例如 WiFi UDP) 控制 Claude 面板显隐
+ *        BLE 路径仍走 claude_mode_enter/exit; WiFi 路径用这个独立控制可见性,
+ *        而无需启动 BLE 栈
+ */
+void claude_mode_panel_show(bool show);
+
+/**
+ * @brief 由其它传输覆写右下角 "BLE: ..." 链路标签 (例如 "WiFi: 1.2.3.4")
+ *        在 WiFi 模式下 BLE 不工作, claude_mode_lvgl_refresh 不会覆盖该标签
+ * @param text       要显示的短文本 (NULL 则恢复默认)
+ * @param color_rgb  0xRRGGBB 颜色
+ */
+void claude_mode_set_link_text(const char *text, uint32_t color_rgb);
+
+/**
+ * @brief 让 WS2812 跟随状态色 (供 WiFi 路径使用; BLE 路径自带)
+ */
+void claude_mode_drive_ws2812(bool enable);
+
+/**
+ * @brief 强制把"已就绪"状态写入快照 (替代 BLE 的 'Connected' 默认值)
+ */
+void claude_mode_set_ready_msg(const char *msg);
+
 #ifdef __cplusplus
 }
 #endif

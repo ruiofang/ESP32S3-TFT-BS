@@ -118,7 +118,7 @@ def main() -> int:
 
     print(f"Installed wrapper: {wrapper}")
     print(f"Updated settings:  {settings_path}")
-    print("Start the bridge separately: python3 tools/claude_status_bridge.py --listen-port 8765")
+    print("Start the bridge separately: python3 tools/claude_status_ble_bridge.py --listen-port 8765 --connect-on-start")
     return 0
 
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Tiny hook helper for Claude Code -> claude_status_bridge.py.
+Tiny hook helper for Claude Code -> claude_status_ble_bridge.py.
 
 Reads the Claude Code hook payload from stdin, maps it to the bridge's
 JSON shape, and posts a single line to the bridge daemon over TCP.

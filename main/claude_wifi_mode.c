@@ -1,6 +1,6 @@
 /*
  * Claude WiFi 状态模式:
- *   - 与 BLE 路径 (claude_mode.c) 共用 LCD 面板/WS2812 颜色/状态机
+ *   - 与 BLE 路径 (claude_ble_mode.c) 共用 LCD 面板/WS2812 颜色/状态机
  *   - 传输换成 WiFi: UDP 只做发现, TCP 长连接承载状态
  *   - 配网逻辑: NVS 已存 STA 凭据 -> STA; 否则启动 AP 'ESP32_Claude_XXXX'
  *     供 PC 浏览器访问 http://192.168.4.1/wificfg 提交家庭 WiFi 凭据
@@ -14,12 +14,12 @@
  *   PC -> ESP   {"q":"ping"}                    -> ESP 回 {"r":"pong","id":"..."}
  *   PC -> ESP   TCP: {"q":"bind","id":"AB12","source":"host"}
  *   PC -> ESP   TCP: {"q":"ping", ...}         -> 心跳保活, 用于离线检测
- *   PC -> ESP   TCP: {状态 JSON, 字段同 BLE 协议} -> 喂入 claude_mode_feed_json
+ *   PC -> ESP   TCP: {状态 JSON, 字段同 BLE 协议} -> 喂入 claude_ble_mode_feed_json
  *   ESP -> PC   {"r":"discover","id":"AB12","name":"ESP32_Claude_AB12","ip":"1.2.3.4","tcp_port":8267}
  */
 
 #include "claude_wifi_mode.h"
-#include "claude_mode.h"
+#include "claude_ble_mode.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -188,7 +188,7 @@ static void close_client_slot(tcp_client_t *client, const char *reason)
     ESP_LOGI(TAG, "TCP client closed: %s (%s)", name[0] ? name : ip, reason ? reason : "closed");
 
     if (active_client_count() == 0) {
-        claude_mode_set_ready_msg(reason && *reason ? reason : "Waiting for WiFi host...");
+        claude_ble_mode_set_ready_msg(reason && *reason ? reason : "Waiting for WiFi host...");
     }
     update_link_label();
 }
@@ -845,7 +845,7 @@ static void handle_tcp_query(tcp_client_t *client, const char *line)
         }
         client->last_rx_tick = xTaskGetTickCount();
         if (strcasecmp(qv, "bind") == 0) {
-            claude_mode_set_ready_msg("TCP linked");
+            claude_ble_mode_set_ready_msg("TCP linked");
         }
         update_link_label();
     }
@@ -857,8 +857,8 @@ static void handle_tcp_status_line(tcp_client_t *client, const char *line)
     if (!client->name[0] && client->ip[0]) {
         snprintf(client->name, sizeof(client->name), "%s", client->ip);
     }
-    claude_mode_feed_json(line, strlen(line));
-    claude_mode_feed_json("\n", 1);
+    claude_ble_mode_feed_json(line, strlen(line));
+    claude_ble_mode_feed_json("\n", 1);
     update_link_label();
 }
 
@@ -1094,7 +1094,7 @@ static void update_link_label(void)
     if (s_ap_mode) {
         // AP 模式下 SSID 已含 ID, 显示完整 SSID
         snprintf(buf, sizeof(buf), "AP: %s", s_dev_name);
-        claude_mode_set_link_text(buf, 0xFFAA40);
+        claude_ble_mode_set_link_text(buf, 0xFFAA40);
     } else {
         int clients = active_client_count();
         if (clients > 0) {
@@ -1102,11 +1102,11 @@ static void update_link_label(void)
             const char *who = (client && client->name[0]) ? client->name : s_peer_ip_str;
             snprintf(buf, sizeof(buf), "ID:%s B:%d %s", s_device_id, clients,
                      who && *who ? who : s_my_ip_str);
-            claude_mode_set_link_text(buf, 0x00FF80);
+            claude_ble_mode_set_link_text(buf, 0x00FF80);
         } else {
             // STA 已连接但尚未绑定主机
             snprintf(buf, sizeof(buf), "ID:%s  %s", s_device_id, s_my_ip_str);
-            claude_mode_set_link_text(buf, 0x66CCFF);
+            claude_ble_mode_set_link_text(buf, 0x66CCFF);
         }
     }
 }
@@ -1136,7 +1136,7 @@ static void wifi_setup_task(void *param)
 
     if (wifi_netif_event_init_once() != ESP_OK) {
         ESP_LOGE(TAG, "wifi init failed");
-        claude_mode_set_link_text("WiFi: INIT FAIL", 0xFF4040);
+        claude_ble_mode_set_link_text("WiFi: INIT FAIL", 0xFF4040);
         vTaskDelete(NULL);
         return;
     }
@@ -1146,7 +1146,7 @@ static void wifi_setup_task(void *param)
                         && ssid[0] != '\0');
 
     if (have_creds) {
-        claude_mode_set_link_text("WiFi: connecting", 0xFFAA40);
+        claude_ble_mode_set_link_text("WiFi: connecting", 0xFFAA40);
         if (start_sta(ssid, pass) != ESP_OK) {
             if (!s_stop_req) start_ap_provisioning();
         }
@@ -1177,10 +1177,10 @@ void claude_wifi_mode_enter(void)
     s_active = true;
     s_stop_req = false;
     // 这些都是非阻塞的本地操作, 调用方 (LVGL 任务) 立刻返回
-    claude_mode_panel_show(true);
-    claude_mode_drive_ws2812(true);
-    claude_mode_set_ready_msg("Waiting for WiFi host...");
-    claude_mode_set_link_text("WiFi: starting", 0xFFAA40);
+    claude_ble_mode_panel_show(true);
+    claude_ble_mode_drive_ws2812(true);
+    claude_ble_mode_set_ready_msg("Waiting for WiFi host...");
+    claude_ble_mode_set_link_text("WiFi: starting", 0xFFAA40);
 
     // 真正的 WiFi/HTTP/UDP 启动 (含可能 15s 的 STA 等待) 放到后台任务
     xTaskCreate(wifi_setup_task, "wifi_setup", 4096, NULL, 4, NULL);
@@ -1212,7 +1212,7 @@ void claude_wifi_mode_exit(void)
     }
     esp_wifi_stop();
 
-    claude_mode_drive_ws2812(false);
-    claude_mode_set_link_text(NULL, 0);
-    claude_mode_panel_show(false);
+    claude_ble_mode_drive_ws2812(false);
+    claude_ble_mode_set_link_text(NULL, 0);
+    claude_ble_mode_panel_show(false);
 }

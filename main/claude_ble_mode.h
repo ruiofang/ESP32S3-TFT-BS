@@ -1,5 +1,5 @@
-#ifndef CLAUDE_MODE_H
-#define CLAUDE_MODE_H
+#ifndef CLAUDE_BLE_MODE_H
+#define CLAUDE_BLE_MODE_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -39,27 +39,27 @@ typedef struct {
  * @param parent  Claude UI 的父屏幕 (一般传 lv_scr_act())
  * @return ESP_OK 成功
  */
-esp_err_t claude_mode_init(lv_obj_t *parent);
+esp_err_t claude_ble_mode_init(lv_obj_t *parent);
 
 /**
  * @brief 进入 Claude 状态模式: 显示 Claude UI 面板, 启动 BLE 广播, 接管 WS2812
  */
-void claude_mode_enter(void);
+void claude_ble_mode_enter(void);
 
 /**
  * @brief 退出 Claude 状态模式: 隐藏 Claude UI, 停止 BLE 广播, 释放 WS2812 覆盖
  */
-void claude_mode_exit(void);
+void claude_ble_mode_exit(void);
 
 /**
  * @brief 当前是否处于 Claude 模式
  */
-bool claude_mode_is_active(void);
+bool claude_ble_mode_is_active(void);
 
 /**
  * @brief 由 LVGL 任务调用, 周期性刷新 UI (使用通知机制避免 LVGL 跨任务调用)
  */
-void claude_mode_lvgl_refresh(void);
+void claude_ble_mode_lvgl_refresh(void);
 
 /**
  * @brief 状态名 -> 字符串 (UI 显示)
@@ -69,35 +69,35 @@ const char *claude_state_name(claude_state_t s);
 /**
  * @brief 直接喂入 JSON 帧 (内部使用, 也可从 UART/其它来源传入)
  */
-void claude_mode_feed_json(const char *json, size_t len);
+void claude_ble_mode_feed_json(const char *json, size_t len);
 
 /**
- * @brief 由其它传输 (例如 WiFi UDP) 控制 Claude 面板显隐
- *        BLE 路径仍走 claude_mode_enter/exit; WiFi 路径用这个独立控制可见性,
+ * @brief 由其它传输 (例如 WiFi) 控制 Claude 面板显隐
+ *        BLE 路径仍走 claude_ble_mode_enter/exit; WiFi 路径用这个独立控制可见性,
  *        而无需启动 BLE 栈
  */
-void claude_mode_panel_show(bool show);
+void claude_ble_mode_panel_show(bool show);
 
 /**
  * @brief 由其它传输覆写右下角 "BLE: ..." 链路标签 (例如 "WiFi: 1.2.3.4")
- *        在 WiFi 模式下 BLE 不工作, claude_mode_lvgl_refresh 不会覆盖该标签
+ *        在 WiFi 模式下 BLE 不工作, claude_ble_mode_lvgl_refresh 不会覆盖该标签
  * @param text       要显示的短文本 (NULL 则恢复默认)
  * @param color_rgb  0xRRGGBB 颜色
  */
-void claude_mode_set_link_text(const char *text, uint32_t color_rgb);
+void claude_ble_mode_set_link_text(const char *text, uint32_t color_rgb);
 
 /**
  * @brief 让 WS2812 跟随状态色 (供 WiFi 路径使用; BLE 路径自带)
  */
-void claude_mode_drive_ws2812(bool enable);
+void claude_ble_mode_drive_ws2812(bool enable);
 
 /**
  * @brief 强制把"已就绪"状态写入快照 (替代 BLE 的 'Connected' 默认值)
  */
-void claude_mode_set_ready_msg(const char *msg);
+void claude_ble_mode_set_ready_msg(const char *msg);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif // CLAUDE_MODE_H
+#endif // CLAUDE_BLE_MODE_H

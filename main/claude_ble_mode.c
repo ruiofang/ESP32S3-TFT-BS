@@ -9,11 +9,11 @@
  *   - state: idle / thinking / tool / writing / waiting / error / done
  *   - 其它字段均为可选
  *
- * LCD 与 WS2812 的更新由 LVGL 主任务调用 claude_mode_lvgl_refresh() 完成；
+ * LCD 与 WS2812 的更新由 LVGL 主任务调用 claude_ble_mode_lvgl_refresh() 完成；
  * BLE 回调只把状态写到带互斥锁的快照里，避免跨任务直接操作 LVGL。
  */
 
-#include "claude_mode.h"
+#include "claude_ble_mode.h"
 #include "ws2812_control.h"
 #include "Lib/cJSON/cJSON.h"
 
@@ -191,7 +191,7 @@ static void parse_and_apply_json(const char *json)
     apply_status(&st);
 }
 
-void claude_mode_feed_json(const char *json, size_t len)
+void claude_ble_mode_feed_json(const char *json, size_t len)
 {
     // 把 [json, json+len) 追加到 RX 缓冲, 按 '\n' 或 '\0' 切分
     for (size_t i = 0; i < len; i++) {
@@ -294,7 +294,7 @@ static void ui_build(lv_obj_t *parent)
     lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
-void claude_mode_lvgl_refresh(void)
+void claude_ble_mode_lvgl_refresh(void)
 {
     if (!s_panel) return;
 
@@ -376,7 +376,7 @@ static int nus_rx_write_cb(uint16_t conn_handle, uint16_t attr_handle,
     int rc = ble_hs_mbuf_to_flat(ctxt->om, tmp, sizeof(tmp), &out_len);
     if (rc != 0 || out_len == 0) return 0;
 
-    claude_mode_feed_json(tmp, out_len);
+    claude_ble_mode_feed_json(tmp, out_len);
     return 0;
 }
 
@@ -644,7 +644,7 @@ static esp_err_t ble_stack_init(void)
 // -----------------------------------------------------------------------------
 // 对外 API
 // -----------------------------------------------------------------------------
-esp_err_t claude_mode_init(lv_obj_t *parent)
+esp_err_t claude_ble_mode_init(lv_obj_t *parent)
 {
     if (!parent) return ESP_ERR_INVALID_ARG;
 
@@ -658,7 +658,7 @@ esp_err_t claude_mode_init(lv_obj_t *parent)
     return ESP_OK;
 }
 
-void claude_mode_enter(void)
+void claude_ble_mode_enter(void)
 {
     s_active = true;
     if (s_panel) lv_obj_clear_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
@@ -691,7 +691,7 @@ void claude_mode_enter(void)
     }
 }
 
-void claude_mode_exit(void)
+void claude_ble_mode_exit(void)
 {
     // 实际上 CLAUDE -> 其它模式切换会触发软重启, 此函数仅做最少的关闭收尾
     s_active = false;
@@ -703,22 +703,22 @@ void claude_mode_exit(void)
     }
 }
 
-bool claude_mode_is_active(void)
+bool claude_ble_mode_is_active(void)
 {
     return s_active;
 }
 
 // -----------------------------------------------------------------------------
-// 外部传输 (WiFi UDP) 用的辅助 API
+// 外部传输 (WiFi) 用的辅助 API
 // -----------------------------------------------------------------------------
-void claude_mode_panel_show(bool show)
+void claude_ble_mode_panel_show(bool show)
 {
     if (!s_panel) return;
     if (show) lv_obj_clear_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
     else      lv_obj_add_flag(s_panel, LV_OBJ_FLAG_HIDDEN);
 }
 
-void claude_mode_set_link_text(const char *text, uint32_t color_rgb)
+void claude_ble_mode_set_link_text(const char *text, uint32_t color_rgb)
 {
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;
     if (text && *text) {
@@ -734,7 +734,7 @@ void claude_mode_set_link_text(const char *text, uint32_t color_rgb)
     xSemaphoreGive(s_lock);
 }
 
-void claude_mode_drive_ws2812(bool enable)
+void claude_ble_mode_drive_ws2812(bool enable)
 {
     s_ext_ws2812 = enable;
     if (!enable && !s_active) {
@@ -747,7 +747,7 @@ void claude_mode_drive_ws2812(bool enable)
     }
 }
 
-void claude_mode_set_ready_msg(const char *msg)
+void claude_ble_mode_set_ready_msg(const char *msg)
 {
     if (!msg) msg = "";
     if (xSemaphoreTake(s_lock, pdMS_TO_TICKS(50)) != pdTRUE) return;

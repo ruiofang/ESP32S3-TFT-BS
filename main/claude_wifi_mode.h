@@ -21,7 +21,7 @@ extern "C" {
 
 /**
  * @brief 初始化 WiFi-Claude 模块 (只准备状态, 不启动 radio/server)
- *        必须在 claude_mode_init 之后调用
+ *        必须在 claude_ble_mode_init 之后调用
  */
 esp_err_t claude_wifi_mode_init(void);
 

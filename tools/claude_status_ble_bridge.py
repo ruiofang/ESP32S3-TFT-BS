@@ -8,15 +8,13 @@ CLAUDE mode (cycle BOOT button until LCD shows "MODE: CLAUDE").
 
 Quick start:
     pip install bleak
-    python3 claude_status_bridge.py --listen-port 8765
-    # If you want BLE to connect immediately at startup:
-    python3 claude_status_bridge.py --listen-port 8765 --connect-on-start
+    python3 claude_status_ble_bridge.py --listen-port 8765 --connect-on-start
 
 Then wire Claude Code hooks (`~/.claude/settings.json`) to call
 `tools/claude_hook_post.py` which posts JSON to localhost:8765.
 
 Send a single status update manually:
-    python3 claude_status_bridge.py --once \
+    python3 claude_status_ble_bridge.py --once \
         --json '{"state":"thinking","tool":"Read","msg":"Reading main.c"}'
 
 Protocol JSON shape (all fields optional except `state`):
@@ -396,8 +394,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--listen-host", default="127.0.0.1", help="TCP bind host (default 127.0.0.1)")
     p.add_argument("--listen-port", type=int, default=8765, help="TCP bind port (default 8765)")
     p.add_argument("--scan-timeout", type=float, default=8.0, help="BLE scan timeout seconds")
-    p.add_argument("--connect-on-start", action="store_true",
-                   help="send an initial idle status to connect BLE immediately")
+    connect_group = p.add_mutually_exclusive_group()
+    connect_group.add_argument("--connect-on-start", dest="connect_on_start", action="store_true",
+                               help="connect BLE immediately on startup (default)")
+    connect_group.add_argument("--no-connect-on-start", dest="connect_on_start", action="store_false",
+                               help="delay BLE connect until first hook arrives")
+    p.set_defaults(connect_on_start=True)
     p.add_argument("--once", action="store_true", help="send one status from --json and exit")
     p.add_argument("--json", help="JSON payload for --once mode")
     p.add_argument("-v", "--verbose", action="store_true", help="debug logging")

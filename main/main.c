@@ -23,7 +23,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include "battery_control.h"
-#include "claude_mode.h"
+#include "claude_ble_mode.h"
 #include "claude_wifi_mode.h"
 
 #define TAG "BATTERY_MONITOR"
@@ -68,7 +68,7 @@ typedef enum {
     BATT_READ_MODE_JSON = 0,        // JSON 被动模式 (UART 115200)
     BATT_READ_MODE_RS485_1 = 1,     // RS485 电池协议 (DD/77 起止) 主动查询 (UART 9600)
     BATT_READ_MODE_RS485_2 = 2,     // RS485-2 电池协议 (0xAA 帧头, 小端) 主动查询 (UART 9600)
-    BATT_READ_MODE_CLAUDE = 3,      // Claude 状态模式 (BLE NUS 接收 PC 推送)
+    BATT_READ_MODE_CLAUDE_BLE = 3,  // Claude 状态模式 (BLE NUS 接收 PC 推送)
     BATT_READ_MODE_CLAUDE_WIFI = 4, // Claude 状态模式 (WiFi + UDP 接收 PC 推送)
     BATT_READ_MODE_MAX
 } battery_read_mode_t;
@@ -85,7 +85,7 @@ static volatile int g_claude_mode_request = 0;
 // 该模式是否属于 "Claude 家族" (UI 走 claude_mode 面板)
 static inline bool is_claude_mode(battery_read_mode_t m)
 {
-    return m == BATT_READ_MODE_CLAUDE || m == BATT_READ_MODE_CLAUDE_WIFI;
+    return m == BATT_READ_MODE_CLAUDE_BLE || m == BATT_READ_MODE_CLAUDE_WIFI;
 }
 
 static inline const char *battery_read_mode_name(battery_read_mode_t m)
@@ -94,7 +94,7 @@ static inline const char *battery_read_mode_name(battery_read_mode_t m)
         case BATT_READ_MODE_JSON:        return "JSON";
         case BATT_READ_MODE_RS485_1:     return "RS485-1";
         case BATT_READ_MODE_RS485_2:     return "RS485-2";
-        case BATT_READ_MODE_CLAUDE:      return "CLAUDE";
+        case BATT_READ_MODE_CLAUDE_BLE:  return "CLAUDE_BLE";
         case BATT_READ_MODE_CLAUDE_WIFI: return "CLAUDE_WIFI";
         default: return "?";
     }
@@ -1477,10 +1477,10 @@ static void apply_battery_read_mode(battery_read_mode_t mode)
     // ESP32-S3 内部 DRAM 不足以让 BLE+WiFi 共存; 选择保存模式后软重启,
     // 让新一轮启动按目标模式做对应的初始化 (跳过 WiFi 或跳过 BLE 或反过来).
     // CLAUDE (BLE) 与 CLAUDE_WIFI 之间互相切换也必须重启 (BLE/WiFi 栈彼此干扰).
-    bool prev_needs_ble  = (prev == BATT_READ_MODE_CLAUDE);
-    bool now_needs_ble   = (mode == BATT_READ_MODE_CLAUDE);
-    bool prev_needs_wifi = (prev != BATT_READ_MODE_CLAUDE);  // 非 BLE 都是 WiFi/无 radio
-    bool now_needs_wifi  = (mode != BATT_READ_MODE_CLAUDE);
+    bool prev_needs_ble  = (prev == BATT_READ_MODE_CLAUDE_BLE);
+    bool now_needs_ble   = (mode == BATT_READ_MODE_CLAUDE_BLE);
+    bool prev_needs_wifi = (prev != BATT_READ_MODE_CLAUDE_BLE);  // 非 BLE 都是 WiFi/无 radio
+    bool now_needs_wifi  = (mode != BATT_READ_MODE_CLAUDE_BLE);
     (void)prev_needs_wifi; (void)now_needs_wifi;
 
     if (prev_needs_ble != now_needs_ble ||
@@ -2396,10 +2396,10 @@ static void lvgl_task(void *pvParameters)
         // 真正的 widget 显示/隐藏和 BLE/WiFi 栈延迟初始化, 避免跨任务动 LVGL)
         if (g_claude_mode_request == 1) {
             g_claude_mode_request = 0;
-            claude_mode_enter();
+            claude_ble_mode_enter();
         } else if (g_claude_mode_request == 2) {
             g_claude_mode_request = 0;
-            claude_mode_exit();
+            claude_ble_mode_exit();
         } else if (g_claude_mode_request == 3) {
             g_claude_mode_request = 0;
             claude_wifi_mode_enter();
@@ -2409,7 +2409,7 @@ static void lvgl_task(void *pvParameters)
         }
 
         // Claude 模式: 每轮检查是否有新的状态快照需要刷新
-        claude_mode_lvgl_refresh();
+        claude_ble_mode_lvgl_refresh();
 
         // 每10次处理一次，避免过于频繁
         cnt++;
@@ -2453,7 +2453,7 @@ void app_main(void)
     ESP_LOGI(TAG, "Battery read mode restored: %s",
              battery_read_mode_name(g_battery_read_mode));
 
-    if (g_battery_read_mode == BATT_READ_MODE_CLAUDE) {
+    if (g_battery_read_mode == BATT_READ_MODE_CLAUDE_BLE) {
         // BLE Claude: 跳过 WiFi/Web 初始化, 把 DRAM 留给 BLE 控制器
         ESP_LOGW(TAG, "CLAUDE (BLE) mode: skipping WiFi/Web init to reserve DRAM for BLE");
     } else if (g_battery_read_mode == BATT_READ_MODE_CLAUDE_WIFI) {
@@ -2532,15 +2532,15 @@ void app_main(void)
     create_battery_ui();
 
     // 初始化 Claude 状态模块 (只创建 LVGL 控件, BLE 延迟到进入时再初始化) - UI 默认隐藏
-    if (claude_mode_init(lv_scr_act()) != ESP_OK) {
-        ESP_LOGW(TAG, "claude_mode_init failed; CLAUDE mode unavailable");
+    if (claude_ble_mode_init(lv_scr_act()) != ESP_OK) {
+        ESP_LOGW(TAG, "claude_ble_mode_init failed; CLAUDE mode unavailable");
     }
     // 同步初始化 WiFi Claude 状态模块 (只准备状态, radio/server 延迟到进入时再启动)
     if (claude_wifi_mode_init() != ESP_OK) {
         ESP_LOGW(TAG, "claude_wifi_mode_init failed; CLAUDE_WIFI mode unavailable");
     }
     // 如果上次模式是 CLAUDE / CLAUDE_WIFI, 让 LVGL 任务在自己的上下文里完成进入
-    if (g_battery_read_mode == BATT_READ_MODE_CLAUDE) {
+    if (g_battery_read_mode == BATT_READ_MODE_CLAUDE_BLE) {
         g_claude_mode_request = 1;
     } else if (g_battery_read_mode == BATT_READ_MODE_CLAUDE_WIFI) {
         g_claude_mode_request = 3;

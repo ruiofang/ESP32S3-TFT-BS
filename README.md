@@ -4,19 +4,19 @@
 
 ## 更新日志
 ## test4 2026-06-22
-- 新增 **CLAUDE_WIFI 模式** (第 5 种 BOOT 循环模式)：通过 **WiFi UDP** 接收 PC 推送的 Claude 状态，与 BLE 路径共用同一套 LCD 面板 / WS2812 状态色 / 状态机，提供给没有 BLE 适配器或需要远程推送的场景；
-- 配网流程：首次进入时自动起 AP `ESP32_Claude_XXXX` (密码 `claude123`)，浏览器打开 `http://192.168.4.1/` 选 SSID → 输密码 → 保存 → 设备重启进 STA；STA 连接成功后 LCD 显示 `WiFi: <IP>` 和 `ID:XXXX`；
+- 新增 **CLAUDE_WIFI 模式** (第 5 种 BOOT 循环模式)：通过 **WiFi** 接收 PC 推送的 Claude 状态，与 BLE 路径共用同一套 LCD 面板 / WS2812 状态色 / 状态机；链路采用 **UDP 发现 + TCP 长连接状态传输**，便于设备可靠判断主机离线；
+- 配网流程：首次进入时自动起 AP `ESP32_Claude_XXXX` (密码 `12345678`)，浏览器打开 `http://192.168.4.1/` 选 SSID → 输密码 → 保存 → 设备重启进 STA；STA 连接成功后 LCD 显示 `WiFi: <IP>` 和 `ID:XXXX`；
 - WiFi 配网网页分页设计（主页 / WiFi / 高级），并提供 `/wifiscan` AP 扫描接口，列表点击即可填入 SSID；
-- **BOOT 长按 (≥2.5s)**：在 CLAUDE_WIFI 模式下清除已保存 WiFi 凭据并重启回 AP 配网，方便换网；短按仍循环模式（改为释放时触发以便与长按区分）；
-- 设备号 = MAC 后 4 位 hex (`ESP32_Claude_XXXX` 的 `XXXX`)，PC 桥通过 UDP 广播 `{"q":"discover","id":"XXXX"}` 完成配对，之后单播状态 JSON 到固定端口 **8266**；
-- 新增 PC 桥 `tools/claude_status_wifi_bridge.py`，无命令行参数，所有配置走同目录 `claude_wifi_bridge.json`（首次运行自动写默认模板）；Claude Code Hooks 配置无需改变。
+- **BOOT 长按 (≥5s)**：在 CLAUDE_WIFI 模式下清除已保存 WiFi 凭据并重启回 AP 配网，方便换网；短按仍循环模式（改为释放时触发以便与长按区分）；
+- 设备号 = MAC 后 4 位 hex (`ESP32_Claude_XXXX` 的 `XXXX`)，PC 桥通过 UDP 广播 `{"q":"discover","id":"XXXX"}` 完成配对，并自动获取设备 IP / TCP 端口；之后桥与 ESP32 建立持久 **TCP** 连接，断开或心跳超时会被判定为离线；
+- 新增 PC 桥 `tools/claude_status_wifi_bridge.py`，无命令行参数，所有配置走同目录 `claude_wifi_bridge.json`（首次运行自动写默认模板）；支持单设备或多设备同时绑定显示；Claude Code Hooks 配置无需改变。
 
 ## test3 2026-06-18
 - 新增 **CLAUDE 状态模式**：通过 BLE (NimBLE Nordic UART Service) 接收 PC 推送的 Claude Code 运行状态；LCD 用 LVGL 面板显示 状态/工具/模型/token 计数/消息；WS2812 用颜色映射当前状态（idle=绿 / thinking=蓝 / tool=青 / writing=品红 / waiting=黄 / error=红 / done=白 / 未连接=灰）；
 - BOOT 按键循环扩展为 4 种模式：`JSON → RS485-1 → RS485-2 → CLAUDE → JSON ...`；模式持久化到 NVS，重启自动恢复；
-- 新增 PC 端桥接脚本 `tools/claude_status_bridge.py` 与钩子助手 `tools/claude_hook_post.py`，通过 Claude Code Hooks 自动推送状态；
+- 新增 PC 端桥接脚本 `tools/claude_status_ble_bridge.py` 与钩子助手 `tools/claude_hook_post.py`，通过 Claude Code Hooks 自动推送状态；
 - BLE 设备名为 `ESP32_Claude_XXXX`（XXXX = MAC 后 2 字节），无 PIN，直接连接。
-/usr/bin/python3 tools/claude_status_bridge.py --connect-on-start -v
+/usr/bin/python3 tools/claude_status_ble_bridge.py --connect-on-start -v
 
 ## test2.5 2026-04-17
 - WiFi AP SSID 改为基于芯片 MAC 自动生成：`ESP32_Light_XXXX`（后 2 字节，同一芯片固定，不同芯片唯一）；密码仍为 `12345678`；
@@ -263,16 +263,16 @@ python test_esp32_functions.py
 │   ├── ws2812_control.c    # WS2812控制实现
 │   ├── ws2812_control.h    # WS2812控制头文件
 │   ├── battery_control.h   # 电池管理头文件
-│   ├── claude_mode.c       # CLAUDE 模式: BLE NUS + LVGL 状态面板
-│   ├── claude_mode.h       # CLAUDE 模式头文件
-│   ├── claude_wifi_mode.c  # CLAUDE_WIFI 模式: WiFi (STA/AP 配网) + UDP 监听
+│   ├── claude_ble_mode.c   # CLAUDE 模式: BLE NUS + LVGL 状态面板
+│   ├── claude_ble_mode.h   # CLAUDE 模式头文件
+│   ├── claude_wifi_mode.c  # CLAUDE_WIFI 模式: WiFi (STA/AP 配网) + UDP 发现 + TCP 状态监听
 │   ├── claude_wifi_mode.h  # CLAUDE_WIFI 模式头文件
 │   ├── APP/                # 应用程序模块
 │   └── Lib/                # 第三方库
 ├── components/             # ESP-IDF组件
 ├── tools/
-│   ├── claude_status_bridge.py        # PC -> BLE 桥接守护脚本
-│   ├── claude_status_wifi_bridge.py   # PC -> WiFi UDP 桥接守护脚本
+│   ├── claude_status_ble_bridge.py    # PC -> BLE 桥接守护脚本
+│   ├── claude_status_wifi_bridge.py   # PC -> WiFi 桥接守护脚本 (UDP 发现 + TCP 长连接)
 │   ├── claude_hook_post.py            # Claude Code 钩子助手
 │   └── claude_hooks_settings.example.json  # 钩子配置示例
 ├── build/                  # 编译输出目录
@@ -300,10 +300,10 @@ python test_esp32_functions.py
 pip install bleak
 
 # 启动桥接守护进程
-python3 tools/claude_status_bridge.py --listen-port 8765
+python3 tools/claude_status_ble_bridge.py --listen-port 8765 --connect-on-start
 
 # 手动单次测试
-python3 tools/claude_status_bridge.py --once \
+python3 tools/claude_status_ble_bridge.py --once \
     --json '{"state":"thinking","tool":"Read","msg":"hello world"}'
 ```
 桥接进程会自动扫描 `ESP32_Claude_*` 设备并连接。
@@ -338,7 +338,7 @@ ESP32 暴露标准 NUS：
 
 ## CLAUDE_WIFI 状态模式 (test4+)
 
-与 BLE 路径共用同一个状态面板和 WS2812 配色，但通过 **WiFi UDP** 代替 BLE NUS 传输，适合手头没有蓝牙适配器、或希望走家庭网络远程推送的场景。
+与 BLE 路径共用同一个状态面板和 WS2812 配色，但通过 **WiFi** 代替 BLE NUS 传输。链路模型为 **UDP 发现 + TCP 长连接状态推送**，适合没有蓝牙适配器、希望走家庭网络远程推送，或需要让 ESP32 明确感知主机离线的场景。
 
 ### 启用方式
 1. 短按 BOOT 循环到 LCD 显示 `MODE: CLAUDE_WIFI` (期间会软重启切换射频)；
@@ -362,27 +362,56 @@ python3 tools/claude_status_wifi_bridge.py
 
 | 字段 | 默认 | 说明 |
 | ---- | ---- | ---- |
-| `device_id`        | `""`              | LCD 上 `ID:XXXX` 的设备号；留空 = 配对任意应答设备 |
-| `static_ip`        | `null`            | 填了就跳过广播发现，直接单播这个 IP |
+| `targets`          | `[]`              | 推荐写法；数组元素形如 `{"device_id":"AB12","label":"desk-left"}`，可同时绑定多个设备 |
+| `device_ids`       | `[]`              | 多设备简写；例如 `["AB12","CD34"]` |
+| `device_id`        | `""`              | 旧单设备兼容写法；LCD 上 `ID:XXXX` 的设备号；留空 = 配对任意应答设备 |
+| `static_ip`        | `null`            | 旧单设备兼容写法；填了就跳过广播发现，直接连接这个 IP |
 | `broadcast`        | `255.255.255.255` | 默认广播地址（会与本地每个接口的 /24 定向广播一起 fan-out） |
 | `listen_host`      | `127.0.0.1`       | TCP 监听地址（Claude Code 钩子连这里） |
 | `listen_port`      | `8765`            | TCP 监听端口 |
+| `source_name`      | `copilot`         | 桥发给 ESP32 的绑定名称，LCD 会优先显示它 |
 | `connect_on_start` | `false`           | 启动时立即发一条 idle，顺便完成发现 |
 | `verbose`          | `false`           | 打开 DEBUG 日志 |
 
-桥广播 `{"q":"discover","id":"XXXX"}` 到 `255.255.255.255` + 本地各子网 `192.168.x.255`，匹配设备号的设备回 `{"r":"discover","ip":"...","port":8266}`，之后单播状态 JSON。Claude Code Hooks 仍指向 `localhost:8765`，与 BLE 桥配置可二选一。
+推荐多设备配置示例：
 
-### UDP 协议 (端口 8266)
+```json
+{
+  "targets": [
+    {"device_id": "AB12", "label": "desk-left"},
+    {"device_id": "CD34", "label": "desk-right"}
+  ],
+  "listen_host": "127.0.0.1",
+  "listen_port": 8765,
+  "source_name": "copilot",
+  "connect_on_start": false,
+  "verbose": false
+}
+```
+
+桥会广播 `{"q":"discover","id":"XXXX"}` 到 `255.255.255.255` + 本地各子网 `192.168.x.255`。匹配设备号的设备回 discovery 应答，里面会自动带上设备 IP 与 `tcp_port`；桥随后建立持久 TCP 连接，并定时发心跳维持在线状态。Claude Code Hooks 仍指向 `localhost:8765`，与 BLE 桥配置可二选一。
+
+### WiFi 协议
+
+#### UDP 发现 (端口 8266)
 | 方向 | 帧 | 说明 |
 | ---- | -- | ---- |
-| PC → ESP | `{"q":"discover"}` 或 `{"q":"discover","id":"XXXX"}` | 设备广播发现；id 不匹配时丢弃 |
-| ESP → PC | `{"r":"discover","id":"XXXX","name":"ESP32_Claude_XXXX","ip":"...","port":8266}` | 发现应答 |
-| PC → ESP | `{"q":"ping","id":"XXXX"}` | 存活检测 |
+| PC → ESP | `{"q":"discover"}` 或 `{"q":"discover","id":"XXXX"}` | 广播发现；id 不匹配时设备丢弃 |
+| ESP → PC | `{"r":"discover","id":"XXXX","name":"ESP32_Claude_XXXX","ip":"...","port":8267,"udp_port":8266,"tcp_port":8267,"clients":0}` | 发现应答，自动携带 TCP 端口和当前已绑定客户端数量 |
+| PC → ESP | `{"q":"ping","id":"XXXX"}` | 可选发现层探活 |
 | ESP → PC | `{"r":"pong","id":"XXXX"}` | ping 应答 |
+
+#### TCP 状态传输 (端口 8267)
+| 方向 | 帧 | 说明 |
+| ---- | -- | ---- |
+| PC → ESP | `{"q":"bind","id":"XXXX","source":"copilot","label":"desk-left"}` | 建立连接后的绑定声明；ESP32 用它更新 LCD 绑定信息 |
+| PC → ESP | `{"q":"ping","id":"XXXX","source":"copilot"}` | 桥定时发送的心跳；断开或超时后 ESP32 判定主机离线 |
 | PC → ESP | `{"state":"thinking","tool":"Read",...}` | 状态推送，字段同 BLE 协议 |
 
+TCP 长连接断开、RST、或 ESP32 侧心跳超时都会触发离线态；这是选择 TCP 而不是 HTTP 的主要原因。
+
 ### 配网页接口
-- `GET /` — 主页 (设备号 / IP / 端口 / 当前模式)
+- `GET /` — 主页 (设备号 / IP / TCP 端口 / 当前模式)
 - `GET /wifi` (`/wificfg` 别名) — WiFi 配网表单 + AP 扫描列表
 - `GET /wifiscan` — 返回 `[{"s":"SSID","r":-50,"a":3}, ...]` 的 AP 列表 (`a` = authmode, 0 = open)
 - `GET /tools` — 高级页，含「清除已保存 WiFi 凭据」按钮

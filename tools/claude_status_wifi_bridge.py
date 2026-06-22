@@ -2,41 +2,22 @@
 """
 ESP32 Claude Status WiFi Bridge
 
-Discovers an ESP32S3-TFT-BS device on the local network via UDP broadcast and
-forwards Claude Code hook events to it. The device must be running in
-CLAUDE_WIFI mode (cycle BOOT button until LCD shows "MODE: CLAUDE_WIFI") and
-must be connected to your WiFi (first time: connect to the AP
-"ESP32_Claude_XXXX" / "claude123" and open http://192.168.4.1/ to enter your
-home WiFi credentials).
+Uses UDP broadcast only for discovery/pairing, then keeps one persistent TCP
+connection per ESP32 target for status delivery. That gives the ESP32 a real
+connection lifecycle: orderly close, reset, or heartbeat timeout can all be
+treated as offline.
 
-Quick start:
-    python3 claude_status_wifi_bridge.py
+The device must be running in CLAUDE_WIFI mode and connected to your LAN.
+The bridge reads config from tools/claude_wifi_bridge.json and accepts Claude
+Code hook events over localhost TCP from tools/claude_hook_post.py.
 
-The script reads its settings from `tools/claude_wifi_bridge.json` (created
-next to the script on first run with sensible defaults). Edit that file to
-change device id / listen port / etc., then rerun. No CLI args needed.
+Supported config styles:
+1. Legacy single-target fields: device_id/static_ip
+2. device_ids: ["AB12", "CD34"]
+3. targets: [{"device_id":"AB12","label":"desk"}, ...]
 
-Config keys:
-    device_id        ESP32 last-4-hex MAC shown on LCD ("ID:XXXX"); empty = any
-    static_ip        Skip broadcast, unicast straight to this IP
-    broadcast        Broadcast address (255.255.255.255 + per-iface /24)
-    listen_host      TCP bind host (default 127.0.0.1)
-    listen_port      TCP bind port (default 8765, hooks point here)
-    connect_on_start Send an initial idle status at startup
-    verbose          Enable DEBUG logging
-
-Then wire Claude Code hooks (`~/.claude/settings.json`) to call
-`tools/claude_hook_post.py` which posts JSON to localhost:8765.
-
-Protocol JSON shape (all fields optional except `state`):
-    {
-        "state": "idle|thinking|tool|writing|waiting|error|done",
-        "tool":  "Read|Edit|Bash|...",
-        "model": "Opus 4.7",
-        "ti":    123,    // total input tokens
-        "to":    45,     // total output tokens
-        "msg":   "short status message"
-    }
+Discovery auto-fills the target IP and TCP port from the ESP32 discovery
+reply; you only need the device id for pairing unless you want static_ip.
 """
 
 from __future__ import annotations
@@ -49,13 +30,17 @@ import os
 import signal
 import socket
 import sys
+from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Optional, Tuple
+from typing import Optional
 
 ESP_UDP_PORT = 8266
+ESP_TCP_PORT = 8267
 DISCOVERY_INTERVAL = 2.0      # seconds between broadcasts when searching
 DISCOVERY_TIMEOUT = 8.0       # seconds before warning
 SEND_RETRY = 2
+CONNECT_TIMEOUT = 3.0
+HEARTBEAT_INTERVAL = 4.0
 MSG_BYTE_LIMIT = 24
 
 log = logging.getLogger("claude-wifi-bridge")
@@ -158,67 +143,77 @@ def compact_payload(obj: dict) -> dict:
     return payload
 
 
-# -----------------------------------------------------------------------------
-# UDP link to the ESP32
-# -----------------------------------------------------------------------------
-class EspWifiLink:
-    """Persistent UDP link: broadcast-discover, then unicast status to device."""
+@dataclass
+class TargetConfig:
+    label: str
+    device_id: Optional[str]
+    static_ip: Optional[str]
+    tcp_port: int = ESP_TCP_PORT
 
-    def __init__(self, device_id: Optional[str], static_ip: Optional[str],
-                 broadcast: str = "255.255.255.255") -> None:
-        self.device_id = device_id.upper() if device_id else None
-        self.static_ip = static_ip
-        self.broadcast = broadcast
-        # 把 255.255.255.255 + 所有本地接口的 /24 定向广播 (e.g. 192.168.31.255) 都列出
+
+class EspTcpTarget:
+    """One ESP32 target: UDP discover + persistent TCP connection."""
+
+    def __init__(self, config: TargetConfig, broadcast: str, source_name: str) -> None:
+        self.config = config
+        self.device_id = config.device_id.upper() if config.device_id else None
         self.broadcasts = _enumerate_broadcasts(broadcast)
-        self.peer: Optional[Tuple[str, int]] = None
+        self.source_name = clip_utf8(source_name, 23) or "host"
+        self.peer_ip: Optional[str] = None
+        self.peer_port: int = config.tcp_port or ESP_TCP_PORT
+        self.peer_name: str = config.label or ""
+        self.discovered_id: Optional[str] = self.device_id
+        self._writer: Optional[asyncio.StreamWriter] = None
+        self._reader_task: Optional[asyncio.Task] = None
         self._lock = asyncio.Lock()
-        self._sock: Optional[socket.socket] = None
 
-    def _ensure_socket(self) -> socket.socket:
-        if self._sock is not None:
-            return self._sock
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        # Bind ephemeral local port so device's reply has somewhere to land.
-        s.bind(("", 0))
-        s.setblocking(False)
-        self._sock = s
-        return s
-
-    async def discover(self, timeout: float = DISCOVERY_TIMEOUT) -> Tuple[str, int]:
-        """Broadcast 'discover' until the device with matching id answers."""
-        if self.static_ip:
-            log.info("Using static IP %s:%d (no broadcast discovery)", self.static_ip, ESP_UDP_PORT)
-            self.peer = (self.static_ip, ESP_UDP_PORT)
-            return self.peer
-
-        sock = self._ensure_socket()
-        loop = asyncio.get_running_loop()
-        q = {"q": "discover"}
+    @property
+    def display_name(self) -> str:
+        if self.config.label:
+            return self.config.label
         if self.device_id:
-            q["id"] = self.device_id
-        payload = (json.dumps(q) + "\n").encode("utf-8")
+            return self.device_id
+        if self.peer_name:
+            return self.peer_name
+        return self.peer_ip or "auto"
 
-        log.info("discover targets: %s", ", ".join(self.broadcasts))
+    async def discover(self, timeout: float = DISCOVERY_TIMEOUT) -> tuple[str, int]:
+        if self.config.static_ip:
+            self.peer_ip = self.config.static_ip
+            self.peer_port = self.config.tcp_port or ESP_TCP_PORT
+            log.info("%s using static TCP target %s:%d",
+                     self.display_name, self.peer_ip, self.peer_port)
+            return self.peer_ip, self.peer_port
 
-        deadline = loop.time() + timeout
-        next_send = 0.0
-        while loop.time() < deadline:
-            now = loop.time()
-            if now >= next_send:
-                for target in self.broadcasts:
-                    try:
-                        sock.sendto(payload, (target, ESP_UDP_PORT))
-                        log.debug("discover -> %s (id=%s)", target, self.device_id)
-                    except OSError as exc:
-                        log.debug("discover -> %s failed: %s", target, exc)
-                next_send = now + DISCOVERY_INTERVAL
+        loop = asyncio.get_running_loop()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("", 0))
+        sock.setblocking(False)
 
-            # Wait up to (next_send - now) but no more than the remaining budget
-            wait = max(0.05, min(next_send - now, deadline - now))
-            try:
+        try:
+            q = {"q": "discover"}
+            if self.device_id:
+                q["id"] = self.device_id
+            payload = (json.dumps(q, separators=(",", ":")) + "\n").encode("utf-8")
+
+            deadline = loop.time() + timeout
+            next_send = 0.0
+            while loop.time() < deadline:
+                now = loop.time()
+                if now >= next_send:
+                    for target in self.broadcasts:
+                        try:
+                            sock.sendto(payload, (target, ESP_UDP_PORT))
+                            log.debug("discover %s -> %s (id=%s)",
+                                      self.display_name, target, self.device_id or "*")
+                        except OSError as exc:
+                            log.debug("discover %s -> %s failed: %s",
+                                      self.display_name, target, exc)
+                    next_send = now + DISCOVERY_INTERVAL
+
+                wait = max(0.05, min(next_send - now, deadline - now))
                 fut = loop.create_future()
 
                 def _on_readable() -> None:
@@ -228,71 +223,176 @@ class EspWifiLink:
                 loop.add_reader(sock.fileno(), _on_readable)
                 try:
                     await asyncio.wait_for(fut, timeout=wait)
+                except asyncio.TimeoutError:
+                    continue
                 finally:
                     loop.remove_reader(sock.fileno())
-            except asyncio.TimeoutError:
-                continue
 
-            try:
-                data, src = sock.recvfrom(2048)
-            except BlockingIOError:
-                continue
-            try:
-                obj = json.loads(data.decode("utf-8", errors="replace").strip())
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
-            if not isinstance(obj, dict):
-                continue
-            if obj.get("r") != "discover":
-                continue
-            their_id = str(obj.get("id", "")).upper()
-            if self.device_id and their_id != self.device_id:
-                log.debug("ignoring discover reply from id %s (want %s)", their_id, self.device_id)
-                continue
-            ip = obj.get("ip") or src[0]
-            port = int(obj.get("port") or ESP_UDP_PORT)
-            self.peer = (ip, port)
-            log.info("Paired with device id=%s name=%s @ %s:%d",
-                     their_id, obj.get("name"), ip, port)
-            return self.peer
+                try:
+                    data, src = sock.recvfrom(2048)
+                except BlockingIOError:
+                    continue
 
-        raise TimeoutError(f"No device id={self.device_id or 'any'} responded within {timeout:.0f}s. "
-                           "Verify the ESP32 LCD shows MODE: CLAUDE_WIFI and 'WiFi: <ip>'.")
+                try:
+                    obj = json.loads(data.decode("utf-8", errors="replace").strip())
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(obj, dict) or obj.get("r") != "discover":
+                    continue
+
+                their_id = str(obj.get("id", "") or "").upper()
+                if self.device_id and their_id != self.device_id:
+                    log.debug("ignoring discover reply from %s for target %s",
+                              their_id, self.display_name)
+                    continue
+
+                self.discovered_id = their_id or self.device_id
+                self.peer_ip = str(obj.get("ip") or src[0])
+                self.peer_port = int(obj.get("tcp_port") or obj.get("port") or ESP_TCP_PORT)
+                self.peer_name = str(obj.get("name") or self.display_name)
+                log.info("paired %s -> id=%s name=%s @ %s:%d",
+                         self.display_name,
+                         self.discovered_id or "(any)",
+                         self.peer_name,
+                         self.peer_ip,
+                         self.peer_port)
+                return self.peer_ip, self.peer_port
+
+        finally:
+            sock.close()
+
+        raise TimeoutError(
+            f"No device for target {self.display_name} responded within {timeout:.0f}s. "
+            "Verify the ESP32 LCD shows MODE: CLAUDE_WIFI and a WiFi IP."
+        )
+
+    async def _watch_reader(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            while True:
+                data = await reader.read(64)
+                if not data:
+                    break
+        except Exception as exc:  # noqa: BLE001
+            log.debug("reader for %s ended: %s", self.display_name, exc)
+        finally:
+            if self._writer is writer:
+                self._drop_connection(log_message=False)
+                log.info("TCP closed by ESP32: %s", self.display_name)
+
+    def _drop_connection(self, log_message: bool = True) -> None:
+        writer = self._writer
+        self._writer = None
+
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            self._reader_task = None
+
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        if log_message:
+            log.debug("connection reset for %s", self.display_name)
+
+    async def _connect_locked(self) -> None:
+        if self._writer is not None:
+            return
+
+        await self.discover()
+        assert self.peer_ip is not None
+
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(self.peer_ip, self.peer_port),
+            timeout=CONNECT_TIMEOUT,
+        )
+
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            except OSError:
+                pass
+
+        self._writer = writer
+        self._reader_task = asyncio.create_task(self._watch_reader(reader, writer))
+        bind_msg = {
+            "q": "bind",
+            "id": self.discovered_id or self.device_id or "",
+            "source": self.source_name,
+            "label": self.config.label or "",
+        }
+        writer.write((json.dumps(bind_msg, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
+        await writer.drain()
+        log.info("TCP linked: %s -> %s:%d", self.display_name, self.peer_ip, self.peer_port)
 
     async def send_json(self, obj: dict) -> None:
         line = (json.dumps(compact_payload(obj), separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
         async with self._lock:
             for attempt in range(SEND_RETRY + 1):
-                if self.peer is None:
-                    try:
-                        await self.discover()
-                    except TimeoutError as exc:
-                        log.error("discover failed: %s", exc)
-                        if attempt == SEND_RETRY:
-                            raise
-                        await asyncio.sleep(0.5)
-                        continue
-                assert self.peer is not None
-                sock = self._ensure_socket()
                 try:
-                    sock.sendto(line, self.peer)
-                    log.debug("sent %d bytes to %s:%d", len(line), *self.peer)
+                    await self._connect_locked()
+                    assert self._writer is not None
+                    self._writer.write(line)
+                    await self._writer.drain()
                     return
-                except OSError as exc:
-                    log.warning("send to %s:%d failed: %s", *self.peer, exc)
-                    if exc.errno in (errno.EHOSTUNREACH, errno.ENETUNREACH):
-                        # device may have changed IP; force re-discover
-                        self.peer = None
+                except (OSError, asyncio.TimeoutError, ConnectionError) as exc:
+                    log.warning("send to %s failed: %s", self.display_name, exc)
+                    self._drop_connection()
                     if attempt == SEND_RETRY:
                         raise
+                    await asyncio.sleep(0.3)
 
-    def close(self) -> None:
-        if self._sock is not None:
+    async def send_ping(self) -> None:
+        async with self._lock:
+            if self._writer is None:
+                return
             try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
+                msg = {
+                    "q": "ping",
+                    "id": self.discovered_id or self.device_id or "",
+                    "source": self.source_name,
+                }
+                self._writer.write((json.dumps(msg, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8"))
+                await self._writer.drain()
+            except (OSError, ConnectionError) as exc:
+                log.warning("ping %s failed: %s", self.display_name, exc)
+                self._drop_connection()
+
+    async def close(self) -> None:
+        async with self._lock:
+            self._drop_connection(log_message=False)
+
+
+class EspTargetFanout:
+    def __init__(self, targets: list[EspTcpTarget]) -> None:
+        self.targets = targets
+
+    async def send_json(self, obj: dict) -> None:
+        if not self.targets:
+            raise RuntimeError("no ESP32 targets configured")
+
+        results = await asyncio.gather(
+            *(target.send_json(obj) for target in self.targets),
+            return_exceptions=True,
+        )
+        failures = []
+        for target, result in zip(self.targets, results):
+            if isinstance(result, Exception):
+                failures.append((target.display_name, result))
+        for name, exc in failures:
+            log.error("target %s failed: %s", name, exc)
+        if len(failures) == len(self.targets):
+            raise RuntimeError("all ESP32 targets failed")
+
+    async def send_ping(self) -> None:
+        if not self.targets:
+            return
+        await asyncio.gather(*(target.send_ping() for target in self.targets), return_exceptions=True)
+
+    async def close(self) -> None:
+        await asyncio.gather(*(target.close() for target in self.targets), return_exceptions=True)
 
 
 # -----------------------------------------------------------------------------
@@ -339,7 +439,7 @@ class StatusAggregator:
 # -----------------------------------------------------------------------------
 # TCP server: accepts one line-delimited JSON per connection
 # -----------------------------------------------------------------------------
-async def run_tcp_server(host: str, port: int, link: EspWifiLink, agg: StatusAggregator,
+async def run_tcp_server(host: str, port: int, link: EspTargetFanout, agg: StatusAggregator,
                          started: Optional[asyncio.Future] = None) -> None:
     async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
@@ -363,7 +463,7 @@ async def run_tcp_server(host: str, port: int, link: EspWifiLink, agg: StatusAgg
                 try:
                     await link.send_json(full)
                 except Exception as exc:  # noqa: BLE001
-                    log.error("UDP forward failed: %s", exc)
+                    log.error("ESP forward failed: %s", exc)
             writer.write(b"OK\n")
             await writer.drain()
         except asyncio.TimeoutError:
@@ -400,14 +500,57 @@ CONFIG_PATH = os.path.join(
 )
 
 DEFAULT_CONFIG = {
-    "device_id": "",                # ESP32 设备号 = MAC 后 4 位 hex (LCD 上 ID:XXXX); 空 = 任意应答的设备
-    "static_ip": None,              # 跳过广播发现, 直接单播这个 IP (例如 "192.168.1.50")
+    "device_id": "",                # 旧单设备配置: ESP32 设备号 = MAC 后 4 位 hex (LCD 上 ID:XXXX)
+    "device_ids": [],               # 多设备简写: ["AB12", "CD34"]
+    "targets": [],                  # 推荐: [{"device_id":"AB12","label":"desk"}, ...]
+    "static_ip": None,              # 旧单设备配置: 跳过广播发现, 直接连这个 IP
     "broadcast": "255.255.255.255", # 默认广播地址 (会和本地子网定向广播一起 fan-out)
     "listen_host": "127.0.0.1",     # TCP 监听地址 (Claude Code 钩子连这里)
     "listen_port": 8765,            # TCP 监听端口
+    "source_name": "copilot",      # 发给 ESP32 的绑定名称
     "connect_on_start": False,      # 启动时立即发一条 idle 给设备 (顺便完成发现)
     "verbose": False,               # 打开 DEBUG 日志
 }
+
+
+def build_target_configs(args: SimpleNamespace) -> list[TargetConfig]:
+    configs: list[TargetConfig] = []
+
+    raw_targets = getattr(args, "targets", None)
+    if isinstance(raw_targets, list):
+        for index, item in enumerate(raw_targets, start=1):
+            if not isinstance(item, dict):
+                continue
+            device_id = str(item.get("device_id") or "").strip().upper() or None
+            static_ip = str(item.get("static_ip") or "").strip() or None
+            label = str(item.get("label") or device_id or f"target-{index}")
+            tcp_port = int(item.get("tcp_port") or ESP_TCP_PORT)
+            configs.append(TargetConfig(label=label, device_id=device_id, static_ip=static_ip, tcp_port=tcp_port))
+
+    raw_ids = getattr(args, "device_ids", None)
+    if not configs and isinstance(raw_ids, list):
+        for index, item in enumerate(raw_ids, start=1):
+            device_id = str(item or "").strip().upper()
+            if not device_id:
+                continue
+            configs.append(TargetConfig(label=device_id or f"target-{index}", device_id=device_id, static_ip=None))
+
+    if not configs:
+        device_id = str(getattr(args, "device_id", "") or "").strip().upper() or None
+        static_ip = str(getattr(args, "static_ip", "") or "").strip() or None
+        label = device_id or static_ip or "auto"
+        configs.append(TargetConfig(label=label, device_id=device_id, static_ip=static_ip))
+
+    return configs
+
+
+async def heartbeat_loop(stop: asyncio.Event, link: EspTargetFanout) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=HEARTBEAT_INTERVAL)
+            break
+        except asyncio.TimeoutError:
+            await link.send_ping()
 
 
 def load_config() -> SimpleNamespace:
@@ -418,7 +561,7 @@ def load_config() -> SimpleNamespace:
                 json.dump(DEFAULT_CONFIG, f, indent=2, ensure_ascii=False)
                 f.write("\n")
             log.info("已创建默认配置: %s", CONFIG_PATH)
-            log.info("请编辑该文件 (至少填 device_id), 然后重新运行.")
+            log.info("请编辑该文件 (可填 device_id/device_ids/targets), 然后重新运行.")
         except OSError as exc:
             log.warning("写默认配置失败 (%s), 仍用内置默认值", exc)
 
@@ -450,13 +593,20 @@ async def amain() -> int:
         logging.getLogger().setLevel(logging.DEBUG)
 
     log.info("配置文件: %s", CONFIG_PATH)
-    log.info("device_id=%s static_ip=%s listen=%s:%d",
-             args.device_id or "(any)", args.static_ip or "(broadcast)",
-             args.listen_host, args.listen_port)
+    target_configs = build_target_configs(args)
+    log.info("listen=%s:%d targets=%d source=%s",
+             args.listen_host, args.listen_port, len(target_configs), args.source_name)
+    for config in target_configs:
+        log.info("target %s id=%s static_ip=%s tcp_port=%d",
+                 config.label,
+                 config.device_id or "(any)",
+                 config.static_ip or "(discover)",
+                 config.tcp_port)
 
-    link = EspWifiLink(device_id=args.device_id or None,
-                       static_ip=args.static_ip,
-                       broadcast=args.broadcast)
+    link = EspTargetFanout([
+        EspTcpTarget(config, args.broadcast, args.source_name)
+        for config in target_configs
+    ])
 
     agg = StatusAggregator()
 
@@ -476,40 +626,58 @@ async def amain() -> int:
     server_task = asyncio.create_task(
         run_tcp_server(args.listen_host, args.listen_port, link, agg, started)
     )
+    heartbeat_task = asyncio.create_task(heartbeat_loop(stop, link))
     try:
         await started
     except OSError as exc:
         if exc.errno == errno.EADDRINUSE:
             log.error("%s:%d is already in use; stop the existing bridge first",
                       args.listen_host, args.listen_port)
+            heartbeat_task.cancel()
             try:
                 await server_task
             except OSError:
                 pass
+            try:
+                await heartbeat_task
+            except asyncio.CancelledError:
+                pass
+            await link.close()
             return 1
         raise
     except Exception:
         server_task.cancel()
+        heartbeat_task.cancel()
         try:
             await server_task
         except asyncio.CancelledError:
             pass
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass
+        await link.close()
         raise
 
     if args.connect_on_start:
         try:
             await link.send_json({"state": "idle", "msg": "Bridge ready"})
-            log.info("initial UDP status sent")
+            log.info("initial TCP status sent")
         except Exception as exc:  # noqa: BLE001
-            log.warning("initial UDP send failed (%s); will retry on first hook", exc)
+            log.warning("initial TCP send failed (%s); will retry on first hook", exc)
 
     await stop.wait()
     server_task.cancel()
+    heartbeat_task.cancel()
     try:
         await server_task
     except asyncio.CancelledError:
         pass
-    link.close()
+    try:
+        await heartbeat_task
+    except asyncio.CancelledError:
+        pass
+    await link.close()
     return 0
 
 

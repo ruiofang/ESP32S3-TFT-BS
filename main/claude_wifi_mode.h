@@ -10,8 +10,11 @@
 extern "C" {
 #endif
 
-// UDP 服务端口 (PC 桥广播/单播都打到这个端口)
+// UDP 发现服务端口 (PC 桥广播 discover 打到这个端口)
 #define CLAUDE_WIFI_UDP_PORT 8266
+
+// TCP 状态传输端口 (PC 桥发现后与此端口建立长连接)
+#define CLAUDE_WIFI_TCP_PORT 8267
 
 // 设备号长度: MAC 后 4 位 (8 个 hex 字符 + 1 个 '\0' 留点余量)
 #define CLAUDE_WIFI_DEVID_LEN 8
@@ -23,7 +26,8 @@ extern "C" {
 esp_err_t claude_wifi_mode_init(void);
 
 /**
- * @brief 进入 CLAUDE_WIFI 模式: 启动 WiFi (STA 已配 -> STA; 否则 AP 配网), 启动 UDP 监听
+ * @brief 进入 CLAUDE_WIFI 模式: 启动 WiFi (STA 已配 -> STA; 否则 AP 配网),
+ *        启动 UDP 发现监听与 TCP 状态监听
  */
 void claude_wifi_mode_enter(void);
 

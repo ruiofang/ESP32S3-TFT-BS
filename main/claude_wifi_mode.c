@@ -1,19 +1,21 @@
 /*
  * Claude WiFi 状态模式:
  *   - 与 BLE 路径 (claude_mode.c) 共用 LCD 面板/WS2812 颜色/状态机
- *   - 传输换成 WiFi UDP, 固定端口 CLAUDE_WIFI_UDP_PORT (8266)
+ *   - 传输换成 WiFi: UDP 只做发现, TCP 长连接承载状态
  *   - 配网逻辑: NVS 已存 STA 凭据 -> STA; 否则启动 AP 'ESP32_Claude_XXXX'
  *     供 PC 浏览器访问 http://192.168.4.1/wificfg 提交家庭 WiFi 凭据
  *   - 配对: 设备号 = MAC 后 4 位 hex (与 BLE 命名规则一致)
  *           PC 桥广播 {"q":"discover","id":"XXXX"} -> 设备回 {"r":"discover", ...}
- *           随后 PC 单播状态 JSON 到本设备 IP:8266
+ *           随后 PC 连接本设备 TCP 端口并持续发送状态 JSON
  *
- * 协议帧 (UDP, line 不强制, 单包一条 JSON):
+ * 协议帧:
  *   PC -> ESP   {"q":"discover"}                -> ESP 回 discovery 应答 (向源端口)
  *   PC -> ESP   {"q":"discover","id":"AB12"}    -> id 匹配才回; 不匹配丢弃
  *   PC -> ESP   {"q":"ping"}                    -> ESP 回 {"r":"pong","id":"..."}
- *   PC -> ESP   {状态 JSON, 字段同 BLE 协议}    -> 喂入 claude_mode_feed_json
- *   ESP -> PC   {"r":"discover","id":"AB12","name":"ESP32_Claude_AB12","ip":"1.2.3.4"}
+ *   PC -> ESP   TCP: {"q":"bind","id":"AB12","source":"host"}
+ *   PC -> ESP   TCP: {"q":"ping", ...}         -> 心跳保活, 用于离线检测
+ *   PC -> ESP   TCP: {状态 JSON, 字段同 BLE 协议} -> 喂入 claude_mode_feed_json
+ *   ESP -> PC   {"r":"discover","id":"AB12","name":"ESP32_Claude_AB12","ip":"1.2.3.4","tcp_port":8267}
  */
 
 #include "claude_wifi_mode.h"
@@ -35,6 +37,7 @@
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "lwip/netdb.h"
+#include "lwip/tcp.h"
 
 #include <string.h>
 #include <stdio.h>
@@ -59,6 +62,10 @@
 
 #define UDP_RX_BUF_LEN       1024
 #define UDP_TX_BUF_LEN       256
+#define TCP_RX_BUF_LEN       384
+#define CLAUDE_TCP_ACCEPT_BACKLOG 4
+#define TCP_MAX_CLIENTS      4
+#define TCP_IDLE_TIMEOUT_MS  12000
 
 // -----------------------------------------------------------------------------
 // 模块全局状态
@@ -75,14 +82,147 @@ static esp_netif_t *s_netif_sta = NULL;
 static esp_netif_t *s_netif_ap  = NULL;
 static httpd_handle_t s_httpd   = NULL;
 
-static TaskHandle_t s_udp_task = NULL;
+typedef struct {
+    int fd;
+    TickType_t last_rx_tick;
+    char ip[16];
+    char name[24];
+    char rx_buf[TCP_RX_BUF_LEN];
+    size_t rx_len;
+} tcp_client_t;
+
+static TaskHandle_t s_net_task = NULL;
 static int s_udp_sock = -1;
+static int s_tcp_listen_sock = -1;
+static tcp_client_t s_clients[TCP_MAX_CLIENTS];
 
 static bool s_ap_mode = false;          // 当前是否处于 AP 配网模式
 static char s_my_ip_str[16] = "0.0.0.0";
 
 // 最后一次成功通信的对端 IP (用于显示和反馈, 不用于安全)
 static char s_peer_ip_str[16] = "";
+
+static void update_link_label(void);
+
+static void reset_client_slot(tcp_client_t *client)
+{
+    if (!client) return;
+    client->fd = -1;
+    client->last_rx_tick = 0;
+    client->ip[0] = '\0';
+    client->name[0] = '\0';
+    client->rx_buf[0] = '\0';
+    client->rx_len = 0;
+}
+
+static int active_client_count(void)
+{
+    int count = 0;
+    for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+        if (s_clients[i].fd >= 0) count++;
+    }
+    return count;
+}
+
+static tcp_client_t *first_active_client(void)
+{
+    for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+        if (s_clients[i].fd >= 0) return &s_clients[i];
+    }
+    return NULL;
+}
+
+static bool extract_json_string_field(const char *json, const char *key,
+                                      char *out, size_t out_size)
+{
+    if (!json || !key || !out || out_size == 0) return false;
+    char pattern[24];
+    snprintf(pattern, sizeof(pattern), "\"%s\"", key);
+    const char *p = strstr(json, pattern);
+    if (!p) return false;
+
+    p = strchr(p, ':');
+    if (!p) return false;
+    p++;
+    while (*p == ' ' || *p == '\t') p++;
+
+    bool quoted = (*p == '\"');
+    if (quoted) p++;
+
+    size_t i = 0;
+    while (*p && i + 1 < out_size) {
+        char c = *p++;
+        if (quoted) {
+            if (c == '\"') break;
+        } else if (c == ',' || c == '}' || c == ' ' || c == '\r' || c == '\n' || c == '\t') {
+            break;
+        }
+        out[i++] = c;
+    }
+    out[i] = '\0';
+    return i > 0;
+}
+
+static bool message_id_matches_device(const char *json)
+{
+    char id_seen[16];
+    if (!extract_json_string_field(json, "id", id_seen, sizeof(id_seen))) return true;
+    if (id_seen[0] == '\0') return true;
+    return strcasecmp(id_seen, s_device_id) == 0;
+}
+
+static void close_client_slot(tcp_client_t *client, const char *reason)
+{
+    if (!client || client->fd < 0) return;
+
+    int fd = client->fd;
+    char ip[16];
+    char name[24];
+    snprintf(ip, sizeof(ip), "%s", client->ip);
+    snprintf(name, sizeof(name), "%s", client->name);
+
+    shutdown(fd, SHUT_RDWR);
+    close(fd);
+    reset_client_slot(client);
+
+    ESP_LOGI(TAG, "TCP client closed: %s (%s)", name[0] ? name : ip, reason ? reason : "closed");
+
+    if (active_client_count() == 0) {
+        claude_mode_set_ready_msg(reason && *reason ? reason : "Waiting for WiFi host...");
+    }
+    update_link_label();
+}
+
+static void close_all_clients(const char *reason)
+{
+    for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+        if (s_clients[i].fd >= 0) close_client_slot(&s_clients[i], reason);
+    }
+}
+
+static void configure_tcp_socket(int fd)
+{
+    int yes = 1;
+    setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(yes));
+#ifdef TCP_KEEPIDLE
+    {
+        int idle = 6;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
+    }
+#endif
+#ifdef TCP_KEEPINTVL
+    {
+        int intvl = 3;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &intvl, sizeof(intvl));
+    }
+#endif
+#ifdef TCP_KEEPCNT
+    {
+        int cnt = 2;
+        setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &cnt, sizeof(cnt));
+    }
+#endif
+}
 
 // -----------------------------------------------------------------------------
 // 工具
@@ -332,16 +472,16 @@ static const char k_nav[] =
 
 static const char k_foot[] = "</body></html>";
 
-// 主页: 显示设备号 / 当前 IP / UDP 端口 / 简短说明
+// 主页: 显示设备号 / 当前 IP / TCP 端口 / 简短说明
 static const char k_home_body[] =
     "<h1>ESP32 Claude</h1>"
     "<table>"
     "<tr><td>设备号</td><td><b>%s</b></td></tr>"
     "<tr><td>当前 IP</td><td>%s</td></tr>"
-    "<tr><td>UDP 端口</td><td>%d</td></tr>"
+    "<tr><td>TCP 端口</td><td>%d</td></tr>"
     "<tr><td>模式</td><td>%s</td></tr>"
     "</table>"
-    "<p><small>PC 桥命令: claude_status_wifi_bridge.py --id %s</small></p>";
+    "<p><small>UDP 发现端口固定为 8266; PC 桥按设备号自动发现后连接 TCP.</small></p>";
 
 // WiFi 页: 扫描 + SSID/PSK 表单
 static const char k_wifi_body[] =
@@ -423,10 +563,8 @@ static esp_err_t send_page_chunks(httpd_req_t *req, page_id_t page, const char *
 static esp_err_t home_get_handler(httpd_req_t *req)
 {
     const char *mode = s_ap_mode ? "AP 配网" : "STA 已连接";
-    char udp_port_str[12];  // 不使用, 占位
-    (void)udp_port_str;
     return send_page_chunks(req, PAGE_HOME, k_home_body,
-                            s_device_id, s_my_ip_str, CLAUDE_WIFI_UDP_PORT, mode);
+                            s_device_id, s_my_ip_str, CLAUDE_WIFI_TCP_PORT, mode);
 }
 
 static esp_err_t wifi_get_handler(httpd_req_t *req)
@@ -655,43 +793,27 @@ static esp_err_t start_http(void)
 // -----------------------------------------------------------------------------
 static void try_handle_query(const char *json, struct sockaddr_in *peer)
 {
-    // 极简 JSON 字段提取 (避免在 UDP 任务里 strdup + cJSON 频繁分配)
-    // 支持: "q":"discover", "q":"ping", 可选 "id":"XXXX"
-    const char *q = strstr(json, "\"q\"");
-    if (!q) return;
-    const char *qv = strchr(q, ':');
-    if (!qv) return;
-    qv++;
-    while (*qv == ' ' || *qv == '\"') qv++;
-    bool is_discover = strncasecmp(qv, "discover", 8) == 0;
-    bool is_ping     = strncasecmp(qv, "ping", 4) == 0;
+    char qv[16];
+    if (!extract_json_string_field(json, "q", qv, sizeof(qv))) return;
+    bool is_discover = strcasecmp(qv, "discover") == 0;
+    bool is_ping     = strcasecmp(qv, "ping") == 0;
     if (!is_discover && !is_ping) return;
 
-    // id 过滤 (可选)
-    const char *idp = strstr(json, "\"id\"");
-    if (idp) {
-        const char *iv = strchr(idp, ':');
-        if (iv) {
-            iv++;
-            while (*iv == ' ' || *iv == '\"') iv++;
-            char id_seen[8] = {0};
-            for (size_t i = 0; i < sizeof(id_seen) - 1 && iv[i] && iv[i] != '\"'; i++) {
-                id_seen[i] = iv[i];
-            }
-            if (id_seen[0] && strcasecmp(id_seen, s_device_id) != 0) {
-                ESP_LOGD(TAG, "discover/ping id mismatch (asked %s, have %s)",
-                         id_seen, s_device_id);
-                return;
-            }
-        }
+    if (!message_id_matches_device(json)) {
+        char id_seen[16] = {0};
+        extract_json_string_field(json, "id", id_seen, sizeof(id_seen));
+        ESP_LOGD(TAG, "discover/ping id mismatch (asked %s, have %s)", id_seen, s_device_id);
+        return;
     }
 
     char reply[UDP_TX_BUF_LEN];
     int n;
     if (is_discover) {
         n = snprintf(reply, sizeof(reply),
-                     "{\"r\":\"discover\",\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"port\":%d}\n",
-                     s_device_id, s_dev_name, s_my_ip_str, CLAUDE_WIFI_UDP_PORT);
+                     "{\"r\":\"discover\",\"id\":\"%s\",\"name\":\"%s\",\"ip\":\"%s\",\"port\":%d,\"udp_port\":%d,\"tcp_port\":%d,\"clients\":%d}\n",
+                     s_device_id, s_dev_name, s_my_ip_str,
+                     CLAUDE_WIFI_TCP_PORT, CLAUDE_WIFI_UDP_PORT, CLAUDE_WIFI_TCP_PORT,
+                     active_client_count());
     } else {
         n = snprintf(reply, sizeof(reply),
                      "{\"r\":\"pong\",\"id\":\"%s\"}\n", s_device_id);
@@ -701,10 +823,123 @@ static void try_handle_query(const char *json, struct sockaddr_in *peer)
     }
 }
 
-static void udp_task(void *param)
+static void handle_tcp_query(tcp_client_t *client, const char *line)
+{
+    char qv[16];
+    if (!extract_json_string_field(line, "q", qv, sizeof(qv))) return;
+
+    if (!message_id_matches_device(line)) {
+        close_client_slot(client, "TCP id mismatch");
+        return;
+    }
+
+    if (strcasecmp(qv, "bind") == 0 || strcasecmp(qv, "ping") == 0) {
+        char source[24] = {0};
+        if (!extract_json_string_field(line, "source", source, sizeof(source))) {
+            extract_json_string_field(line, "name", source, sizeof(source));
+        }
+        if (source[0]) {
+            snprintf(client->name, sizeof(client->name), "%s", source);
+        } else if (!client->name[0] && client->ip[0]) {
+            snprintf(client->name, sizeof(client->name), "%s", client->ip);
+        }
+        client->last_rx_tick = xTaskGetTickCount();
+        if (strcasecmp(qv, "bind") == 0) {
+            claude_mode_set_ready_msg("TCP linked");
+        }
+        update_link_label();
+    }
+}
+
+static void handle_tcp_status_line(tcp_client_t *client, const char *line)
+{
+    client->last_rx_tick = xTaskGetTickCount();
+    if (!client->name[0] && client->ip[0]) {
+        snprintf(client->name, sizeof(client->name), "%s", client->ip);
+    }
+    claude_mode_feed_json(line, strlen(line));
+    claude_mode_feed_json("\n", 1);
+    update_link_label();
+}
+
+static void handle_tcp_client_data(tcp_client_t *client, const char *buf, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        char c = buf[i];
+        if (c == '\r') continue;
+        if (c == '\n' || c == '\0') {
+            if (client->rx_len > 0) {
+                client->rx_buf[client->rx_len] = '\0';
+                if (strstr(client->rx_buf, "\"q\"")) {
+                    handle_tcp_query(client, client->rx_buf);
+                    if (client->fd < 0) return;
+                } else {
+                    handle_tcp_status_line(client, client->rx_buf);
+                }
+                client->rx_len = 0;
+            }
+            continue;
+        }
+
+        if (client->rx_len + 1 < sizeof(client->rx_buf)) {
+            client->rx_buf[client->rx_len++] = c;
+        } else {
+            ESP_LOGW(TAG, "TCP RX overflow from %s", client->ip);
+            client->rx_len = 0;
+        }
+    }
+
+    if (client->rx_len > 0 && client->rx_buf[client->rx_len - 1] == '}') {
+        client->rx_buf[client->rx_len] = '\0';
+        if (strstr(client->rx_buf, "\"q\"")) {
+            handle_tcp_query(client, client->rx_buf);
+        } else {
+            handle_tcp_status_line(client, client->rx_buf);
+        }
+        client->rx_len = 0;
+    }
+}
+
+static void accept_tcp_client(void)
+{
+    struct sockaddr_in peer = {0};
+    socklen_t plen = sizeof(peer);
+    int fd = accept(s_tcp_listen_sock, (struct sockaddr *)&peer, &plen);
+    if (fd < 0) {
+        ESP_LOGW(TAG, "accept errno=%d", errno);
+        return;
+    }
+
+    tcp_client_t *slot = NULL;
+    for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+        if (s_clients[i].fd < 0) {
+            slot = &s_clients[i];
+            break;
+        }
+    }
+    if (!slot) {
+        ESP_LOGW(TAG, "too many TCP clients, reject new connection");
+        shutdown(fd, SHUT_RDWR);
+        close(fd);
+        return;
+    }
+
+    reset_client_slot(slot);
+    slot->fd = fd;
+    slot->last_rx_tick = xTaskGetTickCount();
+    inet_ntoa_r(peer.sin_addr, slot->ip, sizeof(slot->ip));
+    strncpy(slot->name, slot->ip, sizeof(slot->name) - 1);
+    slot->name[sizeof(slot->name) - 1] = '\0';
+    snprintf(s_peer_ip_str, sizeof(s_peer_ip_str), "%s", slot->ip);
+    configure_tcp_socket(fd);
+    ESP_LOGI(TAG, "TCP client connected: %s", slot->ip);
+    update_link_label();
+}
+
+static void network_task(void *param)
 {
     (void)param;
-    char buf[UDP_RX_BUF_LEN];
+    char udp_buf[UDP_RX_BUF_LEN];
 
     while (!s_stop_req) {
         s_udp_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -731,40 +966,122 @@ static void udp_task(void *param)
         struct timeval tv = { .tv_sec = 0, .tv_usec = 100 * 1000 };
         setsockopt(s_udp_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
-        ESP_LOGI(TAG, "UDP listener bound on 0.0.0.0:%d (devid=%s)",
-                 CLAUDE_WIFI_UDP_PORT, s_device_id);
+        s_tcp_listen_sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (s_tcp_listen_sock < 0) {
+            ESP_LOGE(TAG, "tcp socket() failed errno=%d", errno);
+            close(s_udp_sock);
+            s_udp_sock = -1;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        setsockopt(s_tcp_listen_sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        struct sockaddr_in tcp_addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(CLAUDE_WIFI_TCP_PORT),
+            .sin_addr.s_addr = htonl(INADDR_ANY),
+        };
+        if (bind(s_tcp_listen_sock, (struct sockaddr *)&tcp_addr, sizeof(tcp_addr)) < 0) {
+            ESP_LOGE(TAG, "tcp bind(%d) failed errno=%d", CLAUDE_WIFI_TCP_PORT, errno);
+            close(s_tcp_listen_sock);
+            close(s_udp_sock);
+            s_tcp_listen_sock = -1;
+            s_udp_sock = -1;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+        if (listen(s_tcp_listen_sock, CLAUDE_TCP_ACCEPT_BACKLOG) < 0) {
+            ESP_LOGE(TAG, "listen(%d) failed errno=%d", CLAUDE_WIFI_TCP_PORT, errno);
+            close(s_tcp_listen_sock);
+            close(s_udp_sock);
+            s_tcp_listen_sock = -1;
+            s_udp_sock = -1;
+            vTaskDelay(pdMS_TO_TICKS(2000));
+            continue;
+        }
+
+        ESP_LOGI(TAG, "UDP discovery on 0.0.0.0:%d, TCP status on 0.0.0.0:%d (devid=%s)",
+                 CLAUDE_WIFI_UDP_PORT, CLAUDE_WIFI_TCP_PORT, s_device_id);
 
         while (!s_stop_req) {
-            struct sockaddr_in peer = {0};
-            socklen_t plen = sizeof(peer);
-            int n = recvfrom(s_udp_sock, buf, sizeof(buf) - 1, 0,
-                             (struct sockaddr *)&peer, &plen);
-            if (n <= 0) {
-                if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
-                ESP_LOGW(TAG, "recvfrom errno=%d", errno);
+            fd_set rfds;
+            FD_ZERO(&rfds);
+            int maxfd = -1;
+
+            if (s_udp_sock >= 0) {
+                FD_SET(s_udp_sock, &rfds);
+                maxfd = s_udp_sock;
+            }
+            if (s_tcp_listen_sock >= 0) {
+                FD_SET(s_tcp_listen_sock, &rfds);
+                if (s_tcp_listen_sock > maxfd) maxfd = s_tcp_listen_sock;
+            }
+            for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+                if (s_clients[i].fd >= 0) {
+                    FD_SET(s_clients[i].fd, &rfds);
+                    if (s_clients[i].fd > maxfd) maxfd = s_clients[i].fd;
+                }
+            }
+
+            struct timeval sel_tv = { .tv_sec = 0, .tv_usec = 250 * 1000 };
+            int ready = select(maxfd + 1, &rfds, NULL, NULL, &sel_tv);
+            if (ready < 0) {
+                if (errno == EINTR) continue;
+                ESP_LOGW(TAG, "select errno=%d", errno);
                 break;
             }
-            buf[n] = '\0';
 
-            // 同时支持 "查询/握手" 和 "状态推送"
-            // 简单判定: 若帧里出现 "\"q\"" 走 query 处理, 否则当成状态 JSON 喂入
-            if (strstr(buf, "\"q\"")) {
-                try_handle_query(buf, &peer);
-                // 记录最近一次发现的对端用于显示 (不强求)
-                inet_ntoa_r(peer.sin_addr, s_peer_ip_str, sizeof(s_peer_ip_str));
-            } else {
-                // 状态帧: 直接复用 BLE 路径的 JSON 解析 + 应用
-                claude_mode_feed_json(buf, n);
-                inet_ntoa_r(peer.sin_addr, s_peer_ip_str, sizeof(s_peer_ip_str));
+            if (ready > 0 && s_udp_sock >= 0 && FD_ISSET(s_udp_sock, &rfds)) {
+                struct sockaddr_in peer = {0};
+                socklen_t plen = sizeof(peer);
+                int n = recvfrom(s_udp_sock, udp_buf, sizeof(udp_buf) - 1, 0,
+                                 (struct sockaddr *)&peer, &plen);
+                if (n > 0) {
+                    udp_buf[n] = '\0';
+                    try_handle_query(udp_buf, &peer);
+                    inet_ntoa_r(peer.sin_addr, s_peer_ip_str, sizeof(s_peer_ip_str));
+                } else if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    ESP_LOGW(TAG, "recvfrom errno=%d", errno);
+                    break;
+                }
+            }
+
+            if (ready > 0 && s_tcp_listen_sock >= 0 && FD_ISSET(s_tcp_listen_sock, &rfds)) {
+                accept_tcp_client();
+            }
+
+            for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+                tcp_client_t *client = &s_clients[i];
+                if (client->fd < 0) continue;
+                if (ready > 0 && FD_ISSET(client->fd, &rfds)) {
+                    char buf[160];
+                    int n = recv(client->fd, buf, sizeof(buf), 0);
+                    if (n <= 0) {
+                        close_client_slot(client, "TCP disconnected");
+                        continue;
+                    }
+                    handle_tcp_client_data(client, buf, (size_t)n);
+                }
+            }
+
+            TickType_t now = xTaskGetTickCount();
+            for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+                tcp_client_t *client = &s_clients[i];
+                if (client->fd >= 0 &&
+                    (now - client->last_rx_tick) > pdMS_TO_TICKS(TCP_IDLE_TIMEOUT_MS)) {
+                    close_client_slot(client, "TCP idle timeout");
+                }
             }
         }
 
-        close(s_udp_sock);
+        close_all_clients("TCP offline");
+        if (s_tcp_listen_sock >= 0) close(s_tcp_listen_sock);
+        if (s_udp_sock >= 0) close(s_udp_sock);
+        s_tcp_listen_sock = -1;
         s_udp_sock = -1;
     }
 
-    ESP_LOGI(TAG, "UDP task exit");
-    s_udp_task = NULL;
+    ESP_LOGI(TAG, "network task exit");
+    s_net_task = NULL;
     vTaskDelete(NULL);
 }
 
@@ -779,9 +1096,18 @@ static void update_link_label(void)
         snprintf(buf, sizeof(buf), "AP: %s", s_dev_name);
         claude_mode_set_link_text(buf, 0xFFAA40);
     } else {
-        // STA 连接后突出显示设备号 (PC 桥 --id 用的就是这个)
-        snprintf(buf, sizeof(buf), "ID:%s  %s", s_device_id, s_my_ip_str);
-        claude_mode_set_link_text(buf, 0x00FF80);
+        int clients = active_client_count();
+        if (clients > 0) {
+            tcp_client_t *client = first_active_client();
+            const char *who = (client && client->name[0]) ? client->name : s_peer_ip_str;
+            snprintf(buf, sizeof(buf), "ID:%s B:%d %s", s_device_id, clients,
+                     who && *who ? who : s_my_ip_str);
+            claude_mode_set_link_text(buf, 0x00FF80);
+        } else {
+            // STA 已连接但尚未绑定主机
+            snprintf(buf, sizeof(buf), "ID:%s  %s", s_device_id, s_my_ip_str);
+            claude_mode_set_link_text(buf, 0x66CCFF);
+        }
     }
 }
 
@@ -794,6 +1120,7 @@ esp_err_t claude_wifi_mode_init(void)
     compute_device_id();
     s_wifi_evt = xEventGroupCreate();
     if (!s_wifi_evt) return ESP_ERR_NO_MEM;
+    for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) reset_client_slot(&s_clients[i]);
     s_inited = true;
     ESP_LOGI(TAG, "Claude WiFi mode ready (device id=%s, name=%s)",
              s_device_id, s_dev_name);
@@ -830,8 +1157,8 @@ static void wifi_setup_task(void *param)
     if (!s_stop_req) {
         start_http();
         update_link_label();
-        if (!s_udp_task) {
-            xTaskCreate(udp_task, "claude_udp", 4096, NULL, 4, &s_udp_task);
+        if (!s_net_task) {
+            xTaskCreate(network_task, "claude_net", 6144, NULL, 4, &s_net_task);
         }
     }
 
@@ -868,8 +1195,14 @@ void claude_wifi_mode_exit(void)
     if (s_udp_sock >= 0) {
         shutdown(s_udp_sock, 0);
     }
+    if (s_tcp_listen_sock >= 0) {
+        shutdown(s_tcp_listen_sock, SHUT_RDWR);
+    }
+    for (size_t i = 0; i < TCP_MAX_CLIENTS; i++) {
+        if (s_clients[i].fd >= 0) shutdown(s_clients[i].fd, SHUT_RDWR);
+    }
     // 等任务自行退出 (最多 500ms)
-    for (int i = 0; i < 50 && s_udp_task; i++) {
+    for (int i = 0; i < 50 && s_net_task; i++) {
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 

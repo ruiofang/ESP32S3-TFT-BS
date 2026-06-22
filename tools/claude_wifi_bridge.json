@@ -1,9 +1,12 @@
 {
+  "targets": [],
+  "device_ids": [],
   "device_id": "",
   "static_ip": null,
   "broadcast": "255.255.255.255",
   "listen_host": "127.0.0.1",
   "listen_port": 8765,
-  "connect_on_start": false,
+  "source_name": "Ruio",
+  "connect_on_start": true,
   "verbose": false
 }

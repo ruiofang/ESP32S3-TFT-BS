@@ -34,8 +34,14 @@
 
 #define OTA_NVS_NAMESPACE   "ota"
 #define OTA_NVS_KEY_ENABLED "auto"
+
+// Manifest URL configuration
+// For debugging/testing with local server, change to: "http://192.168.x.x:8000/latest.json"
+// For GitHub releases (default), use HTTPS for security
+#ifndef OTA_MANIFEST_URL
 #define OTA_MANIFEST_URL \
     "https://github.com/ruiofang/ESP32S3-TFT-BS/releases/latest/download/latest.json"
+#endif
 #define MANIFEST_MAX_LEN       1024
 #define MANIFEST_FETCH_RETRIES 3
 #define MANIFEST_BACKOFF_MS    1500   // doubles per attempt: 1.5s, 3s, 6s

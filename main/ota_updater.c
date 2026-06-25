@@ -27,6 +27,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
+#include <time.h>
 
 #include "cJSON.h"
 
@@ -37,7 +38,9 @@
 
 // Manifest URL configuration
 // Primary URL (GitHub) and backup URL (Gitee) for OTA manifest
-// For debugging/testing with local server, change OTA_MANIFEST_URL to: "http://192.168.x.x:8000/latest.json"
+// For production: use HTTPS URLs below (requires correct system time for SSL)
+// For testing locally: use HTTP with local server (see tools/ota_test_server.py)
+
 #ifndef OTA_MANIFEST_URL
 #define OTA_MANIFEST_URL \
     "https://github.com/ruiofang/ESP32S3-TFT-BS/releases/latest/download/latest.json"
@@ -46,6 +49,15 @@
 #ifndef OTA_MANIFEST_URL_BACKUP
 #define OTA_MANIFEST_URL_BACKUP \
     "https://gitee.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json"
+#endif
+
+// Optional: HTTP URL for local testing (less secure, no SSL verification)
+// Enable this in sdkconfig or uncomment to test with local HTTP server
+#ifdef CONFIG_OTA_MANIFEST_USE_HTTP_LOCAL
+#undef OTA_MANIFEST_URL
+#define OTA_MANIFEST_URL "http://192.168.4.1:8000/latest.json"
+#undef OTA_MANIFEST_URL_BACKUP
+#define OTA_MANIFEST_URL_BACKUP "http://192.168.4.1:8000/latest.json"
 #endif
 #define MANIFEST_MAX_LEN       1024
 #define MANIFEST_FETCH_RETRIES 3
@@ -73,6 +85,27 @@ static void set_status(const char *fmt, ...)
     vsnprintf(s_last_status, sizeof(s_last_status), fmt, ap);
     va_end(ap);
     ESP_LOGI(TAG, "status: %s", s_last_status);
+}
+
+// Check system time and log it
+static void log_system_time(void)
+{
+    time_t now = time(NULL);
+    struct tm timeinfo = *localtime(&now);
+
+    // Check if time is reasonable (after 2020)
+    if (now < 1577836800) {  // Jan 1, 2020
+        ESP_LOGW(TAG, "⚠️  System time appears to be incorrect!");
+        ESP_LOGW(TAG, "   Current time: %04d-%02d-%02d %02d:%02d:%02d",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+        ESP_LOGW(TAG, "   SSL certificate verification may fail!");
+        ESP_LOGW(TAG, "   Please sync device time (e.g., via SNTP)");
+    } else {
+        ESP_LOGI(TAG, "System time: %04d-%02d-%02d %02d:%02d:%02d",
+                 timeinfo.tm_year + 1900, timeinfo.tm_mon + 1, timeinfo.tm_mday,
+                 timeinfo.tm_hour, timeinfo.tm_min, timeinfo.tm_sec);
+    }
 }
 
 static int version_cmp(const char *a, const char *b)
@@ -105,17 +138,23 @@ static esp_err_t fetch_manifest_from_url(const char *url, char *out, size_t out_
     ESP_LOGI(TAG, "Connecting to manifest server (timeout: 20000ms)...");
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to connect to manifest server: %s (0x%x)", esp_err_to_name(err), err);
+        ESP_LOGE(TAG, "❌ Failed to connect to manifest server: %s (0x%x)", esp_err_to_name(err), err);
 
-        // Print diagnostic information
+        // Print detailed diagnostic information
         if (err == ESP_ERR_INVALID_ARG) {
             ESP_LOGE(TAG, "  -> Invalid argument (bad URL or config)");
         } else if (err == ESP_ERR_NO_MEM) {
             ESP_LOGE(TAG, "  -> Out of memory");
         } else if (err == ESP_ERR_TIMEOUT) {
             ESP_LOGE(TAG, "  -> Connection timeout (check network connectivity)");
-        } else if (err == ESP_FAIL) {
-            ESP_LOGE(TAG, "  -> General failure (may be DNS/SSL issue)");
+        } else if (err == ESP_FAIL || err == 0x7002) {  // 0x7002 is ESP_ERR_HTTP_CONNECT
+            ESP_LOGE(TAG, "  -> Connection failure");
+            ESP_LOGW(TAG, "  HTTPS SSL/TLS errors often caused by:");
+            ESP_LOGW(TAG, "    1. Incorrect system time (most common!)");
+            ESP_LOGW(TAG, "       -> Check if device time is in reasonable range (after 2020)");
+            ESP_LOGW(TAG, "       -> Set time via SNTP/NTP if available");
+            ESP_LOGW(TAG, "    2. Network connectivity issues (DNS, firewall)");
+            ESP_LOGW(TAG, "    3. Certificate bundle problem");
         }
 
         esp_http_client_cleanup(client);
@@ -200,6 +239,12 @@ static void perform_check_task(void *arg)
         return;
     }
     s_check_in_progress = true;
+
+    // Log system info before attempting OTA
+    ESP_LOGI(TAG, "=== OTA System Check ===");
+    log_system_time();
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    ESP_LOGI(TAG, "Free heap memory: %d bytes", free_heap);
 
     set_status("checking manifest");
 

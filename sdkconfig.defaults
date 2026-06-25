@@ -9,6 +9,12 @@ CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
 
+# ---- OTA rollback ----
+# A freshly OTA'd image boots in PENDING_VERIFY state. ota_updater_init() arms a
+# 30s timer that calls esp_ota_mark_app_valid_cancel_rollback() once the system
+# is up; if we crash/reset before that fires the bootloader rolls back.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
 # ---- BLE (NimBLE, peripheral only) ----
 # Memory footprint is tuned down to leave DRAM for WiFi (softAP runs concurrently).
 CONFIG_BT_ENABLED=y

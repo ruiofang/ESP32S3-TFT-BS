@@ -9,6 +9,7 @@
 #include "esp_netif.h"
 #include "esp_mac.h"
 #include "Lib/cJSON/cJSON.h"
+#include "ota_updater.h"
 #include <string.h>
 
 static const char *TAG = "WEB_SERVER";
@@ -229,6 +230,17 @@ static const char* complete_html_page =
 "<button onclick='getSystemInfo()'>系统信息</button>"
 "<button onclick='saveConfig()'>保存配置</button>"
 "<button onclick='loadConfig()'>加载配置</button>"
+"</div>"
+"</div>"
+"<div class='channel-group advanced-section'>"
+"<div class='channel-title'>🚀 固件升级 OTA</div>"
+"<div class='control-row'>"
+"<div id='ota-info' style='background:#fff3cd;padding:10px;border-radius:5px;margin:10px 0;width:100%'>OTA 状态加载中...</div>"
+"</div>"
+"<div class='control-row'>"
+"<button onclick='refreshOtaStatus()'>刷新状态</button>"
+"<button onclick='toggleOtaAuto()'>切换自动更新</button>"
+"<button onclick='checkOtaNow()'>立即检查更新</button>"
 "</div>"
 "</div>"
 
@@ -604,7 +616,30 @@ static const char* complete_html_page =
 "  console.log('Page initialization complete');"
 "  console.log('Final RGB values - Broadcast: R=', document.getElementById('broadcast-r').value, "
 "              'G=', document.getElementById('broadcast-g').value, 'B=', document.getElementById('broadcast-b').value);"
+"  refreshOtaStatus();"
 "};"
+
+"function refreshOtaStatus() {"
+"  fetch('/api/ota/status').then(function(r){return r.json();}).then(function(d){"
+"    document.getElementById('ota-info').innerHTML ="
+"      '<b>版本:</b> ' + d.version + '<br>' +"
+"      '<b>自动更新:</b> ' + (d.auto_update ? '✅ 已开启' : '❌ 已关闭') + '<br>' +"
+"      '<b>最近状态:</b> ' + d.last_status;"
+"  }).catch(function(e){ document.getElementById('ota-info').innerText = 'OTA 状态查询失败: ' + e; });"
+"}"
+"function toggleOtaAuto() {"
+"  fetch('/api/ota/status').then(function(r){return r.json();}).then(function(d){"
+"    return fetch('/api/ota/enable', {method:'POST',headers:{'Content-Type':'application/json'},"
+"      body: JSON.stringify({enabled: !d.auto_update})});"
+"  }).then(function(){ refreshOtaStatus(); });"
+"}"
+"function checkOtaNow() {"
+"  fetch('/api/ota/check_now', {method:'POST'}).then(function(r){return r.json();}).then(function(d){"
+"    alert(d.message || '已请求检查 (轮询状态查看进度)');"
+"    setTimeout(refreshOtaStatus, 1500);"
+"  });"
+"}"
+
 "</script>"
 "</body>"
 "</html>";
@@ -1089,9 +1124,12 @@ static esp_err_t api_status_handler(httpd_req_t *req)
         httpd_resp_sendstr(req, "{\"status\":\"error\",\"message\":\"获取系统状态失败\"}");
         ESP_LOGE(TAG, "Failed to create system status JSON");
     }
-    
+
     return ESP_OK;
 }
+
+// OTA HTTP handlers live in ota_updater.c; registered via
+// ota_updater_register_http_handlers() in start_web_server().
 
 // 启动Web服务器
 httpd_handle_t start_webserver(void)
@@ -1102,7 +1140,7 @@ httpd_handle_t start_webserver(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 10;
+    config.max_uri_handlers = 16;
     config.max_resp_headers = 8;
     config.task_priority = 5;
     config.stack_size = 8192;
@@ -1187,7 +1225,9 @@ httpd_handle_t start_webserver(void)
         };
         httpd_register_uri_handler(server, &status_uri);
 
-        ESP_LOGI(TAG, "Web server started successfully with %d API endpoints", 8);
+        ota_updater_register_http_handlers(server);
+
+        ESP_LOGI(TAG, "Web server started successfully with %d API endpoints", 11);
         return server;
     } else {
         ESP_LOGE(TAG, "Failed to start web server");

@@ -20,6 +20,7 @@
 
 #include "claude_wifi_mode.h"
 #include "claude_ble_mode.h"
+#include "ota_updater.h"
 
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -505,13 +506,30 @@ static const char k_wifi_body[] =
     "catch(e){m.textContent='扫描失败: '+e;}}"
     "</script>";
 
-// 高级页: 清除凭据等危险动作
+// 高级页: 清除凭据等危险动作 + OTA 升级
 static const char k_tools_body[] =
     "<h1>高级</h1>"
     "<h2>WiFi 凭据</h2>"
     "<p>清除后设备会重启回到 AP 配网模式 (热点: %s).</p>"
     "<form method='POST' action='/wificlear'>"
-    "<button class='danger' type='submit'>清除已保存 WiFi 凭据</button></form>";
+    "<button class='danger' type='submit'>清除已保存 WiFi 凭据</button></form>"
+    "<h2>固件升级 OTA</h2>"
+    "<div id='ota' class='msg'>加载中...</div>"
+    "<button onclick='otaToggle()'>切换自动更新</button>"
+    "<button onclick='otaCheck()'>立即检查更新</button>"
+    "<script>"
+    "async function otaStatus(){try{var d=await(await fetch('/api/ota/status')).json();"
+    "document.getElementById('ota').innerHTML='\xe7\x89\x88\xe6\x9c\xac: '+d.version+"
+    "'<br>\xe8\x87\xaa\xe5\x8a\xa8\xe6\x9b\xb4\xe6\x96\xb0: '+(d.auto_update?'\xe2\x9c\x85 \xe5\xbc\x80':'\xe2\x9d\x8c \xe5\x85\xb3')+"
+    "'<br>\xe6\x9c\x80\xe8\xbf\x91: '+d.last_status;}"
+    "catch(e){document.getElementById('ota').textContent='\xe6\x9f\xa5\xe8\xaf\xa2\xe5\xa4\xb1\xe8\xb4\xa5';}}"
+    "async function otaToggle(){var d=await(await fetch('/api/ota/status')).json();"
+    "await fetch('/api/ota/enable',{method:'POST',headers:{'Content-Type':'application/json'},"
+    "body:JSON.stringify({enabled:!d.auto_update})});otaStatus();}"
+    "async function otaCheck(){var d=await(await fetch('/api/ota/check_now',{method:'POST'})).json();"
+    "alert(d.message||'\xe5\xb7\xb2\xe8\xaf\xb7\xe6\xb1\x82');setTimeout(otaStatus,1500);}"
+    "otaStatus();"
+    "</script>";
 
 // 分块发送页面: head + nav + body + foot. 各块都用栈上小缓冲 (<512B), 安全.
 typedef enum {
@@ -536,8 +554,8 @@ static esp_err_t send_page_chunks(httpd_req_t *req, page_id_t page, const char *
              page == PAGE_TOOLS ? "on" : "");
     if (httpd_resp_send_chunk(req, nav, HTTPD_RESP_USE_STRLEN) != ESP_OK) return ESP_FAIL;
 
-    // 正文 (按页变长, 仍放堆; 最大 ~1.5 KB)
-    enum { BODY_BUF = 1600 };
+    // 正文 (按页变长, 仍放堆; tools 页加 OTA 后增至 ~1.2 KB)
+    enum { BODY_BUF = 2200 };
     char *body = malloc(BODY_BUF);
     if (!body) {
         httpd_resp_send_chunk(req, NULL, 0);
@@ -749,7 +767,7 @@ static esp_err_t start_http(void)
     if (s_httpd) return ESP_OK;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 10;
+    cfg.max_uri_handlers = 12;  // 7 builtin + 3 OTA endpoints; bumped for headroom.
     cfg.stack_size = 6144;  // 默认 4 KB, snprintf 路径 + chunk send 时容易溢出, 抬到 6 KB
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {
@@ -784,6 +802,7 @@ static esp_err_t start_http(void)
     httpd_register_uri_handler(s_httpd, &u_post);
     httpd_register_uri_handler(s_httpd, &u_clear);
     httpd_register_uri_handler(s_httpd, &u_scan);
+    ota_updater_register_http_handlers(s_httpd);
     ESP_LOGI(TAG, "HTTP provisioning server up");
     return ESP_OK;
 }

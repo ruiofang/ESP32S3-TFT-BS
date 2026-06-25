@@ -25,6 +25,7 @@
 #include "battery_control.h"
 #include "claude_ble_mode.h"
 #include "claude_wifi_mode.h"
+#include "ota_updater.h"
 
 #define TAG "BATTERY_MONITOR"
 
@@ -2539,6 +2540,8 @@ void app_main(void)
     if (claude_wifi_mode_init() != ESP_OK) {
         ESP_LOGW(TAG, "claude_wifi_mode_init failed; CLAUDE_WIFI mode unavailable");
     }
+    // OTA: 注册 STA-got-IP 监听; 实际拉 manifest/下载在拿到 IP 之后 + 自动更新开关打开时
+    ota_updater_init();
     // 如果上次模式是 CLAUDE / CLAUDE_WIFI, 让 LVGL 任务在自己的上下文里完成进入
     if (g_battery_read_mode == BATT_READ_MODE_CLAUDE_BLE) {
         g_claude_mode_request = 1;

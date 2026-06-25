@@ -46,6 +46,15 @@ static volatile bool s_check_in_progress  = false;
 static volatile bool s_did_initial_check  = false;
 static char          s_last_status[128]   = "idle";
 
+// OTA更新发现的新版本信息
+typedef struct {
+    char version[32];
+    char url[256];
+    bool update_available;
+    bool user_confirmed;
+} ota_pending_update_t;
+static ota_pending_update_t s_pending_update = {0};
+
 static void set_status(const char *fmt, ...)
 {
     va_list ap;
@@ -151,38 +160,31 @@ static void perform_check_task(void *arg)
     const esp_app_desc_t *cur = esp_app_get_description();
     const char *cur_ver       = cur ? cur->version : "0.0.0";
     const char *latest_ver    = jver->valuestring;
+    const char *download_url  = jurl->valuestring;
+
+    ESP_LOGI(TAG, "=== OTA Manifest Check ===");
+    ESP_LOGI(TAG, "Current version: %s", cur_ver);
+    ESP_LOGI(TAG, "Latest version:  %s", latest_ver);
+    ESP_LOGI(TAG, "Download URL: %s", download_url);
 
     if (version_cmp(latest_ver, cur_ver) <= 0) {
+        ESP_LOGI(TAG, "Device is up to date");
         set_status("up to date (%s)", cur_ver);
         cJSON_Delete(root);
         goto done;
     }
 
-    set_status("downloading %s", latest_ver);
+    ESP_LOGI(TAG, "New version available! Waiting for user confirmation...");
+    set_status("new version %s available", latest_ver);
 
-    // Copy URL because the cJSON tree gets freed before esp_https_ota runs.
-    char url_buf[256];
-    strncpy(url_buf, jurl->valuestring, sizeof(url_buf) - 1);
-    url_buf[sizeof(url_buf) - 1] = '\0';
+    // Save pending update info
+    strncpy(s_pending_update.version, latest_ver, sizeof(s_pending_update.version) - 1);
+    strncpy(s_pending_update.url, download_url, sizeof(s_pending_update.url) - 1);
+    s_pending_update.update_available = true;
+    s_pending_update.user_confirmed = false;
+
     cJSON_Delete(root);
-
-    esp_http_client_config_t ota_http = {
-        .url = url_buf,
-        .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 20000,
-        .keep_alive_enable = true,
-    };
-    esp_https_ota_config_t ota_cfg = {
-        .http_config = &ota_http,
-    };
-    esp_err_t err = esp_https_ota(&ota_cfg);
-    if (err == ESP_OK) {
-        set_status("OTA ok, restarting");
-        vTaskDelay(pdMS_TO_TICKS(500));
-        esp_restart();
-    } else {
-        set_status("OTA failed: %s", esp_err_to_name(err));
-    }
+    ESP_LOGI(TAG, "Waiting for user confirmation to proceed with download...");
 
 done:
     s_check_in_progress = false;
@@ -201,6 +203,47 @@ static void got_ip_event_handler(void *arg, esp_event_base_t base,
         ESP_LOGE(TAG, "failed to spawn ota_check task (heap exhausted)");
         s_did_initial_check = false;
     }
+}
+
+// Perform the actual OTA download and update
+static void perform_ota_download_task(void *arg)
+{
+    (void)arg;
+
+    if (!s_pending_update.update_available || !s_pending_update.user_confirmed) {
+        ESP_LOGW(TAG, "OTA download task called but no confirmed update pending");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    set_status("downloading %s", s_pending_update.version);
+    ESP_LOGI(TAG, "Starting OTA download from: %s", s_pending_update.url);
+
+    esp_http_client_config_t ota_http = {
+        .url = s_pending_update.url,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .timeout_ms = 20000,
+        .keep_alive_enable = true,
+    };
+    esp_https_ota_config_t ota_cfg = {
+        .http_config = &ota_http,
+    };
+
+    ESP_LOGI(TAG, "=== Starting OTA Update ===");
+    esp_err_t err = esp_https_ota(&ota_cfg);
+    if (err == ESP_OK) {
+        set_status("OTA ok, restarting");
+        ESP_LOGI(TAG, "OTA update successful! Restarting in 500ms...");
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+    } else {
+        set_status("OTA failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "OTA update failed: %s", esp_err_to_name(err));
+        s_pending_update.update_available = false;
+        s_pending_update.user_confirmed = false;
+    }
+
+    vTaskDelete(NULL);
 }
 
 bool ota_updater_get_auto_enabled(void)
@@ -235,6 +278,36 @@ esp_err_t ota_updater_trigger_now(void)
 const char *ota_updater_last_status(void)
 {
     return s_last_status;
+}
+
+esp_err_t ota_updater_confirm_and_start(void)
+{
+    if (!s_pending_update.update_available) {
+        ESP_LOGW(TAG, "No pending update available");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    ESP_LOGI(TAG, "User confirmed update to version %s", s_pending_update.version);
+    s_pending_update.user_confirmed = true;
+
+    BaseType_t ok = xTaskCreatePinnedToCore(
+        perform_ota_download_task, "ota_download", 6144, NULL, 5, NULL, tskNO_AFFINITY);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OTA download task");
+        s_pending_update.user_confirmed = false;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+bool ota_updater_has_pending_update(void)
+{
+    return s_pending_update.update_available && !s_pending_update.user_confirmed;
+}
+
+const char *ota_updater_pending_version(void)
+{
+    return s_pending_update.version;
 }
 
 const char *ota_updater_current_version(void)
@@ -306,6 +379,15 @@ static esp_err_t ota_http_status_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "last_status", ota_updater_last_status());
     cJSON_AddBoolToObject(root, "check_in_progress", s_check_in_progress);
 
+    // Add pending update info if available
+    if (ota_updater_has_pending_update()) {
+        cJSON *pending = cJSON_CreateObject();
+        cJSON_AddStringToObject(pending, "version", ota_updater_pending_version());
+        cJSON_AddStringToObject(pending, "url", s_pending_update.url);
+        cJSON_AddBoolToObject(pending, "waiting_confirmation", true);
+        cJSON_AddItemToObject(root, "pending_update", pending);
+    }
+
     size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
     cJSON_AddNumberToObject(root, "free_heap_bytes", free_heap);
 
@@ -366,6 +448,31 @@ static esp_err_t ota_http_check_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t ota_http_confirm_handler(httpd_req_t *req)
+{
+    if (!ota_updater_has_pending_update()) {
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_sendstr(req, "{\"ok\":false,\"message\":\"no pending update\"}");
+        return ESP_OK;
+    }
+
+    esp_err_t err = ota_updater_confirm_and_start();
+    httpd_resp_set_type(req, "application/json");
+    if (err == ESP_OK) {
+        cJSON *resp = cJSON_CreateObject();
+        cJSON_AddBoolToObject(resp, "ok", true);
+        cJSON_AddStringToObject(resp, "message", "Update started");
+        cJSON_AddStringToObject(resp, "version", ota_updater_pending_version());
+        char *out = cJSON_PrintUnformatted(resp);
+        cJSON_Delete(resp);
+        httpd_resp_sendstr(req, out ? out : "{}");
+        if (out) free(out);
+    } else {
+        httpd_resp_sendstr(req, "{\"ok\":false,\"message\":\"failed to start download\"}");
+    }
+    return ESP_OK;
+}
+
 esp_err_t ota_updater_register_http_handlers(httpd_handle_t server)
 {
     if (!server) return ESP_ERR_INVALID_ARG;
@@ -381,11 +488,16 @@ esp_err_t ota_updater_register_http_handlers(httpd_handle_t server)
         .uri = "/api/ota/check_now", .method = HTTP_POST,
         .handler = ota_http_check_handler,
     };
+    static const httpd_uri_t u_confirm = {
+        .uri = "/api/ota/confirm", .method = HTTP_POST,
+        .handler = ota_http_confirm_handler,
+    };
     esp_err_t e1 = httpd_register_uri_handler(server, &u_status);
     esp_err_t e2 = httpd_register_uri_handler(server, &u_enable);
     esp_err_t e3 = httpd_register_uri_handler(server, &u_check);
-    if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK) {
-        ESP_LOGW(TAG, "register http: status=%d enable=%d check=%d", e1, e2, e3);
+    esp_err_t e4 = httpd_register_uri_handler(server, &u_confirm);
+    if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK || e4 != ESP_OK) {
+        ESP_LOGW(TAG, "register http: status=%d enable=%d check=%d confirm=%d", e1, e2, e3, e4);
         return ESP_FAIL;
     }
     return ESP_OK;

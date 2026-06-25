@@ -23,6 +23,7 @@
 #include "esp_netif.h"
 #include "esp_ota_ops.h"
 #include "esp_timer.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "nvs.h"
@@ -195,9 +196,9 @@ static void got_ip_event_handler(void *arg, esp_event_base_t base,
     if (!s_auto_enabled || s_did_initial_check) return;
     s_did_initial_check = true;
     BaseType_t ok = xTaskCreatePinnedToCore(
-        perform_check_task, "ota_check", 8192, NULL, 5, NULL, tskNO_AFFINITY);
+        perform_check_task, "ota_check", 4096, NULL, 5, NULL, tskNO_AFFINITY);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "failed to spawn ota_check task");
+        ESP_LOGE(TAG, "failed to spawn ota_check task (heap exhausted)");
         s_did_initial_check = false;
     }
 }
@@ -223,8 +224,12 @@ esp_err_t ota_updater_trigger_now(void)
 {
     if (s_check_in_progress) return ESP_ERR_INVALID_STATE;
     BaseType_t ok = xTaskCreatePinnedToCore(
-        perform_check_task, "ota_check_now", 8192, NULL, 5, NULL, tskNO_AFFINITY);
-    return (ok == pdPASS) ? ESP_OK : ESP_FAIL;
+        perform_check_task, "ota_check_now", 4096, NULL, 5, NULL, tskNO_AFFINITY);
+    if (ok != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create OTA check task (heap may be exhausted)");
+        return ESP_FAIL;
+    }
+    return ESP_OK;
 }
 
 const char *ota_updater_last_status(void)
@@ -299,6 +304,11 @@ static esp_err_t ota_http_status_handler(httpd_req_t *req)
     cJSON_AddStringToObject(root, "version", ota_updater_current_version());
     cJSON_AddBoolToObject(root, "auto_update", ota_updater_get_auto_enabled());
     cJSON_AddStringToObject(root, "last_status", ota_updater_last_status());
+    cJSON_AddBoolToObject(root, "check_in_progress", s_check_in_progress);
+
+    size_t free_heap = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    cJSON_AddNumberToObject(root, "free_heap_bytes", free_heap);
+
     char *out = cJSON_PrintUnformatted(root);
     cJSON_Delete(root);
     httpd_resp_set_type(req, "application/json");

@@ -77,29 +77,57 @@ static int version_cmp(const char *a, const char *b)
 // Fetch the manifest JSON into a caller-provided buffer.
 static esp_err_t fetch_manifest(char *out, size_t out_size)
 {
+    ESP_LOGI(TAG, "Fetching manifest from: %s", OTA_MANIFEST_URL);
+
     esp_http_client_config_t cfg = {
         .url = OTA_MANIFEST_URL,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 10000,
+        .timeout_ms = 20000,  // Increased timeout from 10s to 20s
         .keep_alive_enable = true,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
-    if (!client) return ESP_ERR_NO_MEM;
+    if (!client) {
+        ESP_LOGE(TAG, "Failed to create HTTP client (out of memory)");
+        return ESP_ERR_NO_MEM;
+    }
 
+    ESP_LOGI(TAG, "Connecting to manifest server (timeout: 20000ms)...");
     esp_err_t err = esp_http_client_open(client, 0);
     if (err != ESP_OK) {
-        ESP_LOGW(TAG, "manifest open failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "Failed to connect to manifest server: %s (0x%x)", esp_err_to_name(err), err);
+
+        // Print diagnostic information
+        if (err == ESP_ERR_INVALID_ARG) {
+            ESP_LOGE(TAG, "  -> Invalid argument (bad URL or config)");
+        } else if (err == ESP_ERR_NO_MEM) {
+            ESP_LOGE(TAG, "  -> Out of memory");
+        } else if (err == ESP_ERR_TIMEOUT) {
+            ESP_LOGE(TAG, "  -> Connection timeout (check network connectivity)");
+        } else if (err == ESP_FAIL) {
+            ESP_LOGE(TAG, "  -> General failure (may be DNS/SSL issue)");
+        }
+
         esp_http_client_cleanup(client);
         return err;
     }
+
+    ESP_LOGI(TAG, "Connected! Fetching headers...");
     esp_http_client_fetch_headers(client);
     int status = esp_http_client_get_status_code(client);
+
+    ESP_LOGI(TAG, "HTTP Response Status: %d", status);
+
     if (status / 100 != 2) {
-        ESP_LOGW(TAG, "manifest http status=%d", status);
+        ESP_LOGE(TAG, "Manifest fetch failed with HTTP %d (expected 2xx)", status);
         esp_http_client_close(client);
         esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
+
+    int content_length = esp_http_client_get_content_length(client);
+    ESP_LOGI(TAG, "Content-Length: %d bytes", content_length);
+
+    ESP_LOGI(TAG, "Reading manifest data...");
     size_t total = 0;
     while (total + 1 < out_size) {
         int n = esp_http_client_read(client, out + total, out_size - 1 - total);
@@ -107,9 +135,19 @@ static esp_err_t fetch_manifest(char *out, size_t out_size)
         total += (size_t)n;
     }
     out[total] = '\0';
+
+    ESP_LOGI(TAG, "Successfully read %d bytes of manifest", total);
+
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
-    return (total > 0) ? ESP_OK : ESP_FAIL;
+
+    if (total > 0) {
+        ESP_LOGI(TAG, "Manifest content (first 200 chars): %.200s", out);
+        return ESP_OK;
+    } else {
+        ESP_LOGE(TAG, "No data received from manifest URL");
+        return ESP_FAIL;
+    }
 }
 
 static void perform_check_task(void *arg)
@@ -124,21 +162,35 @@ static void perform_check_task(void *arg)
     s_check_in_progress = true;
 
     set_status("checking manifest");
+    ESP_LOGI(TAG, "=== OTA Manifest Check ===");
+    ESP_LOGI(TAG, "Manifest URL: %s", OTA_MANIFEST_URL);
 
     char manifest[MANIFEST_MAX_LEN];
     memset(manifest, 0, sizeof(manifest));
     esp_err_t fetch_err = ESP_FAIL;
+
     for (int attempt = 0; attempt < MANIFEST_FETCH_RETRIES; ++attempt) {
+        ESP_LOGI(TAG, "Manifest fetch attempt %d/%d", attempt + 1, MANIFEST_FETCH_RETRIES);
         fetch_err = fetch_manifest(manifest, sizeof(manifest));
-        if (fetch_err == ESP_OK) break;
+        if (fetch_err == ESP_OK) {
+            ESP_LOGI(TAG, "Manifest fetch successful!");
+            break;
+        }
         if (attempt + 1 < MANIFEST_FETCH_RETRIES) {
             int backoff = MANIFEST_BACKOFF_MS << attempt;
-            ESP_LOGW(TAG, "manifest fetch attempt %d failed (%s), retrying in %dms",
-                     attempt + 1, esp_err_to_name(fetch_err), backoff);
+            ESP_LOGW(TAG, "Manifest fetch failed (%s), retrying in %dms...",
+                     esp_err_to_name(fetch_err), backoff);
             vTaskDelay(pdMS_TO_TICKS(backoff));
         }
     }
+
     if (fetch_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to fetch manifest after %d attempts", MANIFEST_FETCH_RETRIES);
+        ESP_LOGE(TAG, "Please check:");
+        ESP_LOGE(TAG, "  1. WiFi network connectivity");
+        ESP_LOGE(TAG, "  2. DNS resolution (can device reach 8.8.8.8?)");
+        ESP_LOGE(TAG, "  3. GitHub is accessible from your network");
+        ESP_LOGE(TAG, "  4. Device time is set correctly (for SSL verification)");
         set_status("manifest fetch failed");
         goto done;
     }

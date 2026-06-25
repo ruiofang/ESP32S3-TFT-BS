@@ -9,5 +9,5 @@ add_definitions(-DLV_LVGL_H_INCLUDE_SIMPLE)
 add_definitions(-DLV_COLOR_16_SWAP=1)
 include($ENV{IDF_PATH}/tools/cmake/project.cmake)
 # Bumped each release so OTA can compare against latest.json's version.
-set(PROJECT_VER "1.0.1")
+set(PROJECT_VER "1.0.0")
 project(panda)

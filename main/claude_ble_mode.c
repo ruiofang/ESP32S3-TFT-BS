@@ -122,7 +122,7 @@ static lv_obj_t *s_model_label = NULL;     // 模型 + token
 static lv_obj_t *s_msg_label = NULL;       // 消息
 static lv_obj_t *s_link_label = NULL;      // BLE 连接状态
 
-LV_FONT_DECLARE(claude_status_font_14);
+LV_FONT_DECLARE(font_puhui_14_1);
 
 // -----------------------------------------------------------------------------
 // 状态 -> 字符串 / 解析
@@ -281,7 +281,7 @@ static void ui_build(lv_obj_t *parent)
     lv_obj_set_width(s_msg_label, 408);
     lv_label_set_text(s_msg_label, "Waiting for BLE host...");
     lv_obj_set_style_text_color(s_msg_label, lv_color_hex(0xAAAAAA), 0);
-    lv_obj_set_style_text_font(s_msg_label, &claude_status_font_14, 0);
+    lv_obj_set_style_text_font(s_msg_label, &font_puhui_14_1, 0);
     lv_obj_align(s_msg_label, LV_ALIGN_BOTTOM_LEFT, 4, -4);
 
     // BLE 连接状态 (面板右下角)

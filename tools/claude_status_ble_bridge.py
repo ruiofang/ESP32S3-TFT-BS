@@ -55,6 +55,8 @@ NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"  # PC -> ESP32 (write)
 NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"  # ESP32 -> PC (notify)
 BLE_WRITE_CHUNK = 96
 MSG_BYTE_LIMIT = 24
+EXIT_RESEND_COUNT = 3
+EXIT_RESEND_INTERVAL = 0.4
 
 log = logging.getLogger("claude-ble-bridge")
 
@@ -357,6 +359,16 @@ async def run_tcp_server(host: str, port: int, link: EspBleLink, agg: StatusAggr
                     await link.send_json(full)
                 except Exception as exc:  # noqa: BLE001
                     log.error("BLE forward failed: %s", exc)
+                if full.get("state", "").lower() == "exited":
+                    # Re-emit the exit notice — BLE writes can be dropped and
+                    # there won't be another event after Claude has exited.
+                    for _ in range(EXIT_RESEND_COUNT):
+                        await asyncio.sleep(EXIT_RESEND_INTERVAL)
+                        try:
+                            await link.send_json(full)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("exit resend failed: %s", exc)
+                    log.info("Claude exited notice delivered: %s", full.get("msg", ""))
             writer.write(b"OK\n")
             await writer.drain()
         except asyncio.TimeoutError:

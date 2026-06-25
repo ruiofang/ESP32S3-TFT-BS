@@ -19,11 +19,13 @@ from pathlib import Path
 from typing import Any
 
 HOOK_EVENTS = {
+    "SessionStart": "session_start",
     "UserPromptSubmit": "user_prompt",
     "PreToolUse": "pre_tool",
     "PostToolUse": "post_tool",
     "Notification": "notification",
     "Stop": "stop",
+    "SessionEnd": "session_end",
 }
 
 

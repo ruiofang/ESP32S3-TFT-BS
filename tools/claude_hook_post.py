@@ -124,6 +124,16 @@ def main() -> int:
         patch["tool"] = ""
         patch["msg"] = "Claude finished turn"
 
+    elif event in ("session_start", "sessionstart"):
+        patch["state"] = "idle"
+        patch["tool"] = ""
+        patch["msg"] = "Claude 已启动"
+
+    elif event in ("session_end", "sessionend"):
+        patch["state"] = "exited"
+        patch["tool"] = ""
+        patch["msg"] = "Claude 已停止"
+
     elif event == "notification":
         msg = hook.get("message") or hook.get("notification") or ""
         patch["state"] = classify_message_state(msg, "waiting")

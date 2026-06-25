@@ -44,6 +44,8 @@ CONNECT_TIMEOUT = 3.0
 HEARTBEAT_INTERVAL = 4.0
 IDLE_FALLBACK_CHECK_INTERVAL = 1.0
 MSG_BYTE_LIMIT = 24
+EXIT_RESEND_COUNT = 3
+EXIT_RESEND_INTERVAL = 0.4
 
 log = logging.getLogger("claude-wifi-bridge")
 
@@ -415,12 +417,18 @@ class StatusAggregator:
         self.msg: str = ""
         self._last_event_monotonic: float = time.monotonic()
         self._idle_fallback_sent: bool = False
+        self.exited: bool = False
 
     def update(self, patch: dict) -> dict:
         self._last_event_monotonic = time.monotonic()
         self._idle_fallback_sent = False
+        incoming_state = clip_utf8(patch["state"], 24) if "state" in patch else None
+        # Latch the exit flag so idle fallback won't overwrite the exit notice.
+        # Any non-"exited" state arriving later (e.g. a new session) clears it.
+        if incoming_state is not None:
+            self.exited = incoming_state.lower() == "exited"
         if "state" in patch:
-            self.state = clip_utf8(patch["state"], 24)
+            self.state = incoming_state or self.state
         if "tool" in patch:
             self.tool = clip_utf8(patch["tool"], 23)
         if "model" in patch:
@@ -451,6 +459,9 @@ class StatusAggregator:
         if idle_timeout_sec <= 0:
             return None
         if self._idle_fallback_sent:
+            return None
+        if self.exited:
+            # Don't erase the "Claude exited" notice with an idle fallback.
             return None
         if (time.monotonic() - self._last_event_monotonic) < idle_timeout_sec:
             return None
@@ -501,6 +512,17 @@ async def run_tcp_server(host: str, port: int, link: EspTargetFanout, agg: Statu
                     await link.send_json(full)
                 except Exception as exc:  # noqa: BLE001
                     log.error("ESP forward failed: %s", exc)
+                if full.get("state", "").lower() == "exited":
+                    # Re-emit the exit notice a few times — a single TCP packet
+                    # can be dropped on a flaky link and we won't get another
+                    # event after Claude has actually exited.
+                    for _ in range(EXIT_RESEND_COUNT):
+                        await asyncio.sleep(EXIT_RESEND_INTERVAL)
+                        try:
+                            await link.send_json(full)
+                        except Exception as exc:  # noqa: BLE001
+                            log.debug("exit resend failed: %s", exc)
+                    log.info("Claude exited notice delivered: %s", full.get("msg", ""))
             writer.write(b"OK\n")
             await writer.drain()
         except asyncio.TimeoutError:

@@ -7,7 +7,7 @@ idf_component_register(
         "claude_ble_mode.c"
         "claude_wifi_mode.c"
         "APP/lvgl_demo.c"
-        "APP/claude_status_font_14.c"
+        "APP/font_puhui_14_1.c"
         "Lib/cJSON/cJSON.c"
     INCLUDE_DIRS
         "."

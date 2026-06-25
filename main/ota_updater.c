@@ -36,11 +36,16 @@
 #define OTA_NVS_KEY_ENABLED "auto"
 
 // Manifest URL configuration
-// For debugging/testing with local server, change to: "http://192.168.x.x:8000/latest.json"
-// For GitHub releases (default), use HTTPS for security
+// Primary URL (GitHub) and backup URL (Gitee) for OTA manifest
+// For debugging/testing with local server, change OTA_MANIFEST_URL to: "http://192.168.x.x:8000/latest.json"
 #ifndef OTA_MANIFEST_URL
 #define OTA_MANIFEST_URL \
     "https://github.com/ruiofang/ESP32S3-TFT-BS/releases/latest/download/latest.json"
+#endif
+
+#ifndef OTA_MANIFEST_URL_BACKUP
+#define OTA_MANIFEST_URL_BACKUP \
+    "https://gitee.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json"
 #endif
 #define MANIFEST_MAX_LEN       1024
 #define MANIFEST_FETCH_RETRIES 3
@@ -80,13 +85,13 @@ static int version_cmp(const char *a, const char *b)
     return a3 - b3;
 }
 
-// Fetch the manifest JSON into a caller-provided buffer.
-static esp_err_t fetch_manifest(char *out, size_t out_size)
+// Fetch the manifest JSON from a specific URL
+static esp_err_t fetch_manifest_from_url(const char *url, char *out, size_t out_size)
 {
-    ESP_LOGI(TAG, "Fetching manifest from: %s", OTA_MANIFEST_URL);
+    ESP_LOGI(TAG, "Fetching manifest from: %s", url);
 
     esp_http_client_config_t cfg = {
-        .url = OTA_MANIFEST_URL,
+        .url = url,
         .crt_bundle_attach = esp_crt_bundle_attach,
         .timeout_ms = 20000,  // Increased timeout from 10s to 20s
         .keep_alive_enable = true,
@@ -156,6 +161,35 @@ static esp_err_t fetch_manifest(char *out, size_t out_size)
     }
 }
 
+// Fetch manifest with fallback to backup URL
+static esp_err_t fetch_manifest(char *out, size_t out_size)
+{
+    esp_err_t err;
+
+    // Try primary URL
+    ESP_LOGI(TAG, "=== OTA Manifest Fetch ===");
+    ESP_LOGI(TAG, "Primary URL:  %s", OTA_MANIFEST_URL);
+    ESP_LOGI(TAG, "Backup URL:   %s", OTA_MANIFEST_URL_BACKUP);
+
+    err = fetch_manifest_from_url(OTA_MANIFEST_URL, out, out_size);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "✓ Primary URL successful");
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "Primary URL failed, trying backup...");
+
+    // Try backup URL
+    err = fetch_manifest_from_url(OTA_MANIFEST_URL_BACKUP, out, out_size);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "✓ Backup URL successful (Gitee)");
+        return ESP_OK;
+    }
+
+    ESP_LOGE(TAG, "Both primary and backup URLs failed");
+    return ESP_FAIL;
+}
+
 static void perform_check_task(void *arg)
 {
     (void)arg;
@@ -168,15 +202,13 @@ static void perform_check_task(void *arg)
     s_check_in_progress = true;
 
     set_status("checking manifest");
-    ESP_LOGI(TAG, "=== OTA Manifest Check ===");
-    ESP_LOGI(TAG, "Manifest URL: %s", OTA_MANIFEST_URL);
 
     char manifest[MANIFEST_MAX_LEN];
     memset(manifest, 0, sizeof(manifest));
     esp_err_t fetch_err = ESP_FAIL;
 
     for (int attempt = 0; attempt < MANIFEST_FETCH_RETRIES; ++attempt) {
-        ESP_LOGI(TAG, "Manifest fetch attempt %d/%d", attempt + 1, MANIFEST_FETCH_RETRIES);
+        ESP_LOGI(TAG, "--- Manifest fetch attempt %d/%d ---", attempt + 1, MANIFEST_FETCH_RETRIES);
         fetch_err = fetch_manifest(manifest, sizeof(manifest));
         if (fetch_err == ESP_OK) {
             ESP_LOGI(TAG, "Manifest fetch successful!");
@@ -184,18 +216,20 @@ static void perform_check_task(void *arg)
         }
         if (attempt + 1 < MANIFEST_FETCH_RETRIES) {
             int backoff = MANIFEST_BACKOFF_MS << attempt;
-            ESP_LOGW(TAG, "Manifest fetch failed (%s), retrying in %dms...",
-                     esp_err_to_name(fetch_err), backoff);
+            ESP_LOGW(TAG, "Manifest fetch failed, retrying in %dms...", backoff);
             vTaskDelay(pdMS_TO_TICKS(backoff));
         }
     }
 
     if (fetch_err != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to fetch manifest after %d attempts", MANIFEST_FETCH_RETRIES);
+        ESP_LOGE(TAG, "❌ Failed to fetch manifest after %d attempts", MANIFEST_FETCH_RETRIES);
+        ESP_LOGE(TAG, "Tried both URLs:");
+        ESP_LOGE(TAG, "  • Primary (GitHub): %s", OTA_MANIFEST_URL);
+        ESP_LOGE(TAG, "  • Backup (Gitee):   %s", OTA_MANIFEST_URL_BACKUP);
         ESP_LOGE(TAG, "Please check:");
         ESP_LOGE(TAG, "  1. WiFi network connectivity");
         ESP_LOGE(TAG, "  2. DNS resolution (can device reach 8.8.8.8?)");
-        ESP_LOGE(TAG, "  3. GitHub is accessible from your network");
+        ESP_LOGE(TAG, "  3. GitHub and/or Gitee are accessible from your network");
         ESP_LOGE(TAG, "  4. Device time is set correctly (for SSL verification)");
         set_status("manifest fetch failed");
         goto done;

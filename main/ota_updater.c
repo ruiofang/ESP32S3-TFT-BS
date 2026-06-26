@@ -66,12 +66,12 @@ typedef enum {
 
 #ifndef OTA_MANIFEST_URL
 #define OTA_MANIFEST_URL \
-    "https://github.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json"
+    "http://120.27.145.121:8090/releases/latest.json"
 #endif
 
 #ifndef OTA_MANIFEST_URL_BACKUP
 #define OTA_MANIFEST_URL_BACKUP \
-    "https://gitee.com/ruiofang/ESP32S3-TFT-BS/raw/cluade_tool/firmware/latest.json"
+    "https://github.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json"
 #endif
 
 #define MANIFEST_MAX_LEN       1024

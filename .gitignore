@@ -5,3 +5,4 @@ node_modules
 .vscode
 *.log
 .claude/settings.local.json
+doc/ruio-xiaozhi-esp32-2.0.5

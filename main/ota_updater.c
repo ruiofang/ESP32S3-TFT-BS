@@ -41,6 +41,9 @@
 #define OTA_NVS_KEY_URL      "url"
 #define OTA_NVS_KEY_VERSION  "version"
 #define OTA_NVS_KEY_SERIAL   "serial"
+#define OTA_NVS_KEY_MFST_PRI "mfst_pri"   // user-override primary manifest URL
+#define OTA_NVS_KEY_MFST_BAK "mfst_bak"   // user-override backup manifest URL
+#define OTA_MANIFEST_URL_MAX 256
 
 // 安全校验配置
 #define OTA_SIGNATURE_HEADER "X-Firmware-Signature"
@@ -63,7 +66,7 @@ typedef enum {
 
 #ifndef OTA_MANIFEST_URL
 #define OTA_MANIFEST_URL \
-    "https://raw.githubusercontent.com/ruiofang/ESP32S3-TFT-BS/refs/heads/cluade_tool/firmware/latest.json"
+    "https://github.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json"
 #endif
 
 #ifndef OTA_MANIFEST_URL_BACKUP
@@ -98,6 +101,12 @@ static bool          s_sntp_started       = false;
 static TaskHandle_t  s_ota_worker         = NULL;
 #define OTA_NOTIFY_CHECK    (1U << 0)
 #define OTA_NOTIFY_DOWNLOAD (1U << 1)
+
+// Runtime-overridable manifest URLs. Loaded from NVS at init; fall back to
+// the compile-time OTA_MANIFEST_URL{,_BACKUP} macros (which double as the
+// "restore defaults" source of truth).
+static char s_manifest_url[OTA_MANIFEST_URL_MAX]     = {0};
+static char s_manifest_url_bak[OTA_MANIFEST_URL_MAX] = {0};
 
 // OTA更新发现的新版本信息
 typedef struct {
@@ -476,6 +485,89 @@ static bool is_valid_version_format(const char *version)
     return false;
 }
 
+static bool url_is_http_or_https(const char *u)
+{
+    return u && (strncmp(u, "http://", 7) == 0 || strncmp(u, "https://", 8) == 0);
+}
+
+// Populate s_manifest_url{,_bak} from NVS, else from compile-time defaults.
+// Safe to call multiple times.
+static void load_manifest_urls(void)
+{
+    s_manifest_url[0] = 0;
+    s_manifest_url_bak[0] = 0;
+    nvs_handle_t nvs;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READONLY, &nvs) == ESP_OK) {
+        size_t len = sizeof(s_manifest_url);
+        if (nvs_get_str(nvs, OTA_NVS_KEY_MFST_PRI, s_manifest_url, &len) != ESP_OK) {
+            s_manifest_url[0] = 0;
+        }
+        len = sizeof(s_manifest_url_bak);
+        if (nvs_get_str(nvs, OTA_NVS_KEY_MFST_BAK, s_manifest_url_bak, &len) != ESP_OK) {
+            s_manifest_url_bak[0] = 0;
+        }
+        nvs_close(nvs);
+    }
+    if (!url_is_http_or_https(s_manifest_url)) {
+        snprintf(s_manifest_url, sizeof(s_manifest_url), "%s", OTA_MANIFEST_URL);
+    }
+    if (!url_is_http_or_https(s_manifest_url_bak)) {
+        snprintf(s_manifest_url_bak, sizeof(s_manifest_url_bak), "%s", OTA_MANIFEST_URL_BACKUP);
+    }
+}
+
+void ota_updater_get_manifest_urls(char *primary, size_t pn, char *backup, size_t bn)
+{
+    if (primary && pn > 0) snprintf(primary, pn, "%s", s_manifest_url);
+    if (backup  && bn > 0) snprintf(backup,  bn, "%s", s_manifest_url_bak);
+}
+
+void ota_updater_get_default_manifest_urls(const char **primary, const char **backup)
+{
+    if (primary) *primary = OTA_MANIFEST_URL;
+    if (backup)  *backup  = OTA_MANIFEST_URL_BACKUP;
+}
+
+esp_err_t ota_updater_set_manifest_urls(const char *primary, const char *backup)
+{
+    if (!url_is_http_or_https(primary) || !url_is_http_or_https(backup)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (strlen(primary) >= OTA_MANIFEST_URL_MAX ||
+        strlen(backup)  >= OTA_MANIFEST_URL_MAX) {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t nvs;
+    esp_err_t err = nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(nvs, OTA_NVS_KEY_MFST_PRI, primary);
+    if (err == ESP_OK) err = nvs_set_str(nvs, OTA_NVS_KEY_MFST_BAK, backup);
+    if (err == ESP_OK) err = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (err == ESP_OK) {
+        snprintf(s_manifest_url,     sizeof(s_manifest_url),     "%s", primary);
+        snprintf(s_manifest_url_bak, sizeof(s_manifest_url_bak), "%s", backup);
+        ESP_LOGI(TAG, "Manifest URLs updated: primary=%s backup=%s", s_manifest_url, s_manifest_url_bak);
+    }
+    return err;
+}
+
+esp_err_t ota_updater_reset_manifest_urls(void)
+{
+    nvs_handle_t nvs;
+    if (nvs_open(OTA_NVS_NAMESPACE, NVS_READWRITE, &nvs) == ESP_OK) {
+        // Best-effort erase: ignore "key not found" so reset is idempotent.
+        nvs_erase_key(nvs, OTA_NVS_KEY_MFST_PRI);
+        nvs_erase_key(nvs, OTA_NVS_KEY_MFST_BAK);
+        nvs_commit(nvs);
+        nvs_close(nvs);
+    }
+    snprintf(s_manifest_url,     sizeof(s_manifest_url),     "%s", OTA_MANIFEST_URL);
+    snprintf(s_manifest_url_bak, sizeof(s_manifest_url_bak), "%s", OTA_MANIFEST_URL_BACKUP);
+    ESP_LOGI(TAG, "Manifest URLs reset to defaults");
+    return ESP_OK;
+}
+
 // Fetch the manifest JSON from a specific URL
 static esp_err_t fetch_manifest_from_url(const char *url, char *out, size_t out_size)
 {
@@ -584,12 +676,12 @@ static esp_err_t fetch_manifest(char *out, size_t out_size)
 {
     esp_err_t err;
 
-    // Try primary URL
+    // Try primary URL (runtime-overridable; defaults to OTA_MANIFEST_URL macro)
     ESP_LOGI(TAG, "=== OTA Manifest Fetch ===");
-    ESP_LOGI(TAG, "Primary URL:  %s", OTA_MANIFEST_URL);
-    ESP_LOGI(TAG, "Backup URL:   %s", OTA_MANIFEST_URL_BACKUP);
+    ESP_LOGI(TAG, "Primary URL:  %s", s_manifest_url);
+    ESP_LOGI(TAG, "Backup URL:   %s", s_manifest_url_bak);
 
-    err = fetch_manifest_from_url(OTA_MANIFEST_URL, out, out_size);
+    err = fetch_manifest_from_url(s_manifest_url, out, out_size);
     if (err == ESP_OK) {
         ESP_LOGI(TAG, "✓ Primary URL successful");
         return ESP_OK;
@@ -597,10 +689,9 @@ static esp_err_t fetch_manifest(char *out, size_t out_size)
 
     ESP_LOGW(TAG, "Primary URL failed, trying backup...");
 
-    // Try backup URL
-    err = fetch_manifest_from_url(OTA_MANIFEST_URL_BACKUP, out, out_size);
+    err = fetch_manifest_from_url(s_manifest_url_bak, out, out_size);
     if (err == ESP_OK) {
-        ESP_LOGI(TAG, "✓ Backup URL successful (Gitee)");
+        ESP_LOGI(TAG, "✓ Backup URL successful");
         return ESP_OK;
     }
 
@@ -663,8 +754,8 @@ static void do_perform_check(void)
     if (fetch_err != ESP_OK) {
         ESP_LOGE(TAG, "❌ Failed to fetch manifest after %d attempts", MANIFEST_FETCH_RETRIES);
         ESP_LOGE(TAG, "Tried both URLs:");
-        ESP_LOGE(TAG, "  • Primary (GitHub): %s", OTA_MANIFEST_URL);
-        ESP_LOGE(TAG, "  • Backup (Gitee):   %s", OTA_MANIFEST_URL_BACKUP);
+        ESP_LOGE(TAG, "  • Primary: %s", s_manifest_url);
+        ESP_LOGE(TAG, "  • Backup:  %s", s_manifest_url_bak);
         ESP_LOGE(TAG, "Please check:");
         ESP_LOGE(TAG, "  1. WiFi network connectivity");
         ESP_LOGE(TAG, "  2. DNS resolution (can device reach 8.8.8.8?)");
@@ -1058,6 +1149,10 @@ esp_err_t ota_updater_init(void)
         ESP_LOGW(TAG, "Failed to open NVS namespace: %s", esp_err_to_name(err));
     }
 
+    // Load runtime-overridable manifest URLs (falls back to compile-time defaults).
+    load_manifest_urls();
+    ESP_LOGI(TAG, "Manifest URLs: primary=%s backup=%s", s_manifest_url, s_manifest_url_bak);
+
     // Spawn the long-lived worker BEFORE registering the got_ip handler so
     // the handler can always notify it. Done early while internal heap is
     // still fresh — runtime task creation was failing once LVGL/WiFi/BLE
@@ -1376,6 +1471,85 @@ static esp_err_t ota_http_upload_handler(httpd_req_t *req)
     return ESP_OK; // unreachable
 }
 
+// GET /api/ota/urls -> {primary, backup, default_primary, default_backup}
+static esp_err_t ota_http_urls_get_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    cJSON *root = cJSON_CreateObject();
+    if (!root) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{}");
+    }
+    cJSON_AddStringToObject(root, "primary",         s_manifest_url);
+    cJSON_AddStringToObject(root, "backup",          s_manifest_url_bak);
+    cJSON_AddStringToObject(root, "default_primary", OTA_MANIFEST_URL);
+    cJSON_AddStringToObject(root, "default_backup",  OTA_MANIFEST_URL_BACKUP);
+    char *out = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (!out) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{}");
+    }
+    esp_err_t e = httpd_resp_sendstr(req, out);
+    free(out);
+    return e;
+}
+
+// POST /api/ota/urls   body: {"primary":"https://...","backup":"https://..."}
+static esp_err_t ota_http_urls_set_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    int total = req->content_len;
+    if (total <= 0 || total > 1024) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"bad content-length\"}");
+    }
+    char *body = malloc(total + 1);
+    if (!body) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"alloc failed\"}");
+    }
+    int r = httpd_req_recv(req, body, total);
+    if (r <= 0) {
+        free(body);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"recv failed\"}");
+    }
+    body[r] = '\0';
+    cJSON *root = cJSON_Parse(body);
+    free(body);
+    if (!root) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"invalid json\"}");
+    }
+    cJSON *jp = cJSON_GetObjectItem(root, "primary");
+    cJSON *jb = cJSON_GetObjectItem(root, "backup");
+    if (!cJSON_IsString(jp) || !cJSON_IsString(jb)) {
+        cJSON_Delete(root);
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"missing primary/backup string\"}");
+    }
+    esp_err_t err = ota_updater_set_manifest_urls(jp->valuestring, jb->valuestring);
+    cJSON_Delete(root);
+    if (err == ESP_ERR_INVALID_ARG) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"url must start with http:// or https:// and be <256 chars\"}");
+    }
+    if (err != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "{\"ok\":false,\"err\":\"nvs write failed\"}");
+    }
+    return httpd_resp_sendstr(req, "{\"ok\":true}");
+}
+
+// POST /api/ota/urls/reset -> erase NVS overrides, revert to compile-time defaults
+static esp_err_t ota_http_urls_reset_handler(httpd_req_t *req)
+{
+    httpd_resp_set_type(req, "application/json");
+    ota_updater_reset_manifest_urls();
+    return httpd_resp_sendstr(req, "{\"ok\":true,\"message\":\"restored defaults\"}");
+}
+
 esp_err_t ota_updater_register_http_handlers(httpd_handle_t server)
 {
     if (!server) return ESP_ERR_INVALID_ARG;
@@ -1403,16 +1577,30 @@ esp_err_t ota_updater_register_http_handlers(httpd_handle_t server)
         .uri = "/api/ota/upload",   .method = HTTP_POST,
         .handler = ota_http_upload_handler,
     };
+    static const httpd_uri_t u_urls_get = {
+        .uri = "/api/ota/urls",       .method = HTTP_GET,
+        .handler = ota_http_urls_get_handler,
+    };
+    static const httpd_uri_t u_urls_set = {
+        .uri = "/api/ota/urls",       .method = HTTP_POST,
+        .handler = ota_http_urls_set_handler,
+    };
+    static const httpd_uri_t u_urls_reset = {
+        .uri = "/api/ota/urls/reset", .method = HTTP_POST,
+        .handler = ota_http_urls_reset_handler,
+    };
     esp_err_t e1 = httpd_register_uri_handler(server, &u_status);
     esp_err_t e2 = httpd_register_uri_handler(server, &u_enable);
     esp_err_t e3 = httpd_register_uri_handler(server, &u_check);
     esp_err_t e4 = httpd_register_uri_handler(server, &u_confirm);
     esp_err_t e5 = httpd_register_uri_handler(server, &u_upload_page);
     esp_err_t e6 = httpd_register_uri_handler(server, &u_upload);
-    if (e1 != ESP_OK || e2 != ESP_OK || e3 != ESP_OK ||
-        e4 != ESP_OK || e5 != ESP_OK || e6 != ESP_OK) {
-        ESP_LOGW(TAG, "register http: status=%d enable=%d check=%d confirm=%d upload_page=%d upload=%d",
-                 e1, e2, e3, e4, e5, e6);
+    esp_err_t e7 = httpd_register_uri_handler(server, &u_urls_get);
+    esp_err_t e8 = httpd_register_uri_handler(server, &u_urls_set);
+    esp_err_t e9 = httpd_register_uri_handler(server, &u_urls_reset);
+    if (e1 || e2 || e3 || e4 || e5 || e6 || e7 || e8 || e9) {
+        ESP_LOGW(TAG, "register http: status=%d enable=%d check=%d confirm=%d upload_page=%d upload=%d urls_get=%d urls_set=%d urls_reset=%d",
+                 e1, e2, e3, e4, e5, e6, e7, e8, e9);
         return ESP_FAIL;
     }
     return ESP_OK;

@@ -1176,7 +1176,7 @@ httpd_handle_t start_webserver(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 16;
+    config.max_uri_handlers = 20;  // 8 builtin + up to 9 OTA endpoints (incl. urls editor)
     config.max_resp_headers = 8;
     config.task_priority = 5;
     config.stack_size = 8192;

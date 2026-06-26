@@ -468,6 +468,7 @@ static const char k_nav[] =
     "<nav>"
     "<a href='/' class='%s'>主页</a>"
     "<a href='/wifi' class='%s'>WiFi</a>"
+    "<a href='/ota' class='%s'>OTA</a>"
     "<a href='/tools' class='%s'>高级</a>"
     "</nav>";
 
@@ -506,17 +507,28 @@ static const char k_wifi_body[] =
     "catch(e){m.textContent='扫描失败: '+e;}}"
     "</script>";
 
-// 高级页: 清除凭据等危险动作 + OTA 升级
+// 高级页: 清除凭据等危险动作 (固件相关已拆到 /ota)
 static const char k_tools_body[] =
     "<h1>高级</h1>"
     "<h2>WiFi 凭据</h2>"
     "<p>清除后设备会重启回到 AP 配网模式 (热点: %s).</p>"
     "<form method='POST' action='/wificlear'>"
     "<button class='danger' type='submit'>清除已保存 WiFi 凭据</button></form>"
-    "<h2>固件升级 OTA</h2>"
+    "<p><small>固件升级/地址配置/本地上传请前往 <a href='/ota'>OTA</a> 页面.</small></p>";
+
+// OTA 专页: 状态 / 切换 / 检查 / 地址编辑 / 本地上传
+static const char k_ota_body[] =
+    "<h1>固件升级 OTA</h1>"
+    "<h2>状态</h2>"
     "<div id='ota' class='msg'>加载中...</div>"
     "<button onclick='otaToggle()'>切换自动更新</button>"
     "<button onclick='otaCheck()'>立即检查更新</button>"
+    "<h2>升级地址</h2>"
+    "<label>主地址<input id='urlP' type='url' placeholder='https://...'/></label>"
+    "<label>备用地址<input id='urlB' type='url' placeholder='https://...'/></label>"
+    "<button onclick='urlSave()'>保存地址</button>"
+    "<button class='danger' onclick='urlReset()'>恢复默认</button>"
+    "<div id='urlMsg' class='msg'>加载中...</div>"
     "<h2>本地上传升级</h2>"
     "<p><small>选择编译产物 build/panda.bin 直接推送到设备 (不经外网, 不走 HTTPS).</small></p>"
     "<input type='file' id='fwfile' accept='.bin'/>"
@@ -546,13 +558,25 @@ static const char k_tools_body[] =
     "if(x.status>=200&&x.status<300)setTimeout(function(){m.textContent+=' \xe2\x9c\x85 \xe8\xae\xbe\xe5\xa4\x87\xe9\x87\x8d\xe5\x90\xaf\xe4\xb8\xad...';},800);};"
     "x.onerror=function(){m.textContent='\xe4\xbc\xa0\xe8\xbe\x93\xe9\x94\x99\xe8\xaf\xaf';b.disabled=false;};"
     "x.send(f);}"
-    "otaStatus();"
+    "async function urlLoad(){try{var d=await(await fetch('/api/ota/urls')).json();"
+    "document.getElementById('urlP').value=d.primary||'';"
+    "document.getElementById('urlB').value=d.backup||'';"
+    "document.getElementById('urlMsg').innerHTML='\xe9\xbb\x98\xe8\xae\xa4\xe4\xb8\xbb: '+d.default_primary+'<br>\xe9\xbb\x98\xe8\xae\xa4\xe5\xa4\x87: '+d.default_backup;"
+    "}catch(e){document.getElementById('urlMsg').textContent='\xe5\x8a\xa0\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5';}}"
+    "async function urlSave(){var p=document.getElementById('urlP').value.trim(),b=document.getElementById('urlB').value.trim();"
+    "if(!p||!b){alert('\xe4\xb8\xa4\xe4\xb8\xaa\xe5\x9c\xb0\xe5\x9d\x80\xe9\x83\xbd\xe8\xa6\x81\xe5\xa1\xab');return;}"
+    "var r=await fetch('/api/ota/urls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({primary:p,backup:b})});"
+    "var d=await r.json();document.getElementById('urlMsg').textContent=d.ok?'\xe2\x9c\x85 \xe5\xb7\xb2\xe4\xbf\x9d\xe5\xad\x98':('\xe2\x9d\x8c '+(d.err||'\xe5\xa4\xb1\xe8\xb4\xa5'));}"
+    "async function urlReset(){if(!confirm('\xe6\x81\xa2\xe5\xa4\x8d\xe7\xbc\x96\xe8\xaf\x91\xe9\xbb\x98\xe8\xae\xa4\xe5\x9c\xb0\xe5\x9d\x80?'))return;"
+    "await fetch('/api/ota/urls/reset',{method:'POST'});urlLoad();}"
+    "urlLoad();otaStatus();"
     "</script>";
 
 // 分块发送页面: head + nav + body + foot. 各块都用栈上小缓冲 (<512B), 安全.
 typedef enum {
     PAGE_HOME = 0,
     PAGE_WIFI,
+    PAGE_OTA,
     PAGE_TOOLS,
 } page_id_t;
 
@@ -565,15 +589,16 @@ static esp_err_t send_page_chunks(httpd_req_t *req, page_id_t page, const char *
     if (httpd_resp_send_chunk(req, k_head, sizeof(k_head) - 1) != ESP_OK) return ESP_FAIL;
 
     // 导航 (当前页 'on' 高亮)
-    char nav[sizeof(k_nav) + 16];
+    char nav[sizeof(k_nav) + 24];
     snprintf(nav, sizeof(nav), k_nav,
              page == PAGE_HOME  ? "on" : "",
              page == PAGE_WIFI  ? "on" : "",
+             page == PAGE_OTA   ? "on" : "",
              page == PAGE_TOOLS ? "on" : "");
     if (httpd_resp_send_chunk(req, nav, HTTPD_RESP_USE_STRLEN) != ESP_OK) return ESP_FAIL;
 
-    // 正文 (按页变长, 仍放堆; tools 页加 OTA + 本地上传后增至 ~2.0 KB)
-    enum { BODY_BUF = 3072 };
+    // 正文 (按页变长, 仍放堆; OTA 页含完整脚本约 ~3.0 KB)
+    enum { BODY_BUF = 4096 };
     char *body = malloc(BODY_BUF);
     if (!body) {
         httpd_resp_send_chunk(req, NULL, 0);
@@ -584,7 +609,7 @@ static esp_err_t send_page_chunks(httpd_req_t *req, page_id_t page, const char *
     } else if (page == PAGE_TOOLS) {
         snprintf(body, BODY_BUF, body_fmt, a1);  // a1 = AP SSID
     } else {
-        // wifi 页正文是纯静态
+        // wifi/ota 页正文是纯静态 (没有服务端注入)
         snprintf(body, BODY_BUF, "%s", body_fmt);
     }
     esp_err_t err = httpd_resp_send_chunk(req, body, HTTPD_RESP_USE_STRLEN);
@@ -611,6 +636,11 @@ static esp_err_t wifi_get_handler(httpd_req_t *req)
 static esp_err_t tools_get_handler(httpd_req_t *req)
 {
     return send_page_chunks(req, PAGE_TOOLS, k_tools_body, s_dev_name, NULL, 0, NULL);
+}
+
+static esp_err_t ota_get_handler(httpd_req_t *req)
+{
+    return send_page_chunks(req, PAGE_OTA, k_ota_body, NULL, NULL, 0, NULL);
 }
 
 // JSON-escape: " 和 \, 控制字符过滤掉
@@ -785,7 +815,7 @@ static esp_err_t start_http(void)
     if (s_httpd) return ESP_OK;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 16;  // 7 builtin + 6 OTA endpoints (incl. /ota/upload); headroom for growth.
+    cfg.max_uri_handlers = 20;  // 7 builtin + 9 OTA endpoints (status/enable/check/confirm/upload_page/upload/urls{get,set,reset}); headroom for growth.
     cfg.stack_size = 6144;  // 默认 4 KB, snprintf 路径 + chunk send 时容易溢出, 抬到 6 KB
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {
@@ -804,6 +834,9 @@ static esp_err_t start_http(void)
     static const httpd_uri_t u_tools = {
         .uri = "/tools", .method = HTTP_GET, .handler = tools_get_handler
     };
+    static const httpd_uri_t u_ota_page = {
+        .uri = "/ota",   .method = HTTP_GET, .handler = ota_get_handler
+    };
     static const httpd_uri_t u_post = {
         .uri = "/wificfg", .method = HTTP_POST, .handler = cfg_post_handler
     };
@@ -817,6 +850,7 @@ static esp_err_t start_http(void)
     httpd_register_uri_handler(s_httpd, &u_wifi);
     httpd_register_uri_handler(s_httpd, &u_wifi_alias);
     httpd_register_uri_handler(s_httpd, &u_tools);
+    httpd_register_uri_handler(s_httpd, &u_ota_page);
     httpd_register_uri_handler(s_httpd, &u_post);
     httpd_register_uri_handler(s_httpd, &u_clear);
     httpd_register_uri_handler(s_httpd, &u_scan);

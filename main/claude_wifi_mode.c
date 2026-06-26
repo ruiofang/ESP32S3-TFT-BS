@@ -517,6 +517,12 @@ static const char k_tools_body[] =
     "<div id='ota' class='msg'>加载中...</div>"
     "<button onclick='otaToggle()'>切换自动更新</button>"
     "<button onclick='otaCheck()'>立即检查更新</button>"
+    "<h2>本地上传升级</h2>"
+    "<p><small>选择编译产物 build/panda.bin 直接推送到设备 (不经外网, 不走 HTTPS).</small></p>"
+    "<input type='file' id='fwfile' accept='.bin'/>"
+    "<button id='upbtn' onclick='otaUpload()'>上传并升级</button>"
+    "<progress id='upprog' max='100' value='0'></progress>"
+    "<div id='upmsg' class='msg'>就绪</div>"
     "<script>"
     "async function otaStatus(){try{var d=await(await fetch('/api/ota/status')).json();"
     "document.getElementById('ota').innerHTML='\xe7\x89\x88\xe6\x9c\xac: '+d.version+"
@@ -528,6 +534,18 @@ static const char k_tools_body[] =
     "body:JSON.stringify({enabled:!d.auto_update})});otaStatus();}"
     "async function otaCheck(){var d=await(await fetch('/api/ota/check_now',{method:'POST'})).json();"
     "alert(d.message||'\xe5\xb7\xb2\xe8\xaf\xb7\xe6\xb1\x82');setTimeout(otaStatus,1500);}"
+    "function otaUpload(){"
+    "var f=document.getElementById('fwfile').files[0];"
+    "if(!f){alert('\xe8\xaf\xb7\xe5\x85\x88\xe9\x80\x89\xe6\x8b\xa9 .bin \xe6\x96\x87\xe4\xbb\xb6');return;}"
+    "var m=document.getElementById('upmsg'),p=document.getElementById('upprog'),b=document.getElementById('upbtn');"
+    "b.disabled=true;m.textContent='\xe4\xb8\x8a\xe4\xbc\xa0\xe4\xb8\xad: '+f.name+' ('+f.size+' B)';p.value=0;"
+    "var x=new XMLHttpRequest();x.open('POST','/api/ota/upload');"
+    "x.setRequestHeader('Content-Type','application/octet-stream');"
+    "x.upload.onprogress=function(e){if(e.lengthComputable)p.value=e.loaded*100/e.total;};"
+    "x.onload=function(){m.textContent=x.status+': '+x.responseText;b.disabled=false;"
+    "if(x.status>=200&&x.status<300)setTimeout(function(){m.textContent+=' \xe2\x9c\x85 \xe8\xae\xbe\xe5\xa4\x87\xe9\x87\x8d\xe5\x90\xaf\xe4\xb8\xad...';},800);};"
+    "x.onerror=function(){m.textContent='\xe4\xbc\xa0\xe8\xbe\x93\xe9\x94\x99\xe8\xaf\xaf';b.disabled=false;};"
+    "x.send(f);}"
     "otaStatus();"
     "</script>";
 
@@ -554,8 +572,8 @@ static esp_err_t send_page_chunks(httpd_req_t *req, page_id_t page, const char *
              page == PAGE_TOOLS ? "on" : "");
     if (httpd_resp_send_chunk(req, nav, HTTPD_RESP_USE_STRLEN) != ESP_OK) return ESP_FAIL;
 
-    // 正文 (按页变长, 仍放堆; tools 页加 OTA 后增至 ~1.2 KB)
-    enum { BODY_BUF = 2200 };
+    // 正文 (按页变长, 仍放堆; tools 页加 OTA + 本地上传后增至 ~2.0 KB)
+    enum { BODY_BUF = 3072 };
     char *body = malloc(BODY_BUF);
     if (!body) {
         httpd_resp_send_chunk(req, NULL, 0);
@@ -767,7 +785,7 @@ static esp_err_t start_http(void)
     if (s_httpd) return ESP_OK;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.lru_purge_enable = true;
-    cfg.max_uri_handlers = 12;  // 7 builtin + 3 OTA endpoints; bumped for headroom.
+    cfg.max_uri_handlers = 16;  // 7 builtin + 6 OTA endpoints (incl. /ota/upload); headroom for growth.
     cfg.stack_size = 6144;  // 默认 4 KB, snprintf 路径 + chunk send 时容易溢出, 抬到 6 KB
     esp_err_t err = httpd_start(&s_httpd, &cfg);
     if (err != ESP_OK) {

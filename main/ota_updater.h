@@ -20,6 +20,8 @@ const char *ota_updater_current_version(void);
 bool        ota_updater_has_pending_update(void);
 const char *ota_updater_pending_version(void);
 esp_err_t   ota_updater_confirm_and_start(void);
+int         ota_updater_get_progress(void);
+const char *ota_updater_get_progress_msg(void);
 
 // Manifest URL management (runtime-overridable via NVS; compile-time macros are defaults).
 void        ota_updater_get_manifest_urls(char *primary, size_t pn, char *backup, size_t bn);

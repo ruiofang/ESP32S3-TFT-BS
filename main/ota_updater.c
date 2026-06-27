@@ -136,6 +136,8 @@ typedef enum {
     OTA_STATE_COMPLETED
 } ota_state_t;
 static volatile ota_state_t s_ota_state = OTA_STATE_IDLE;
+static volatile int s_ota_progress_percent = 0;
+static char s_ota_progress_msg[64] = "";
 
 static void set_status(const char *fmt, ...)
 {
@@ -144,6 +146,14 @@ static void set_status(const char *fmt, ...)
     vsnprintf(s_last_status, sizeof(s_last_status), fmt, ap);
     va_end(ap);
     ESP_LOGI(TAG, "status: %s", s_last_status);
+}
+
+static void update_progress(const char *msg, int percent)
+{
+    s_ota_progress_percent = percent;
+    snprintf(s_ota_progress_msg, sizeof(s_ota_progress_msg), "%s", msg);
+    // Note: LCD display is driven by LVGL task; calling LCD here from OTA
+    // worker task would collide with LVGL's SPI refresh and cause a crash.
 }
 
 static bool is_system_time_valid(void)
@@ -874,6 +884,7 @@ static void do_perform_download(void)
     }
 
     s_ota_state = OTA_STATE_DOWNLOADING;
+    update_progress("正在下载固件...", 0);
     set_status("downloading %s", s_pending_update.version);
     ESP_LOGI(TAG, "Starting OTA download from: %s", s_pending_update.url);
 
@@ -884,92 +895,142 @@ static void do_perform_download(void)
             strcmp(resume_info.version, s_pending_update.version) == 0 &&
             resume_info.downloaded_bytes > 0) {
             ESP_LOGI(TAG, "Found resume point: %d bytes downloaded", resume_info.downloaded_bytes);
-            // TODO: 实现断点续传功能
         }
     }
 
     esp_http_client_config_t ota_http = {
         .url = s_pending_update.url,
         .crt_bundle_attach = esp_crt_bundle_attach,
-        .timeout_ms = 30000,  // 增加超时时间
+        .timeout_ms = 15000,
         .keep_alive_enable = true,
         .disable_auto_redirect = false,
         .max_redirection_count = 3,
-        .buffer_size = 2048,  // small HTTP rx buffer; OTA body lives in PSRAM via buffer_caps
+        .buffer_size = 2048,
     };
 
-    // buffer_caps: route the OTA scratch buffer to PSRAM so internal SRAM stays
-    //   free for esp-aes DMA descriptors (root cause of the prior alloc failure).
-    //   (esp_https_ota runs synchronously in the OTA worker task, which already
-    //   has an 8 KB stack from ota_updater_init.)
     esp_https_ota_config_t ota_cfg = {
         .http_config = &ota_http,
         .buffer_caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT,
     };
 
     ESP_LOGI(TAG, "=== Starting OTA Update ===");
-    
-    // 重试机制
+
     const int max_retries = 3;
     int retry_count = 0;
     esp_err_t err = ESP_FAIL;
-    
+
+    // 使用多步 API 以获取进度
     while (retry_count < max_retries) {
         if (retry_count > 0) {
-            ESP_LOGW(TAG, "Retry attempt %d/%d after 2 second delay", 
+            ESP_LOGW(TAG, "Retry attempt %d/%d after 2 second delay",
                      retry_count, max_retries);
             vTaskDelay(pdMS_TO_TICKS(2000));
         }
-        
-        err = esp_https_ota(&ota_cfg);
-        
-        if (err == ESP_OK) {
-            break;
-        } else if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
-            ESP_LOGE(TAG, "OTA validation failed - firmware corrupted or invalid");
-            set_status("validation failed");
-            break;  // 验证失败不需要重试
-        } else if (err == ESP_ERR_NO_MEM) {
-            ESP_LOGE(TAG, "Out of memory during OTA");
-            set_status("out of memory");
-            break;  // 内存不足不需要重试
-        } else {
-            ESP_LOGE(TAG, "OTA update failed (attempt %d): %s", 
-                     retry_count + 1, esp_err_to_name(err));
-            set_status("failed: %s (retry %d)", esp_err_to_name(err), retry_count + 1);
+
+        esp_https_ota_handle_t handle = NULL;
+        err = esp_https_ota_begin(&ota_cfg, &handle);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "esp_https_ota_begin failed: %s", esp_err_to_name(err));
             retry_count++;
+            continue;
+        }
+
+        int image_size = 0;
+        int last_logged_pct = -1;
+        int bytes_read = 0;
+        time_t last_progress_time = time(NULL);
+        while (1) {
+            err = esp_https_ota_perform(handle);
+            if (err != ESP_ERR_HTTPS_OTA_IN_PROGRESS) break;
+
+            if (image_size == 0) {
+                image_size = esp_https_ota_get_image_size(handle);
+            }
+            bytes_read = esp_https_ota_get_image_len_read(handle);
+            if (image_size > 0) {
+                int pct = (bytes_read * 100) / image_size;
+                if (pct != s_ota_progress_percent) {
+                    float mb_total = image_size / 1048576.0f;
+                    float mb_done = bytes_read / 1048576.0f;
+                    char msg[64];
+                    snprintf(msg, sizeof(msg), "下载中 %.1f/%.1f MB", mb_done, mb_total);
+                    update_progress(msg, pct);
+                    last_progress_time = time(NULL);
+                }
+                // 每 5% 打印一次日志，方便诊断卡住问题
+                if (pct != last_logged_pct && pct % 5 == 0) {
+                    ESP_LOGI(TAG, "Download progress: %d%% (%d/%d bytes)", pct, bytes_read, image_size);
+                    last_logged_pct = pct;
+                }
+            } else {
+                // 未知大小，显示已下载字节数
+                if (bytes_read % 51200 == 0) {  // 每 50KB 更新一次
+                    char msg[64];
+                    snprintf(msg, sizeof(msg), "下载中 %d KB", bytes_read / 1024);
+                    update_progress(msg, -1);
+                    last_progress_time = time(NULL);
+                }
+            }
+            // 看门狗：15 秒进度无变化则告警
+            time_t now = time(NULL);
+            if (now - last_progress_time > 15) {
+                ESP_LOGW(TAG, "Download stalled: no progress for %d seconds (bytes_read=%d, image_size=%d)",
+                         (int)(now - last_progress_time), bytes_read, image_size);
+                last_progress_time = now;  // 避免重复告警
+            }
+        }
+
+        ESP_LOGI(TAG, "esp_https_ota_perform returned: %s (bytes_read=%d)", esp_err_to_name(err), bytes_read);
+
+        if (err == ESP_OK) {
+            err = esp_https_ota_finish(handle);
+            if (err == ESP_OK) {
+                break;
+            }
+            ESP_LOGE(TAG, "esp_https_ota_finish failed: %s", esp_err_to_name(err));
+        } else {
+            esp_https_ota_abort(handle);
+            if (err == ESP_ERR_OTA_VALIDATE_FAILED) {
+                ESP_LOGE(TAG, "OTA validation failed - firmware corrupted or invalid");
+                set_status("validation failed");
+                break;
+            } else if (err == ESP_ERR_NO_MEM) {
+                ESP_LOGE(TAG, "Out of memory during OTA");
+                set_status("out of memory");
+                break;
+            } else {
+                ESP_LOGE(TAG, "OTA update failed (attempt %d): %s",
+                         retry_count + 1, esp_err_to_name(err));
+                set_status("failed: %s (retry %d)", esp_err_to_name(err), retry_count + 1);
+                retry_count++;
+            }
         }
     }
 
     if (err == ESP_OK) {
+        update_progress("下载完成, 重启中...", 100);
         set_status("OTA ok, restarting");
         ESP_LOGI(TAG, "OTA update successful! Restarting in 500ms...");
-        
-        // 清除断点续传信息
+
         clear_resume_info();
-        
+
         vTaskDelay(pdMS_TO_TICKS(500));
         esp_restart();
     } else {
+        update_progress("升级失败", -1);
         set_status("OTA failed: %s", esp_err_to_name(err));
-        ESP_LOGE(TAG, "OTA update failed after %d attempts: %s", 
+        ESP_LOGE(TAG, "OTA update failed after %d attempts: %s",
                  retry_count, esp_err_to_name(err));
-        
-        // 保存当前下载进度以便恢复
+
         if (s_ota_state == OTA_STATE_DOWNLOADING) {
-            // 注意：esp_https_ota内部不提供进度信息，这里需要扩展
-            // 暂时保存基本信息
-            ota_resume_info_t info = {
-                .downloaded_bytes = 0,  // 需要实际实现获取进度
-            };
+            ota_resume_info_t info = { .downloaded_bytes = 0 };
             strncpy(info.url, s_pending_update.url, sizeof(info.url) - 1);
             strncpy(info.version, s_pending_update.version, sizeof(info.version) - 1);
             info.last_update = time(NULL);
-            
             save_resume_info(&info);
             ESP_LOGW(TAG, "Saved resume info for recovery");
         }
-        
+
         s_pending_update.update_available = false;
         s_pending_update.user_confirmed = false;
         s_ota_state = OTA_STATE_ERROR;
@@ -1058,6 +1119,16 @@ const char *ota_updater_pending_version(void)
     return s_pending_update.version;
 }
 
+int ota_updater_get_progress(void)
+{
+    return s_ota_progress_percent;
+}
+
+const char *ota_updater_get_progress_msg(void)
+{
+    return s_ota_progress_msg;
+}
+
 const char *ota_updater_current_version(void)
 {
     const esp_app_desc_t *cur = esp_app_get_description();
@@ -1125,9 +1196,11 @@ static void rollback_confirm_cb(void *arg)
         ESP_LOGW(TAG, "Unknown partition state: %d", state);
     }
     
-    // 检查是否有其他需要清理的状态
-    if (s_ota_state == OTA_STATE_DOWNLOADING || s_ota_state == OTA_STATE_PAUSED) {
-        ESP_LOGW(TAG, "Resetting OTA state from %d to IDLE", s_ota_state);
+    // 检查是否有其他需要清理的状态（下载中时不重置，避免打断网页轮询）
+    if (s_ota_state == OTA_STATE_DOWNLOADING) {
+        ESP_LOGI(TAG, "OTA download in progress, skipping state reset");
+    } else if (s_ota_state == OTA_STATE_PAUSED) {
+        ESP_LOGW(TAG, "Resetting OTA state from PAUSED to IDLE");
         s_ota_state = OTA_STATE_IDLE;
     }
 }
@@ -1229,6 +1302,11 @@ static esp_err_t ota_http_status_handler(httpd_req_t *req)
     cJSON_AddBoolToObject(root, "auto_update", ota_updater_get_auto_enabled());
     cJSON_AddStringToObject(root, "last_status", ota_updater_last_status());
     cJSON_AddBoolToObject(root, "check_in_progress", s_check_in_progress);
+
+    // OTA download progress
+    cJSON_AddNumberToObject(root, "progress", ota_updater_get_progress());
+    cJSON_AddStringToObject(root, "progress_msg", ota_updater_get_progress_msg());
+    cJSON_AddBoolToObject(root, "downloading", s_ota_state == OTA_STATE_DOWNLOADING);
 
     // Add pending update info if available
     if (ota_updater_has_pending_update()) {

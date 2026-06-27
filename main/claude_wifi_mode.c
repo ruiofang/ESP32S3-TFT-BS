@@ -603,7 +603,7 @@ static const char k_ota_body[] =
     "async function urlLoad(){try{var d=await(await fetch('/api/ota/urls')).json();"
     "document.getElementById('urlP').value=d.primary||'';"
     "document.getElementById('urlB').value=d.backup||'';"
-    "document.getElementById('urlMsg').innerHTML='\xe9\xbb\x98\xe8\xae\xa4\xe4\xb8\xbb: '+d.default_primary+'<br>\xe9\xbb\x98\xe8\xae\xa4\xe5\xa4\x87: '+d.default_backup;"
+    "document.getElementById('urlMsg').innerHTML='';"
     "}catch(e){document.getElementById('urlMsg').textContent='\xe5\x8a\xa0\xe8\xbd\xbd\xe5\xa4\xb1\xe8\xb4\xa5';}}"
     "async function urlSave(){var p=document.getElementById('urlP').value.trim(),b=document.getElementById('urlB').value.trim();"
     "if(!p||!b){alert('\xe4\xb8\xa4\xe4\xb8\xaa\xe5\x9c\xb0\xe5\x9d\x80\xe9\x83\xbd\xe8\xa6\x81\xe5\xa1\xab');return;}"

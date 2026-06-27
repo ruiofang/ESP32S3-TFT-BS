@@ -3,7 +3,17 @@
 基于ESP32-S3的TFT显示屏、WS2812 RGB灯带控制系统和电池管理系统
 
 ## 更新日志
-## test4 2026-06-22
+## test5 2026-06-27
+- 新增 **OTA 固件升级**功能：设备可通过 WiFi 远程下载并安装新固件，支持自动检查更新和手动确认升级；
+- OTA 升级网页界面：在 `/ota` 页面查看当前版本、自动更新开关、手动检查更新、确认升级；升级过程中显示实时进度条（百分比 + 已下载/总大小）；
+- OTA 后端 API：`/api/ota/status` 查询状态与进度，`/api/ota/check_now` 触发检查，`/api/ota/confirm` 确认升级，`/api/ota/upload` 本地上传固件；
+- OTA 下载改用多步 API（`esp_https_ota_begin/perform/finish`），支持实时进度反馈（每 5% 打印日志，15 秒无进展告警）；
+- 固件版本号从 `CMakeLists.txt` 的 `PROJECT_VER` 自动读取，`tools/make_release.sh` 一键构建发布包；
+- 默认 OTA 升级地址：`http://120.27.145.121:8090/releases/latest.json`（清单）/ `http://120.27.145.121:8090/releases/panda.bin`（固件）；
+- 支持断点续传：下载中断后恢复，避免重复下载；
+- 升级完成自动重启，rollback 定时器确认镜像有效后提交；
+- 网页 OTA 页面 BODY_BUF 扩展至 6144 字节，适配完整 JS 脚本；
+- 修复 rollback 定时器在下载中途重置状态导致网页轮询中断的问题。
 - 新增 **CLAUDE_WIFI 模式** (第 5 种 BOOT 循环模式)：通过 **WiFi** 接收 PC 推送的 Claude 状态，与 BLE 路径共用同一套 LCD 面板 / WS2812 状态色 / 状态机；链路采用 **UDP 发现 + TCP 长连接状态传输**，便于设备可靠判断主机离线；
 - 配网流程：首次进入时自动起 AP `ESP32_Claude_XXXX` (密码 `12345678`)，浏览器打开 `http://192.168.4.1/` 选 SSID → 输密码 → 保存 → 设备重启进 STA；STA 连接成功后 LCD 显示 `WiFi: <IP>` 和 `ID:XXXX`；
 - WiFi 配网网页分页设计（主页 / WiFi / 高级），并提供 `/wifiscan` AP 扫描接口，列表点击即可填入 SSID；
@@ -210,6 +220,16 @@ python test_esp32_functions.py
 - **GET** `/api/battery/status` - 查询电池状态
 - **POST** `/api/battery/control` - 电池控制设置
 
+### 📡 OTA 固件升级接口
+- **GET** `/api/ota/status` - 查询 OTA 状态（版本、进度、下载中标记）
+- **POST** `/api/ota/check_now` - 立即检查更新（返回是否有新版本）
+- **POST** `/api/ota/confirm` - 用户确认升级，开始下载
+- **POST** `/api/ota/upload` - 本地上传 .bin 固件直接升级
+- **POST** `/api/ota/enable` - 开关自动更新
+- **GET** `/api/ota/urls` - 查询升级地址
+- **POST** `/api/ota/urls` - 保存升级地址
+- **POST** `/api/ota/urls/reset` - 恢复默认升级地址
+
 ### RGB控制参数
 ```json
 {
@@ -254,6 +274,24 @@ python test_esp32_functions.py
 }
 ```
 
+### OTA 状态查询响应
+```json
+{
+  "version": "1.0.0",           // 当前固件版本
+  "auto_update": false,         // 是否启用自动更新
+  "last_status": "idle",        // 最近状态
+  "check_in_progress": false,   // 是否正在检查更新
+  "progress": 37,               // 下载进度 (0-100)
+  "progress_msg": "下载中 0.4/1.8 MB",  // 进度描述
+  "downloading": true,          // 是否正在下载
+  "pending_update": {           // 待确认更新（仅当有新版本时出现）
+    "version": "1.0.1",
+    "url": "http://...",
+    "waiting_confirmation": true
+  }
+}
+```
+
 ## 文件结构
 ```
 ├── main/
@@ -267,6 +305,8 @@ python test_esp32_functions.py
 │   ├── claude_ble_mode.h   # CLAUDE 模式头文件
 │   ├── claude_wifi_mode.c  # CLAUDE_WIFI 模式: WiFi (STA/AP 配网) + UDP 发现 + TCP 状态监听
 │   ├── claude_wifi_mode.h  # CLAUDE_WIFI 模式头文件
+│   ├── ota_updater.c       # OTA 固件升级: 版本检查、下载、进度、断点续传
+│   ├── ota_updater.h       # OTA 固件升级头文件
 │   ├── APP/                # 应用程序模块
 │   └── Lib/                # 第三方库
 ├── components/             # ESP-IDF组件
@@ -274,10 +314,45 @@ python test_esp32_functions.py
 │   ├── claude_status_ble_bridge.py    # PC -> BLE 桥接守护脚本
 │   ├── claude_status_wifi_bridge.py   # PC -> WiFi 桥接守护脚本 (UDP 发现 + TCP 长连接)
 │   ├── claude_hook_post.py            # Claude Code 钩子助手
-│   └── claude_hooks_settings.example.json  # 钩子配置示例
+│   ├── claude_hooks_settings.example.json  # 钩子配置示例
+│   └── make_release.sh                # OTA 发布包构建脚本（自动读取版本号）
 ├── build/                  # 编译输出目录
 └── managed_components/     # 管理的组件
 ```
+
+## OTA 固件升级 (test5+)
+
+### 网页端升级
+1. 设备连接 WiFi 后，浏览器访问 `http://<设备IP>/ota`；
+2. 页面显示当前版本、自动更新开关、最近状态；
+3. 点击「立即检查更新」—— 设备从默认服务器拉取 `latest.json` 比对新版本；
+4. 发现新版本后显示红色提示和「确认升级」按钮，点击确认开始下载；
+5. 下载过程中页面实时显示进度条和百分比，下载完成后设备自动重启；
+6. 重启后 rollback 定时器（30 秒）确认新固件运行正常，自动提交。
+
+### 本地上传升级
+- 在 `/ota` 页面选择本地 `build/panda.bin` 文件，点击「上传并升级」直接推送固件到设备，不经外网。
+
+### 发布新版本
+```bash
+# 1. 修改 CMakeLists.txt 中的版本号
+#    set(PROJECT_VER "1.0.1")
+
+# 2. 一键构建发布包
+./tools/make_release.sh
+
+# 脚本自动：
+#   - 从 CMakeLists.txt 读取 PROJECT_VER
+#   - 编译固件
+#   - 生成 latest.json 清单（含版本号、下载地址、文件大小、SHA256）
+#   - 输出到 releases/ 目录
+```
+发布包上传到服务器后，设备即可通过 OTA 检测到新版本。
+
+### 升级地址配置
+- 网页 `/ota` 页面可修改主/备升级地址，保存到 NVS；
+- 默认主地址：`http://120.27.145.121:8090/releases/latest.json`；
+- 默认备地址：`https://github.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json`。
 
 ## CLAUDE 状态模式 (test3+)
 
@@ -421,7 +496,7 @@ TCP 长连接断开、RST、或 ESP32 侧心跳超时都会触发离线态；这
 > **CLAUDE_WIFI 与 CLAUDE/BLE 互斥**：与 CLAUDE (BLE) 模式同理，CLAUDE_WIFI ↔ CLAUDE 之间切换会触发软重启重新选择射频；CLAUDE_WIFI ↔ JSON/RS485 之间切换也会软重启，因为 WiFi 接口初始化路径不同。
 
 ## 开发环境
-- **ESP-IDF**: v5.4.2
+- **ESP-IDF**: v5.5.2
 - **编译器**: GCC
 - **开发平台**: Windows/Linux/macOS
 

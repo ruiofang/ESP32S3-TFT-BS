@@ -10,10 +10,20 @@
 #include "esp_mac.h"
 #include "Lib/cJSON/cJSON.h"
 #include "ota_updater.h"
+#include "freertos/task.h"
 #include <string.h>
 
 static const char *TAG = "WEB_SERVER";
 static httpd_handle_t server = NULL;
+
+static inline void web_server_task_wdt_reset_if_registered(void)
+{
+    TaskHandle_t current_task = xTaskGetCurrentTaskHandle();
+    esp_err_t status = esp_task_wdt_status(current_task);
+    if (status == ESP_OK) {
+        esp_task_wdt_reset();
+    }
+}
 
 // 完整的HTML网页内容
 static const char* complete_html_page = 
@@ -637,7 +647,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 static esp_err_t api_control_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "=== API CONTROL HANDLER CALLED ===");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
     
     char content[1024];
     size_t to_read = req->content_len;
@@ -660,12 +670,12 @@ static esp_err_t api_control_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         received += (size_t)ret;
-        esp_task_wdt_reset();
+        web_server_task_wdt_reset_if_registered();
     }
     content[received] = '\0';
 
     ESP_LOGI(TAG, "Received control command (%d bytes of %d): %s", (int)received, (int)to_read, content);
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
     
     // 解析JSON并处理WS2812控制命令
     esp_err_t result = ws2812_handle_json_command(content);
@@ -686,7 +696,7 @@ static esp_err_t api_control_handler(httpd_req_t *req)
 static esp_err_t api_test_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "API test endpoint called");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
 
     // 发送测试命令到WS2812控制任务
     esp_err_t result = ws2812_handle_json_command("{\"channel\":255,\"mode\":1,\"color\":{\"r\":255,\"g\":255,\"b\":255},\"brightness\":100}");
@@ -707,7 +717,7 @@ static esp_err_t api_test_handler(httpd_req_t *req)
 static esp_err_t api_simple_test_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Simple test API called");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
 
     httpd_resp_set_type(req, "application/json");
     httpd_resp_sendstr(req, "{\"status\":\"ok\"}");
@@ -720,7 +730,7 @@ static esp_err_t api_simple_test_handler(httpd_req_t *req)
 static esp_err_t api_battery_status_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "Battery status API called");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
 
     // 获取电池状态JSON
     char *json_response = create_battery_status_json();
@@ -742,7 +752,7 @@ static esp_err_t api_battery_status_handler(httpd_req_t *req)
 static esp_err_t api_battery_control_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "=== BATTERY CONTROL API CALLED ===");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
     
     char content[1024];
     size_t to_read = req->content_len;
@@ -765,12 +775,12 @@ static esp_err_t api_battery_control_handler(httpd_req_t *req)
             return ESP_FAIL;
         }
         received += (size_t)ret;
-        esp_task_wdt_reset();
+        web_server_task_wdt_reset_if_registered();
     }
     content[received] = '\0';
 
     ESP_LOGI(TAG, "Received battery control command (%d bytes): %s", (int)received, content);
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
     
     // 解析JSON并处理电池控制命令
     cJSON *json = cJSON_Parse(content);
@@ -843,7 +853,7 @@ static esp_err_t api_battery_control_handler(httpd_req_t *req)
 static esp_err_t api_unified_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "=== UNIFIED API CALLED ===");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
     
     char content[2048];  // 增大缓冲区以支持复杂命令
     size_t to_read = req->content_len;
@@ -1027,7 +1037,7 @@ static esp_err_t api_unified_handler(httpd_req_t *req)
 static esp_err_t api_status_handler(httpd_req_t *req)
 {
     ESP_LOGI(TAG, "System status API called");
-    esp_task_wdt_reset();
+    web_server_task_wdt_reset_if_registered();
     
     // 获取系统状态信息
     cJSON *status = cJSON_CreateObject();

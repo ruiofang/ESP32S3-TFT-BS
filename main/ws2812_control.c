@@ -657,6 +657,7 @@ void ws2812_task(void *pvParameters) {
             uint8_t r = g_no_signal_override_r;
             uint8_t g = g_no_signal_override_g;
             uint8_t b = g_no_signal_override_b;
+            bool override_applied = false;
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
                 bool is_batt_ch = (channels[ch].config.mode == WS2812_MODE_BATTERY) ||
                                   (battery_config.battery_channel == ch);
@@ -667,10 +668,14 @@ void ws2812_task(void *pvParameters) {
                     led_strip_set_pixel(led_strips[ch], i, r, g, b);
                 }
                 led_strip_refresh(led_strips[ch]);
+                override_applied = true;
             }
-            // 覆盖激活时跳过正常渲染；下一轮由定时器翻转颜色
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
+            // 仅当实际覆盖到电量通道时才跳过正常渲染。
+            // 若当前没有电量通道，继续执行正常渲染，避免所有灯被“卡黑”。
+            if (override_applied) {
+                vTaskDelay(pdMS_TO_TICKS(50));
+                continue;
+            }
         }
 
         // 检查是否有通道处于音乐律动模式

@@ -252,10 +252,16 @@ esp_err_t ws2812_set_mode(uint8_t channel_id, ws2812_mode_t mode) {
                 channels[ch].config.color = broadcast_master_color;
                 channels[ch].config.brightness = broadcast_master_brightness;
             }
+            if (mode != WS2812_MODE_BATTERY) {
+                battery_config.battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+            }
             ESP_LOGI(TAG, "Mode set to %d for all channels (broadcast)", mode);
         } else if (channel_id < WS2812_CHANNEL_COUNT) {
             // 设置指定通道
             channels[channel_id].config.mode = mode;
+            if (mode != WS2812_MODE_BATTERY && battery_config.battery_channel == channel_id) {
+                battery_config.battery_channel = WS2812_BATTERY_CHANNEL_DISABLED;
+            }
 
             // 如果多个通道使用相同模式，尝试与它们同步颜色/亮度
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
@@ -685,28 +691,23 @@ void ws2812_task(void *pvParameters) {
             continue;
         }
 
-        // --- 无信号覆盖：只让"电量显示通道"闪烁，其它通道保持原状 ---
+        // --- 无信号覆盖：只让"电量显示通道"闪烁，其它通道继续正常渲染 ---
+        bool no_signal_channel_overridden[WS2812_CHANNEL_COUNT] = {false};
         if (g_no_signal_override_enabled) {
             uint8_t r = g_no_signal_override_r;
             uint8_t g = g_no_signal_override_g;
             uint8_t b = g_no_signal_override_b;
-            bool override_applied = false;
             for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
                 bool is_batt_ch = (channels[ch].config.mode == WS2812_MODE_BATTERY) ||
                                   (battery_config.battery_channel == ch);
                 if (!is_batt_ch || !channels[ch].enabled || led_strips[ch] == NULL) {
                     continue;
                 }
-                override_applied = true;
+                no_signal_channel_overridden[ch] = true;
                 for (int i = 0; i < channels[ch].led_count; i++) {
                     led_strip_set_pixel(led_strips[ch], i, r, g, b);
                 }
                 led_strip_refresh(led_strips[ch]);
-            }
-            if (override_applied) {
-                // 仅在实际覆盖到电量通道时，才跳过正常渲染
-                vTaskDelay(pdMS_TO_TICKS(50));
-                continue;
             }
         }
 
@@ -757,6 +758,10 @@ void ws2812_task(void *pvParameters) {
 
         // 处理每个通道
         for (int ch = 0; ch < WS2812_CHANNEL_COUNT; ch++) {
+            if (no_signal_channel_overridden[ch]) {
+                continue;
+            }
+
             if (!led_strips[ch] || !channels[ch].enabled) {
                 if (!led_strips[ch]) {
                     ESP_LOGD(TAG, "Channel %d: LED strip not initialized", ch);

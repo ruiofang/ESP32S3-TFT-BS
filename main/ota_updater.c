@@ -865,6 +865,11 @@ static void got_ip_event_handler(void *arg, esp_event_base_t base,
                                  int32_t id, void *data)
 {
     (void)arg; (void)base; (void)id; (void)data;
+    ota_updater_note_sta_got_ip();
+}
+
+void ota_updater_note_sta_got_ip(void)
+{
     ensure_sta_dns_servers();
     if (!s_auto_enabled || s_did_initial_check) return;
     if (!s_ota_worker) {
@@ -1287,6 +1292,17 @@ esp_err_t ota_updater_init(void)
     ESP_LOGI(TAG, "  Auto-update: %s", s_auto_enabled ? "enabled" : "disabled");
     ESP_LOGI(TAG, "  Current version: %s", cur ? cur->version : "unknown");
     ESP_LOGI(TAG, "  Free heap: %d bytes", heap_caps_get_free_size(MALLOC_CAP_DEFAULT));
+
+    // In RGB/Web mode WiFi STA may already have connected before OTA init
+    // registers its IP event handler. Trigger the same path once if STA has IP.
+    esp_netif_t *sta = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    if (sta) {
+        esp_netif_ip_info_t ip = {0};
+        if (esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0) {
+            ESP_LOGI(TAG, "STA already has IP, checking OTA auto-trigger path");
+            ota_updater_note_sta_got_ip();
+        }
+    }
     
     return ESP_OK;
 }

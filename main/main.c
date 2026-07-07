@@ -1713,6 +1713,27 @@ static void update_battery_ui(void)
 
     // ---- 信号丢失优先：显示红色闪烁的报警画面 ----
     if (is_battery_signal_lost()) {
+        bool show_network_ip = web_server_is_sta_connected() &&
+                               !web_server_rgb_tcp_client_connected();
+        if (show_network_ip) {
+            const char *ip = web_server_get_ip();
+            if (battery_bar) {
+                lv_bar_set_value(battery_bar, 100, LV_ANIM_OFF);
+                lv_obj_set_style_bg_color(battery_bar, lv_color_hex(0xFFFFFF), LV_PART_INDICATOR);
+            }
+            if (battery_label) {
+                lv_label_set_text_fmt(battery_label, "IP: %s", ip && *ip ? ip : "0.0.0.0");
+                lv_obj_set_style_text_color(battery_label, lv_color_hex(0x202020), 0);
+                lv_obj_invalidate(battery_label);
+            }
+            if (info_label) {
+                lv_label_set_text(info_label, "Waiting for TCP or UART JSON control");
+                lv_obj_set_style_text_color(info_label, lv_color_hex(0xAAAAAA), 0);
+                lv_obj_invalidate(info_label);
+            }
+            return;
+        }
+
         bool blink_on = g_no_signal_blink_on;
         if (battery_bar) {
             // 进度条满格红色 / 熄灭 交替，形成闪烁

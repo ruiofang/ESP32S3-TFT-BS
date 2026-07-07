@@ -11,10 +11,126 @@
 #include "Lib/cJSON/cJSON.h"
 #include "ota_updater.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "nvs.h"
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+#include "lwip/netdb.h"
 #include <string.h>
+#include <stdlib.h>
+#include <errno.h>
 
 static const char *TAG = "WEB_SERVER";
 static httpd_handle_t server = NULL;
+
+#define RGB_WIFI_NVS_NS    "rgb_wifi"
+#define RGB_WIFI_NVS_SSID  "ssid"
+#define RGB_WIFI_NVS_PASS  "pass"
+#define RGB_AP_SSID_PREFIX "ESP32_Light_"
+#define RGB_STA_CONNECT_TIMEOUT_MS 15000
+#define RGB_STA_MAX_RETRY 6
+#define RGB_TCP_RX_BUF_LEN 768
+
+#define RGB_WIFI_BIT_GOT_IP BIT0
+#define RGB_WIFI_BIT_FAIL   BIT1
+
+static EventGroupHandle_t s_wifi_evt = NULL;
+static esp_netif_t *s_netif_sta = NULL;
+static esp_netif_t *s_netif_ap = NULL;
+static int s_sta_retry = 0;
+static bool s_want_sta_connect = false;
+static bool s_ap_mode = false;
+static char s_light_ssid[32] = WIFI_SSID;
+static char s_ip_str[16] = "192.168.4.1";
+static TaskHandle_t s_rgb_tcp_task = NULL;
+static volatile int s_rgb_tcp_active_clients = 0;
+
+static void compute_light_ssid(void)
+{
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
+    snprintf(s_light_ssid, sizeof(s_light_ssid), "%s%02X%02X",
+             RGB_AP_SSID_PREFIX, mac[4], mac[5]);
+}
+
+static esp_err_t rgb_wifi_creds_save(const char *ssid, const char *pass)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(RGB_WIFI_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    err = nvs_set_str(h, RGB_WIFI_NVS_SSID, ssid ? ssid : "");
+    if (err == ESP_OK) err = nvs_set_str(h, RGB_WIFI_NVS_PASS, pass ? pass : "");
+    if (err == ESP_OK) err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t rgb_wifi_creds_load(char *ssid, size_t ssid_size,
+                                     char *pass, size_t pass_size)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(RGB_WIFI_NVS_NS, NVS_READONLY, &h);
+    if (err != ESP_OK) return err;
+    size_t len = ssid_size;
+    err = nvs_get_str(h, RGB_WIFI_NVS_SSID, ssid, &len);
+    if (err == ESP_OK) {
+        len = pass_size;
+        esp_err_t pass_err = nvs_get_str(h, RGB_WIFI_NVS_PASS, pass, &len);
+        if (pass_err == ESP_ERR_NVS_NOT_FOUND) {
+            pass[0] = '\0';
+        } else if (pass_err != ESP_OK) {
+            err = pass_err;
+        }
+    }
+    nvs_close(h);
+    return err;
+}
+
+static esp_err_t rgb_wifi_creds_clear(void)
+{
+    nvs_handle_t h;
+    esp_err_t err = nvs_open(RGB_WIFI_NVS_NS, NVS_READWRITE, &h);
+    if (err != ESP_OK) return err;
+    nvs_erase_key(h, RGB_WIFI_NVS_SSID);
+    nvs_erase_key(h, RGB_WIFI_NVS_PASS);
+    err = nvs_commit(h);
+    nvs_close(h);
+    return err;
+}
+
+static void url_decode(const char *src, char *dst, size_t dst_size)
+{
+    size_t i = 0, j = 0;
+    while (src[i] && j + 1 < dst_size) {
+        if (src[i] == '+') {
+            dst[j++] = ' ';
+            i++;
+        } else if (src[i] == '%' && src[i + 1] && src[i + 2]) {
+            char hex[3] = {src[i + 1], src[i + 2], 0};
+            dst[j++] = (char)strtol(hex, NULL, 16);
+            i += 3;
+        } else {
+            dst[j++] = src[i++];
+        }
+    }
+    dst[j] = '\0';
+}
+
+static size_t json_escape(const char *in, size_t in_len, char *out, size_t out_size)
+{
+    size_t j = 0;
+    for (size_t i = 0; i < in_len && j + 2 < out_size; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') {
+            out[j++] = '\\';
+            out[j++] = (char)c;
+        } else if (c >= 0x20) {
+            out[j++] = (char)c;
+        }
+    }
+    out[j] = '\0';
+    return j;
+}
 
 static inline void web_server_task_wdt_reset_if_registered(void)
 {
@@ -23,6 +139,21 @@ static inline void web_server_task_wdt_reset_if_registered(void)
     if (status == ESP_OK) {
         esp_task_wdt_reset();
     }
+}
+
+const char *web_server_get_ip(void)
+{
+    return s_ip_str;
+}
+
+bool web_server_is_sta_connected(void)
+{
+    return !s_ap_mode && strcmp(s_ip_str, "0.0.0.0") != 0 && strcmp(s_ip_str, "192.168.4.1") != 0;
+}
+
+bool web_server_rgb_tcp_client_connected(void)
+{
+    return s_rgb_tcp_active_clients > 0;
 }
 
 // 完整的HTML网页内容
@@ -34,9 +165,10 @@ static const char* complete_html_page =
 "<meta name='viewport' content='width=device-width, initial-scale=1.0'>"
 "<title>ESP32S3-TFT-BS 智能控制面板</title>"
 "<style>"
+"* { box-sizing: border-box; }"
 "body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }"
-".container { max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
-".channel-group { border: 2px solid #ddd; border-radius: 10px; margin: 15px 0; padding: 15px; }"
+".container { width: 100%; max-width: 800px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }"
+".channel-group { width: 100%; border: 2px solid #ddd; border-radius: 10px; margin: 15px 0; padding: 15px; }"
 ".channel-title { font-size: 18px; font-weight: bold; color: #333; margin-bottom: 10px; }"
 ".control-row { display: flex; align-items: center; margin: 10px 0; gap: 15px; flex-wrap: wrap; }"
 ".control-row.center { justify-content: center; }"
@@ -63,7 +195,7 @@ static const char* complete_html_page =
 "<body>"
 "<div class='container'>"
 "<h1>🌈 ESP32S3-TFT-BS 智能控制面板</h1>"
-"<div class='status-info' id='status'>状态: 连接成功 | 设备IP: 192.168.4.1 | WiFi: ESP32_LightControl</div>"
+"<div class='status-info' id='status'>状态: 连接成功 | <a href='/wifi'>WiFi 配网</a> | <a href='/ota'>OTA 升级</a> | TCP: 8267</div>"
 "<div class='channel-group broadcast-section'>"
 "<div class='channel-title'>📡 广播控制 (所有通道)</div>"
 "<div class='control-row'>"
@@ -146,7 +278,6 @@ static const char* complete_html_page =
 "<span>G</span><input type='range' id='channel-g' min='0' max='255' value='255' style='width:100px'><input type='number' id='channel-g-num' class='number-input' min='0' max='255' value='255'>"
 "<span>B</span><input type='range' id='channel-b' min='0' max='255' value='255' style='width:100px'><input type='number' id='channel-b-num' class='number-input' min='0' max='255' value='255'>"
 "<div class='color-preview' id='channel-color'></div>"
-"</div>"
 "</div>"
 "<div class='control-row'>"
 "<span class='control-label'>亮度:</span>"
@@ -643,6 +774,212 @@ static esp_err_t root_get_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+static esp_err_t wifi_config_get_handler(httpd_req_t *req)
+{
+    char page[2048];
+    snprintf(page, sizeof(page),
+             "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+             "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+             "<title>RGB WiFi 配网</title>"
+             "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
+             ".box{max-width:520px;margin:0 auto;background:#fff;padding:20px;border-radius:8px}"
+             "input,button{width:100%%;box-sizing:border-box;padding:10px;margin-top:8px;font-size:15px}"
+             "button{background:#007bff;color:#fff;border:0;border-radius:5px;cursor:pointer}"
+             ".ap{padding:8px;border-bottom:1px solid #eee;cursor:pointer;display:flex;justify-content:space-between}"
+             ".ap:hover{background:#eef5ff}.muted{color:#666;font-size:13px}.danger{background:#dc3545}</style>"
+             "</head><body><div class='box'>"
+             "<h2>RGB WiFi 配网</h2>"
+             "<p class='muted'>模式: %s | 当前 IP: %s | TCP: %d | 热点: %s</p>"
+             "<p><a href='/'>打开灯光控制面板</a></p>"
+             "<form method='POST' action='/wificfg'>"
+             "<label>SSID</label><input id='ssid' name='ssid' maxlength='32' required>"
+             "<button type='button' onclick='scan()'>扫描附近 WiFi</button>"
+             "<div id='msg' class='muted'></div><div id='aps'></div>"
+             "<label>密码</label><input name='pass' type='password' maxlength='64'>"
+             "<button type='submit'>保存并连接</button></form>"
+             "<form method='POST' action='/wificlear'>"
+             "<button class='danger' type='submit'>清除已保存 WiFi</button></form>"
+             "<script>"
+             "async function scan(){let m=document.getElementById('msg'),d=document.getElementById('aps');"
+             "m.textContent='扫描中...';d.innerHTML='';try{let j=await(await fetch('/wifiscan')).json();"
+             "m.textContent=j.length?'发现 '+j.length+' 个，点击选择':'未发现 AP';"
+             "j.forEach(a=>{let e=document.createElement('div');e.className='ap';"
+             "e.innerHTML='<span>'+(a.a?'锁 ':'')+a.s+'</span><span>'+a.r+' dBm</span>';"
+             "e.onclick=()=>document.getElementById('ssid').value=a.s;d.appendChild(e);});}"
+             "catch(e){m.textContent='扫描失败: '+e;}}"
+             "</script></div></body></html>",
+             s_ap_mode ? "AP 配网" : "STA 已连接",
+             s_ip_str, RGB_TCP_CONTROL_PORT, s_light_ssid);
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_sendstr(req, page);
+}
+
+static esp_err_t wifi_scan_get_handler(httpd_req_t *req)
+{
+    wifi_scan_config_t cfg = {0};
+    cfg.scan_type = WIFI_SCAN_TYPE_ACTIVE;
+    cfg.scan_time.active.min = 50;
+    cfg.scan_time.active.max = 150;
+
+    esp_err_t err = esp_wifi_scan_start(&cfg, true);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "WiFi scan failed: %s", esp_err_to_name(err));
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "[]");
+    }
+
+    uint16_t count = 0;
+    esp_wifi_scan_get_ap_num(&count);
+    if (count > 24) count = 24;
+
+    wifi_ap_record_t *recs = NULL;
+    if (count > 0) {
+        recs = calloc(count, sizeof(*recs));
+        if (!recs) {
+            esp_wifi_clear_ap_list();
+            httpd_resp_set_type(req, "application/json");
+            return httpd_resp_sendstr(req, "[]");
+        }
+        esp_wifi_scan_get_ap_records(&count, recs);
+    }
+
+    char *json = malloc(2048);
+    if (!json) {
+        free(recs);
+        esp_wifi_clear_ap_list();
+        httpd_resp_set_type(req, "application/json");
+        return httpd_resp_sendstr(req, "[]");
+    }
+
+    size_t pos = 0;
+    json[pos++] = '[';
+    for (uint16_t i = 0; i < count; i++) {
+        if (recs[i].ssid[0] == '\0') continue;
+        bool duplicate = false;
+        for (uint16_t k = 0; k < i; k++) {
+            if (strncmp((char *)recs[i].ssid, (char *)recs[k].ssid,
+                        sizeof(recs[i].ssid)) == 0 && recs[k].ssid[0] != '\0') {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) continue;
+
+        char esc[80];
+        size_t ssid_len = strnlen((char *)recs[i].ssid, sizeof(recs[i].ssid));
+        json_escape((const char *)recs[i].ssid, ssid_len, esc, sizeof(esc));
+        int n = snprintf(json + pos, 2048 - pos,
+                         "%s{\"s\":\"%s\",\"r\":%d,\"a\":%d}",
+                         pos > 1 ? "," : "", esc, recs[i].rssi, (int)recs[i].authmode);
+        if (n < 0 || (size_t)n >= 2048 - pos) break;
+        pos += n;
+    }
+    if (pos + 1 < 2048) json[pos++] = ']';
+    json[pos] = '\0';
+
+    free(recs);
+    esp_wifi_clear_ap_list();
+
+    httpd_resp_set_type(req, "application/json");
+    esp_err_t send_err = httpd_resp_send(req, json, pos);
+    free(json);
+    return send_err;
+}
+
+static esp_err_t wifi_config_post_handler(httpd_req_t *req)
+{
+    char body[256];
+    int total = req->content_len < (int)sizeof(body) - 1 ? req->content_len : (int)sizeof(body) - 1;
+    int r = httpd_req_recv(req, body, total);
+    if (r <= 0) return ESP_FAIL;
+    body[r] = '\0';
+
+    char ssid_raw[64] = {0};
+    char pass_raw[128] = {0};
+    httpd_query_key_value(body, "ssid", ssid_raw, sizeof(ssid_raw));
+    httpd_query_key_value(body, "pass", pass_raw, sizeof(pass_raw));
+
+    char ssid[64] = {0};
+    char pass[128] = {0};
+    url_decode(ssid_raw, ssid, sizeof(ssid));
+    url_decode(pass_raw, pass, sizeof(pass));
+
+    if (!ssid[0]) {
+        httpd_resp_set_status(req, "400 Bad Request");
+        return httpd_resp_sendstr(req, "ssid required");
+    }
+    if (rgb_wifi_creds_save(ssid, pass) != ESP_OK) {
+        httpd_resp_set_status(req, "500 Internal Server Error");
+        return httpd_resp_sendstr(req, "save failed");
+    }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req, "<html><body><p>已保存 WiFi，设备将在 1 秒后重启并连接路由器。</p></body></html>");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
+static esp_err_t wifi_clear_post_handler(httpd_req_t *req)
+{
+    rgb_wifi_creds_clear();
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr(req, "<html><body><p>已清除 WiFi，设备将在 1 秒后重启回配网热点。</p></body></html>");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    esp_restart();
+    return ESP_OK;
+}
+
+static esp_err_t ota_page_get_handler(httpd_req_t *req)
+{
+    static const char page[] =
+        "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1.0'>"
+        "<title>ESP32 OTA</title>"
+        "<style>body{font-family:Arial,sans-serif;margin:20px;background:#f5f5f5}"
+        ".box{max-width:620px;margin:0 auto;background:#fff;padding:20px;border-radius:8px}"
+        "button,input{box-sizing:border-box;padding:10px;margin:6px 0;font-size:15px}"
+        "button{background:#007bff;color:#fff;border:0;border-radius:5px;cursor:pointer}"
+        "button.danger{background:#dc3545}input{width:100%}"
+        ".row{display:flex;gap:8px;flex-wrap:wrap}.muted{color:#666;font-size:13px}"
+        "progress{width:100%;height:20px}</style></head><body><div class='box'>"
+        "<h2>OTA 固件升级</h2><p><a href='/'>返回灯光控制</a> | <a href='/wifi'>WiFi 配网</a></p>"
+        "<div id='status' class='muted'>加载中...</div>"
+        "<progress id='prog' max='100' value='0'></progress><div id='progmsg' class='muted'></div>"
+        "<div class='row'><button onclick='toggleAuto()'>切换自动更新</button>"
+        "<button onclick='checkNow()'>立即检查更新</button><button onclick='confirmUpdate()'>确认升级</button></div>"
+        "<h3>升级地址</h3><label>主地址</label><input id='pri' type='url'>"
+        "<label>备用地址</label><input id='bak' type='url'>"
+        "<div class='row'><button onclick='saveUrls()'>保存地址</button>"
+        "<button class='danger' onclick='resetUrls()'>恢复默认</button></div>"
+        "<h3>本地上传</h3><input type='file' id='fw' accept='.bin'>"
+        "<button onclick='uploadFw()'>上传并升级</button><div id='msg' class='muted'></div>"
+        "<script>"
+        "async function j(u,o){return await(await fetch(u,o)).json()}"
+        "async function load(){try{let s=await j('/api/ota/status?_='+Date.now());"
+        "let h='版本: '+s.version+'<br>自动更新: '+(s.auto_update?'开':'关')+'<br>状态: '+s.last_status;"
+        "if(s.pending_update)h+='<br>发现新版本: '+s.pending_update.version;"
+        "document.getElementById('status').innerHTML=h;"
+        "document.getElementById('prog').value=s.progress||0;"
+        "document.getElementById('progmsg').textContent=(s.progress_msg||'')+' '+(s.progress||0)+'%';"
+        "let u=await j('/api/ota/urls?_='+Date.now());document.getElementById('pri').value=u.primary||'';"
+        "document.getElementById('bak').value=u.backup||'';}catch(e){document.getElementById('status').textContent='查询失败: '+e}}"
+        "async function toggleAuto(){let s=await j('/api/ota/status?_='+Date.now());"
+        "await fetch('/api/ota/enable',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:!s.auto_update})});load()}"
+        "async function checkNow(){let r=await j('/api/ota/check_now',{method:'POST'});document.getElementById('msg').textContent=r.message||'已请求';setTimeout(load,1500)}"
+        "async function confirmUpdate(){let r=await j('/api/ota/confirm',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});document.getElementById('msg').textContent=r.message||JSON.stringify(r);setTimeout(load,1000)}"
+        "async function saveUrls(){let primary=document.getElementById('pri').value.trim(),backup=document.getElementById('bak').value.trim();"
+        "let r=await j('/api/ota/urls',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({primary,backup})});document.getElementById('msg').textContent=r.ok?'已保存':(r.err||'保存失败')}"
+        "async function resetUrls(){await fetch('/api/ota/urls/reset',{method:'POST'});load()}"
+        "function uploadFw(){let f=document.getElementById('fw').files[0];if(!f){alert('请选择 .bin 文件');return}"
+        "let x=new XMLHttpRequest(),m=document.getElementById('msg'),p=document.getElementById('prog');x.open('POST','/api/ota/upload');"
+        "x.setRequestHeader('Content-Type','application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable)p.value=e.loaded*100/e.total};"
+        "x.onload=()=>{m.textContent=x.status+': '+x.responseText};x.onerror=()=>{m.textContent='上传失败'};x.send(f)}"
+        "load();setInterval(load,3000)</script></div></body></html>";
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    return httpd_resp_send(req, page, sizeof(page) - 1);
+}
+
 // API控制处理函数
 static esp_err_t api_control_handler(httpd_req_t *req)
 {
@@ -1108,6 +1445,256 @@ static esp_err_t api_status_handler(httpd_req_t *req)
 // OTA HTTP handlers live in ota_updater.c; registered via
 // ota_updater_register_http_handlers() in start_web_server().
 
+static bool json_object_complete(const char *buf, size_t len)
+{
+    int depth = 0;
+    bool in_string = false;
+    bool escape = false;
+    bool seen_open = false;
+
+    for (size_t i = 0; i < len; i++) {
+        char c = buf[i];
+        if (escape) {
+            escape = false;
+            continue;
+        }
+        if (in_string) {
+            if (c == '\\') escape = true;
+            else if (c == '"') in_string = false;
+            continue;
+        }
+        if (c == '"') in_string = true;
+        else if (c == '{') {
+            depth++;
+            seen_open = true;
+        } else if (c == '}') {
+            depth--;
+            if (depth == 0 && seen_open) return true;
+            if (depth < 0) return false;
+        }
+    }
+    return false;
+}
+
+static void rgb_tcp_send_result(int fd, esp_err_t err)
+{
+    const char *reply = (err == ESP_OK)
+        ? "{\"status\":\"success\",\"message\":\"命令执行成功\"}\n"
+        : "{\"status\":\"error\",\"message\":\"命令执行失败\"}\n";
+    send(fd, reply, strlen(reply), 0);
+}
+
+static esp_err_t process_rgb_json_command(const char *content)
+{
+    esp_err_t ws2812_result = ws2812_handle_json_command(content);
+    bool battery_processed = false;
+
+    cJSON *json = cJSON_Parse(content);
+    if (json) {
+        cJSON *voltage = cJSON_GetObjectItem(json, "voltage");
+        if (voltage && cJSON_IsNumber(voltage)) {
+            set_external_voltage((float)voltage->valuedouble);
+            battery_processed = true;
+            ESP_LOGI(TAG, "TCP JSON: set voltage %.2fV", voltage->valuedouble);
+        }
+
+        cJSON *battery = cJSON_GetObjectItem(json, "battery");
+        if (battery && cJSON_IsNumber(battery)) {
+            set_external_battery_percentage(battery->valueint);
+            battery_processed = true;
+            ESP_LOGI(TAG, "TCP JSON: set battery %d%%", battery->valueint);
+        }
+
+        cJSON *charging = cJSON_GetObjectItem(json, "charging");
+        if (charging && cJSON_IsBool(charging)) {
+            bool charging_status = cJSON_IsTrue(charging);
+            set_external_charging_status(charging_status);
+            battery_processed = true;
+            ESP_LOGI(TAG, "TCP JSON: set charging %s", charging_status ? "true" : "false");
+        }
+
+        cJSON *auto_mode = cJSON_GetObjectItem(json, "auto_mode");
+        if (auto_mode && cJSON_IsBool(auto_mode) && cJSON_IsTrue(auto_mode)) {
+            restore_auto_battery_mode();
+            battery_processed = true;
+            ESP_LOGI(TAG, "TCP JSON: restore auto battery mode");
+        }
+
+        cJSON *auto_charging = cJSON_GetObjectItem(json, "auto_charging");
+        if (auto_charging && cJSON_IsBool(auto_charging) && cJSON_IsTrue(auto_charging)) {
+            restore_auto_charging_mode();
+            battery_processed = true;
+            ESP_LOGI(TAG, "TCP JSON: restore auto charging mode");
+        }
+
+        cJSON *battery_channel = cJSON_GetObjectItem(json, "battery_channel");
+        cJSON *show_charging_effect = cJSON_GetObjectItem(json, "show_charging_effect");
+        cJSON *background_brightness = cJSON_GetObjectItem(json, "background_brightness");
+        cJSON *battery_display_obj = cJSON_GetObjectItem(json, "battery_display");
+
+        if (battery_display_obj && cJSON_IsObject(battery_display_obj)) {
+            cJSON *bd_channel = cJSON_GetObjectItem(battery_display_obj, "channel");
+            cJSON *bd_show_effect = cJSON_GetObjectItem(battery_display_obj, "show_charging_effect");
+            cJSON *bd_brightness = cJSON_GetObjectItem(battery_display_obj, "background_brightness");
+            uint8_t channel = 255;
+            bool show_effect = true;
+            uint8_t brightness = 10;
+
+            if (bd_channel && cJSON_IsNumber(bd_channel)) channel = (uint8_t)bd_channel->valueint;
+            if (bd_show_effect && cJSON_IsBool(bd_show_effect)) show_effect = cJSON_IsTrue(bd_show_effect);
+            if (bd_brightness && cJSON_IsNumber(bd_brightness)) brightness = (uint8_t)bd_brightness->valueint;
+
+            if (ws2812_set_battery_display(channel, show_effect, brightness) == ESP_OK) {
+                battery_processed = true;
+                ESP_LOGI(TAG, "TCP JSON: set battery display channel=%d brightness=%d", channel, brightness);
+            }
+        } else if (battery_channel || show_charging_effect || background_brightness) {
+            uint8_t channel = 255;
+            bool show_effect = true;
+            uint8_t brightness = 10;
+
+            if (battery_channel && cJSON_IsNumber(battery_channel)) channel = (uint8_t)battery_channel->valueint;
+            if (show_charging_effect && cJSON_IsBool(show_charging_effect)) show_effect = cJSON_IsTrue(show_charging_effect);
+            if (background_brightness && cJSON_IsNumber(background_brightness)) brightness = (uint8_t)background_brightness->valueint;
+
+            if (ws2812_set_battery_display(channel, show_effect, brightness) == ESP_OK) {
+                battery_processed = true;
+                ESP_LOGI(TAG, "TCP JSON: set battery display channel=%d brightness=%d", channel, brightness);
+            }
+        }
+
+        cJSON *channel_battery_mode = cJSON_GetObjectItem(json, "channel_battery_mode");
+        if (channel_battery_mode && cJSON_IsObject(channel_battery_mode)) {
+            cJSON *channel = cJSON_GetObjectItem(channel_battery_mode, "channel");
+            cJSON *enable = cJSON_GetObjectItem(channel_battery_mode, "enable");
+            cJSON *bg_brightness = cJSON_GetObjectItem(channel_battery_mode, "background_brightness");
+            if (channel && cJSON_IsNumber(channel) && enable && cJSON_IsBool(enable)) {
+                uint8_t brightness = 10;
+                if (bg_brightness && cJSON_IsNumber(bg_brightness)) {
+                    brightness = (uint8_t)bg_brightness->valueint;
+                }
+                if (ws2812_set_channel_battery_mode((uint8_t)channel->valueint,
+                                                    cJSON_IsTrue(enable),
+                                                    brightness) == ESP_OK) {
+                    battery_processed = true;
+                    ESP_LOGI(TAG, "TCP JSON: set channel %d battery mode", channel->valueint);
+                }
+            }
+        }
+
+        if (battery_processed) {
+            ws2812_update_battery_display(get_battery_percentage(), is_charging());
+        }
+
+        cJSON_Delete(json);
+    }
+
+    return (ws2812_result == ESP_OK || battery_processed) ? ESP_OK : ESP_FAIL;
+}
+
+static void rgb_tcp_handle_client(int client_fd, const char *peer_ip)
+{
+    char rx[RGB_TCP_RX_BUF_LEN];
+    size_t rx_len = 0;
+
+    ESP_LOGI(TAG, "RGB TCP client connected: %s", peer_ip);
+    s_rgb_tcp_active_clients++;
+    const char *hello = "{\"status\":\"ready\",\"protocol\":\"ws2812-json\"}\n";
+    send(client_fd, hello, strlen(hello), 0);
+
+    while (true) {
+        int n = recv(client_fd, rx + rx_len, sizeof(rx) - rx_len - 1, 0);
+        if (n <= 0) break;
+        rx_len += (size_t)n;
+        rx[rx_len] = '\0';
+
+        char *line_start = rx;
+        while (true) {
+            char *newline = strpbrk(line_start, "\r\n");
+            if (!newline) break;
+            *newline = '\0';
+            if (line_start[0] != '\0') {
+                ESP_LOGI(TAG, "RGB TCP JSON: %s", line_start);
+                rgb_tcp_send_result(client_fd, process_rgb_json_command(line_start));
+            }
+            line_start = newline + 1;
+            while (*line_start == '\r' || *line_start == '\n') line_start++;
+        }
+
+        size_t remain = rx + rx_len - line_start;
+        if (line_start != rx && remain > 0) memmove(rx, line_start, remain);
+        rx_len = remain;
+        rx[rx_len] = '\0';
+
+        if (rx_len > 0 && json_object_complete(rx, rx_len)) {
+            ESP_LOGI(TAG, "RGB TCP JSON: %s", rx);
+            rgb_tcp_send_result(client_fd, process_rgb_json_command(rx));
+            rx_len = 0;
+            rx[0] = '\0';
+        } else if (rx_len >= sizeof(rx) - 1) {
+            ESP_LOGW(TAG, "RGB TCP receive buffer overflow, dropping partial command");
+            const char *err = "{\"status\":\"error\",\"message\":\"JSON too large\"}\n";
+            send(client_fd, err, strlen(err), 0);
+            rx_len = 0;
+            rx[0] = '\0';
+        }
+    }
+
+    shutdown(client_fd, SHUT_RDWR);
+    close(client_fd);
+    if (s_rgb_tcp_active_clients > 0) s_rgb_tcp_active_clients--;
+    ESP_LOGI(TAG, "RGB TCP client disconnected: %s", peer_ip);
+}
+
+static void rgb_tcp_server_task(void *arg)
+{
+    (void)arg;
+    int listen_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (listen_fd < 0) {
+        ESP_LOGE(TAG, "RGB TCP socket failed: errno=%d", errno);
+        s_rgb_tcp_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int yes = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    addr.sin_port = htons(RGB_TCP_CONTROL_PORT);
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(listen_fd, 3) != 0) {
+        ESP_LOGE(TAG, "RGB TCP bind/listen failed: errno=%d", errno);
+        close(listen_fd);
+        s_rgb_tcp_task = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
+    ESP_LOGI(TAG, "RGB TCP JSON control listening on port %d", RGB_TCP_CONTROL_PORT);
+    while (true) {
+        struct sockaddr_in peer = {0};
+        socklen_t peer_len = sizeof(peer);
+        int client_fd = accept(listen_fd, (struct sockaddr *)&peer, &peer_len);
+        if (client_fd < 0) {
+            ESP_LOGW(TAG, "RGB TCP accept failed: errno=%d", errno);
+            continue;
+        }
+        char peer_ip[16];
+        inet_ntoa_r(peer.sin_addr, peer_ip, sizeof(peer_ip));
+        rgb_tcp_handle_client(client_fd, peer_ip);
+    }
+}
+
+static void start_rgb_tcp_server(void)
+{
+    if (s_rgb_tcp_task) return;
+    xTaskCreate(rgb_tcp_server_task, "rgb_tcp", 4096, NULL, 4, &s_rgb_tcp_task);
+}
+
 // 启动Web服务器
 httpd_handle_t start_webserver(void)
 {
@@ -1117,7 +1704,7 @@ httpd_handle_t start_webserver(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    config.max_uri_handlers = 20;  // 8 builtin + up to 9 OTA endpoints (incl. urls editor)
+    config.max_uri_handlers = 24;  // builtin APIs + WiFi config + OTA endpoints
     config.max_resp_headers = 8;
     config.task_priority = 5;
     config.stack_size = 8192;
@@ -1138,6 +1725,54 @@ httpd_handle_t start_webserver(void)
             .user_ctx = NULL
         };
         httpd_register_uri_handler(server, &root_uri);
+
+        httpd_uri_t wifi_uri = {
+            .uri = "/wifi",
+            .method = HTTP_GET,
+            .handler = wifi_config_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &wifi_uri);
+
+        httpd_uri_t wifi_cfg_get_uri = {
+            .uri = "/wificfg",
+            .method = HTTP_GET,
+            .handler = wifi_config_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &wifi_cfg_get_uri);
+
+        httpd_uri_t wifi_cfg_post_uri = {
+            .uri = "/wificfg",
+            .method = HTTP_POST,
+            .handler = wifi_config_post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &wifi_cfg_post_uri);
+
+        httpd_uri_t wifi_clear_uri = {
+            .uri = "/wificlear",
+            .method = HTTP_POST,
+            .handler = wifi_clear_post_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &wifi_clear_uri);
+
+        httpd_uri_t wifi_scan_uri = {
+            .uri = "/wifiscan",
+            .method = HTTP_GET,
+            .handler = wifi_scan_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &wifi_scan_uri);
+
+        httpd_uri_t ota_page_uri = {
+            .uri = "/ota",
+            .method = HTTP_GET,
+            .handler = ota_page_get_handler,
+            .user_ctx = NULL
+        };
+        httpd_register_uri_handler(server, &ota_page_uri);
 
         // API控制处理器
         httpd_uri_t control_uri = {
@@ -1203,8 +1838,9 @@ httpd_handle_t start_webserver(void)
         httpd_register_uri_handler(server, &status_uri);
 
         ota_updater_register_http_handlers(server);
+        start_rgb_tcp_server();
 
-        ESP_LOGI(TAG, "Web server started successfully with %d API endpoints", 11);
+        ESP_LOGI(TAG, "Web server started successfully with HTTP APIs and TCP:%d", RGB_TCP_CONTROL_PORT);
         return server;
     } else {
         ESP_LOGE(TAG, "Failed to start web server");
@@ -1228,10 +1864,10 @@ httpd_handle_t web_server_init(void)
 {
     ESP_LOGI(TAG, "Initializing Web Server System");
     
-    // 初始化WiFi AP模式
+    // 初始化WiFi: 优先连接已保存路由器, 失败则进入 AP 配网
     esp_err_t ret = wifi_init_ap();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to initialize WiFi AP");
+        ESP_LOGE(TAG, "Failed to initialize WiFi");
         return NULL;
     }
     
@@ -1250,28 +1886,122 @@ httpd_handle_t web_server_init(void)
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
                               int32_t event_id, void* event_data)
 {
-    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
-        wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
-        ESP_LOGI(TAG, "Station "MACSTR" joined, AID=%d", MAC2STR(event->mac), event->aid);
-    } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
-        wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
-        ESP_LOGI(TAG, "Station "MACSTR" left, AID=%d", MAC2STR(event->mac), event->aid);
+    (void)arg;
+    if (event_base == WIFI_EVENT) {
+        if (event_id == WIFI_EVENT_STA_START) {
+            if (s_want_sta_connect) esp_wifi_connect();
+        } else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
+            if (!s_want_sta_connect) return;
+            if (s_sta_retry < RGB_STA_MAX_RETRY) {
+                s_sta_retry++;
+                ESP_LOGW(TAG, "STA disconnected, retry %d/%d", s_sta_retry, RGB_STA_MAX_RETRY);
+                esp_wifi_connect();
+            } else if (s_wifi_evt) {
+                xEventGroupSetBits(s_wifi_evt, RGB_WIFI_BIT_FAIL);
+            }
+        } else if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+            wifi_event_ap_staconnected_t* event = (wifi_event_ap_staconnected_t*) event_data;
+            ESP_LOGI(TAG, "Station "MACSTR" joined, AID=%d", MAC2STR(event->mac), event->aid);
+        } else if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+            wifi_event_ap_stadisconnected_t* event = (wifi_event_ap_stadisconnected_t*) event_data;
+            ESP_LOGI(TAG, "Station "MACSTR" left, AID=%d", MAC2STR(event->mac), event->aid);
+        }
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
+        snprintf(s_ip_str, sizeof(s_ip_str), IPSTR, IP2STR(&event->ip_info.ip));
+        s_sta_retry = 0;
+        s_ap_mode = false;
+        ESP_LOGI(TAG, "==================================================");
+        ESP_LOGI(TAG, "WiFi connected, device IP: %s", s_ip_str);
+        ESP_LOGI(TAG, "Web control: http://%s/", s_ip_str);
+        ESP_LOGI(TAG, "WiFi config:  http://%s/wifi", s_ip_str);
+        ESP_LOGI(TAG, "OTA update:   http://%s/ota", s_ip_str);
+        ESP_LOGI(TAG, "TCP JSON:     %s:%d", s_ip_str, RGB_TCP_CONTROL_PORT);
+        ESP_LOGI(TAG, "==================================================");
+        if (s_wifi_evt) xEventGroupSetBits(s_wifi_evt, RGB_WIFI_BIT_GOT_IP);
+        ota_updater_note_sta_got_ip();
     }
 }
 
-// 初始化WiFi AP模式
+static esp_err_t start_wifi_sta(const char *ssid, const char *pass)
+{
+    if (!s_netif_sta) s_netif_sta = esp_netif_create_default_wifi_sta();
+
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, ssid, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, pass, sizeof(wifi_config.sta.password) - 1);
+    wifi_config.sta.threshold.authmode = WIFI_AUTH_OPEN;
+    wifi_config.sta.pmf_cfg.capable = true;
+
+    s_sta_retry = 0;
+    s_want_sta_connect = true;
+    xEventGroupClearBits(s_wifi_evt, RGB_WIFI_BIT_GOT_IP | RGB_WIFI_BIT_FAIL);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_evt,
+                                           RGB_WIFI_BIT_GOT_IP | RGB_WIFI_BIT_FAIL,
+                                           pdFALSE,
+                                           pdFALSE,
+                                           pdMS_TO_TICKS(RGB_STA_CONNECT_TIMEOUT_MS));
+    if (bits & RGB_WIFI_BIT_GOT_IP) {
+        ESP_LOGI(TAG, "WiFi STA initialized. IP: %s", s_ip_str);
+        return ESP_OK;
+    }
+
+    ESP_LOGW(TAG, "WiFi STA connect failed or timed out");
+    s_want_sta_connect = false;
+    esp_wifi_stop();
+    return ESP_FAIL;
+}
+
+static esp_err_t start_wifi_ap_provisioning(void)
+{
+    if (!s_netif_ap) s_netif_ap = esp_netif_create_default_wifi_ap();
+    if (!s_netif_sta) s_netif_sta = esp_netif_create_default_wifi_sta();
+
+    wifi_config_t ap_config = {
+        .ap = {
+            .channel = WIFI_CHANNEL,
+            .password = WIFI_PASS,
+            .max_connection = WIFI_MAX_STA_CONN,
+            .authmode = WIFI_AUTH_WPA_WPA2_PSK
+        },
+    };
+    size_t ssid_len = strnlen(s_light_ssid, sizeof(s_light_ssid));
+    memcpy(ap_config.ap.ssid, s_light_ssid, ssid_len);
+    ap_config.ap.ssid_len = ssid_len;
+
+    wifi_config_t sta_empty = {0};
+    s_want_sta_connect = false;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ap_config));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta_empty));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    snprintf(s_ip_str, sizeof(s_ip_str), "192.168.4.1");
+    s_ap_mode = true;
+    ESP_LOGI(TAG, "==================================================");
+    ESP_LOGI(TAG, "WiFi provisioning AP started");
+    ESP_LOGI(TAG, "AP SSID:      %s", s_light_ssid);
+    ESP_LOGI(TAG, "AP Password:  %s", WIFI_PASS);
+    ESP_LOGI(TAG, "WiFi config:  http://%s/wifi", s_ip_str);
+    ESP_LOGI(TAG, "Web control:  http://%s/", s_ip_str);
+    ESP_LOGI(TAG, "==================================================");
+    return ESP_OK;
+}
+
+// 初始化WiFi: 优先 STA, 失败则 APSTA 配网
 esp_err_t wifi_init_ap(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
+    compute_light_ssid();
 
     ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_create_default_wifi_ap();
+    esp_err_t err = esp_event_loop_create_default();
+    if (err != ESP_OK && err != ESP_ERR_INVALID_STATE) return err;
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -1281,29 +2011,23 @@ esp_err_t wifi_init_ap(void)
                                                         &wifi_event_handler,
                                                         NULL,
                                                         NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT,
+                                                        IP_EVENT_STA_GOT_IP,
+                                                        &wifi_event_handler,
+                                                        NULL,
+                                                        NULL));
 
-    /* 基于芯片 MAC 生成唯一 SSID：ESP32_Light_XXXX (取 MAC 后 2 字节, 同一芯片固定) */
-    uint8_t mac[6] = {0};
-    esp_read_mac(mac, ESP_MAC_WIFI_SOFTAP);
-    char ssid_buf[32] = {0};
-    int ssid_len = snprintf(ssid_buf, sizeof(ssid_buf), "ESP32_Light_%02X%02X", mac[4], mac[5]);
+    if (!s_wifi_evt) {
+        s_wifi_evt = xEventGroupCreate();
+        if (!s_wifi_evt) return ESP_ERR_NO_MEM;
+    }
 
-    wifi_config_t wifi_config = {
-        .ap = {
-            .channel = WIFI_CHANNEL,
-            .password = WIFI_PASS,
-            .max_connection = WIFI_MAX_STA_CONN,
-            .authmode = WIFI_AUTH_WPA_WPA2_PSK
-        },
-    };
-    memcpy(wifi_config.ap.ssid, ssid_buf, ssid_len);
-    wifi_config.ap.ssid_len = ssid_len;
+    char ssid[64] = {0};
+    char pass[64] = {0};
+    if (rgb_wifi_creds_load(ssid, sizeof(ssid), pass, sizeof(pass)) == ESP_OK && ssid[0] != '\0') {
+        ESP_LOGI(TAG, "Saved RGB WiFi credentials found, trying STA: %s", ssid);
+        if (start_wifi_sta(ssid, pass) == ESP_OK) return ESP_OK;
+    }
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-
-    ESP_LOGI(TAG, "WiFi AP initialized. SSID: %s, Password: %s", ssid_buf, wifi_config.ap.password);
-    
-    return ESP_OK;
+    return start_wifi_ap_provisioning();
 }

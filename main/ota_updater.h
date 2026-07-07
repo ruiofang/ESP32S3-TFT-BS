@@ -13,6 +13,7 @@ esp_err_t   ota_updater_init(void);
 esp_err_t   ota_updater_set_auto_enabled(bool enabled);
 bool        ota_updater_get_auto_enabled(void);
 esp_err_t   ota_updater_trigger_now(void);
+void        ota_updater_note_sta_got_ip(void);
 const char *ota_updater_last_status(void);
 const char *ota_updater_current_version(void);
 

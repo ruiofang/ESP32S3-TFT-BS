@@ -13,6 +13,7 @@ import os
 import struct
 import json
 import time
+import socket
 from functools import partial
 
 # 解决 PyQt5 在特殊路径下找不到 xcb 插件的问题
@@ -77,11 +78,69 @@ class SerialManager:
             self.ser.baudrate = baud
 
 
+class TcpManager:
+    """TCP JSON 调试连接"""
+    def __init__(self):
+        self.sock = None
+        self.host = ""
+        self.port = 8267
+
+    def open(self, host, port):
+        self.close()
+        self.host = host
+        self.port = int(port)
+        sock = socket.create_connection((self.host, self.port), timeout=3.0)
+        sock.settimeout(0.0)
+        self.sock = sock
+        return True
+
+    def close(self):
+        if self.sock:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+        self.sock = None
+
+    @property
+    def is_open(self):
+        return self.sock is not None
+
+    def write_json_line(self, text: str):
+        if not self.is_open:
+            return
+        data = (text.rstrip("\r\n") + "\n").encode("utf-8")
+        try:
+            self.sock.sendall(data)
+        except OSError:
+            self.close()
+            raise
+
+    def read_all(self) -> bytes:
+        if not self.is_open:
+            return b""
+        chunks = []
+        while True:
+            try:
+                data = self.sock.recv(4096)
+                if not data:
+                    self.close()
+                    break
+                chunks.append(data)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.close()
+                break
+        return b"".join(chunks)
+
+
 class JsonTab(QWidget):
     """JSON 命令发送面板"""
-    def __init__(self, serial_mgr, log_fn):
+    def __init__(self, serial_mgr, tcp_mgr, log_fn):
         super().__init__()
         self.serial_mgr = serial_mgr
+        self.tcp_mgr = tcp_mgr
         self.log = log_fn
         self._init_ui()
 
@@ -183,13 +242,20 @@ class JsonTab(QWidget):
         return obj
 
     def _send_json(self, obj):
-        if not self.serial_mgr.is_open:
-            self.log("[错误] 串口未打开")
-            return
         obj = self._round_floats(obj)
         text = json.dumps(obj, ensure_ascii=False)
-        self.serial_mgr.write(text.encode('utf-8'))
-        self.log(f"[TX JSON] {text}")
+        if self.tcp_mgr.is_open:
+            try:
+                self.tcp_mgr.write_json_line(text)
+                self.log(f"[TX TCP JSON] {text}")
+            except OSError as e:
+                self.log(f"[错误] TCP 发送失败: {e}")
+            return
+        if self.serial_mgr.is_open:
+            self.serial_mgr.write(text.encode('utf-8'))
+            self.log(f"[TX UART JSON] {text}")
+            return
+        self.log("[错误] TCP 未连接，串口也未打开")
 
     def _send_battery(self):
         self._send_json({
@@ -491,6 +557,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ESP32S3-TFT-BS 调试工具")
         self.resize(900, 650)
         self.serial_mgr = SerialManager()
+        self.tcp_mgr = TcpManager()
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -525,11 +592,38 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(ser_grp)
 
+        # TCP 配置
+        tcp_grp = QGroupBox("TCP 调试 (RGB/Web 模式 JSON, 默认端口 8267)")
+        tcp_hl = QHBoxLayout(tcp_grp)
+
+        tcp_hl.addWidget(QLabel("设备 IP:"))
+        self.tcp_host_edit = QLineEdit()
+        self.tcp_host_edit.setPlaceholderText("例如 192.168.1.123")
+        self.tcp_host_edit.setMinimumWidth(180)
+        tcp_hl.addWidget(self.tcp_host_edit)
+
+        tcp_hl.addWidget(QLabel("端口:"))
+        self.tcp_port_spin = QSpinBox()
+        self.tcp_port_spin.setRange(1, 65535)
+        self.tcp_port_spin.setValue(8267)
+        tcp_hl.addWidget(self.tcp_port_spin)
+
+        self.btn_tcp_open = QPushButton("连接 TCP")
+        self.btn_tcp_open.clicked.connect(self._toggle_tcp)
+        tcp_hl.addWidget(self.btn_tcp_open)
+
+        self.tcp_status = QLabel("● 未连接")
+        self.tcp_status.setStyleSheet("color: red; font-weight: bold;")
+        tcp_hl.addWidget(self.tcp_status)
+        tcp_hl.addStretch()
+
+        main_layout.addWidget(tcp_grp)
+
         # 功能 Tab
         splitter = QSplitter(Qt.Vertical)
 
         self.tabs = QTabWidget()
-        self.json_tab = JsonTab(self.serial_mgr, self._log)
+        self.json_tab = JsonTab(self.serial_mgr, self.tcp_mgr, self._log)
         self.rs485_1_tab = RS485_1_Tab(self.serial_mgr, self._log)
         self.rs485_2_tab = RS485_2_Tab(self.serial_mgr, self._log)
         self.tabs.addTab(self.json_tab, "JSON 模式 (115200)")
@@ -581,6 +675,30 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "串口错误", str(e))
 
+    def _toggle_tcp(self):
+        if self.tcp_mgr.is_open:
+            self.tcp_mgr.close()
+            self.btn_tcp_open.setText("连接 TCP")
+            self.tcp_status.setText("● 未连接")
+            self.tcp_status.setStyleSheet("color: red; font-weight: bold;")
+            self._log("[TCP] 已断开")
+            return
+
+        host = self.tcp_host_edit.text().strip()
+        if not host:
+            QMessageBox.warning(self, "错误", "请输入设备 IP")
+            return
+        port = self.tcp_port_spin.value()
+        try:
+            self.tcp_mgr.open(host, port)
+            self.btn_tcp_open.setText("断开 TCP")
+            self.tcp_status.setText(f"● {host}:{port}")
+            self.tcp_status.setStyleSheet("color: green; font-weight: bold;")
+            self._log(f"[TCP] 已连接 {host}:{port}")
+        except Exception as e:
+            self.tcp_mgr.close()
+            QMessageBox.critical(self, "TCP 错误", str(e))
+
     def _on_tab_changed(self, idx):
         """切换 Tab 时自动建议波特率"""
         if idx == 0:
@@ -595,18 +713,30 @@ class MainWindow(QMainWindow):
 
     def _poll_rx(self):
         data = self.serial_mgr.read_all()
-        if not data:
-            return
-        # 尝试文本显示
-        try:
-            text = data.decode('utf-8', errors='replace')
-            self._log(f"[RX] {text.strip()}")
-        except Exception:
-            self._log(f"[RX HEX] {data.hex(' ')}")
+        if data:
+            # 尝试文本显示
+            try:
+                text = data.decode('utf-8', errors='replace')
+                self._log(f"[RX UART] {text.strip()}")
+            except Exception:
+                self._log(f"[RX UART HEX] {data.hex(' ')}")
 
-        # 转发给 RS485 模拟器检查自动应答
-        self.rs485_1_tab.check_and_reply(data)
-        self.rs485_2_tab.check_and_reply(data)
+            # 转发给 RS485 模拟器检查自动应答
+            self.rs485_1_tab.check_and_reply(data)
+            self.rs485_2_tab.check_and_reply(data)
+
+        tcp_data = self.tcp_mgr.read_all()
+        if tcp_data:
+            try:
+                text = tcp_data.decode('utf-8', errors='replace').strip()
+                self._log(f"[RX TCP] {text}")
+            except Exception:
+                self._log(f"[RX TCP HEX] {tcp_data.hex(' ')}")
+        if self.btn_tcp_open.text() == "断开 TCP" and not self.tcp_mgr.is_open:
+            self.btn_tcp_open.setText("连接 TCP")
+            self.tcp_status.setText("● 未连接")
+            self.tcp_status.setStyleSheet("color: red; font-weight: bold;")
+            self._log("[TCP] 连接已关闭")
 
     def _log(self, msg):
         self.log_edit.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
@@ -615,6 +745,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.serial_mgr.close()
+        self.tcp_mgr.close()
         super().closeEvent(event)
 
 

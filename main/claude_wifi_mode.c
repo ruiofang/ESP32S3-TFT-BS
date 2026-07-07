@@ -350,7 +350,13 @@ static void wifi_event_handler(void *arg, esp_event_base_t base, int32_t id, voi
     } else if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
         ip_event_got_ip_t *e = (ip_event_got_ip_t *)data;
         snprintf(s_my_ip_str, sizeof(s_my_ip_str), IPSTR, IP2STR(&e->ip_info.ip));
-        ESP_LOGI(TAG, "STA got IP: %s", s_my_ip_str);
+        ESP_LOGI(TAG, "==================================================");
+        ESP_LOGI(TAG, "Claude WiFi connected, device IP: %s", s_my_ip_str);
+        ESP_LOGI(TAG, "Status page:  http://%s/", s_my_ip_str);
+        ESP_LOGI(TAG, "WiFi config:  http://%s/wifi", s_my_ip_str);
+        ESP_LOGI(TAG, "OTA update:   http://%s/ota", s_my_ip_str);
+        ESP_LOGI(TAG, "TCP status:   %s:%d", s_my_ip_str, CLAUDE_WIFI_TCP_PORT);
+        ESP_LOGI(TAG, "==================================================");
         s_sta_retry = 0;
         xEventGroupSetBits(s_wifi_evt, WIFI_BIT_GOT_IP | WIFI_BIT_CONNECTED);
     }
@@ -435,6 +441,13 @@ static esp_err_t start_ap_provisioning(void)
 
     strncpy(s_my_ip_str, "192.168.4.1", sizeof(s_my_ip_str));
     s_ap_mode = true;
+    ESP_LOGI(TAG, "==================================================");
+    ESP_LOGI(TAG, "Claude WiFi provisioning AP started");
+    ESP_LOGI(TAG, "AP SSID:      %s", s_dev_name);
+    ESP_LOGI(TAG, "AP Password:  %s", AP_PASSWORD);
+    ESP_LOGI(TAG, "WiFi config:  http://%s/wifi", s_my_ip_str);
+    ESP_LOGI(TAG, "Status page:  http://%s/", s_my_ip_str);
+    ESP_LOGI(TAG, "==================================================");
     return ESP_OK;
 }
 

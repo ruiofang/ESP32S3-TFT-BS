@@ -3,6 +3,15 @@
 基于ESP32-S3的TFT显示屏、WS2812 RGB灯带控制系统和电池管理系统
 
 ## 更新日志
+## test5.2 2026-07-07
+- RGB / Web 控制模式新增 **WiFi 配网**：优先连接已保存路由器 WiFi，未配置或连接失败时自动开启 `ESP32_Light_XXXX` 配网热点，访问 `http://192.168.4.1/wifi` 可扫描并保存 SSID；
+- RGB / Web 控制模式新增 **TCP JSON 调试控制**：连接到设备 IP 的 `8267` 端口后，可直接发送一行 JSON 指令控制 WS2812、电池显示、电压、充电状态等，返回成功/失败 JSON；
+- Web 控制端支持通过 `http://<设备IP>/` 打开灯光控制页面，通过 `http://<设备IP>/ota` 打开 OTA 升级页面；
+- STA 联网成功后，串口终端会打印设备 IP、Web 控制地址、WiFi 配网页、OTA 页面和 TCP 端口；无 TCP 客户端且无 UART JSON 输入时，屏幕也会显示当前 IP，方便无串口或无屏幕场景调试；
+- 更新 `tools/debug_tool.py`，增加 TCP 连接区，JSON 页会优先通过 TCP 发送，未连接 TCP 时仍可通过串口发送；
+- 修复 Web 页面下方电池配置 / 电压状态模块宽度异常问题；
+- 修复 TCP JSON 只能处理灯光命令的问题，现已支持与串口 JSON 一致的电池相关字段。
+
 ## test5.1 2026-07-07
 - 修复 Web API 回调中的任务看门狗误复位：HTTP 回调任务在未注册到 TWDT 时不再调用 `esp_task_wdt_reset()`，消除运行日志中的 `task not found` 报错；
 - 修复无信号覆盖逻辑导致的“设置模式后 RGB 不亮”：仅在无信号覆盖**实际命中电量通道**时才跳过常规渲染，避免非电量模式被错误卡黑；
@@ -91,17 +100,17 @@
 
 ### 软件功能
 - **LVGL图形界面**: 基于LVGL的用户界面
-- **WiFi热点模式**: 自动创建WiFi接入点
-- **Web控制面板**: 通过浏览器远程控制
+- **WiFi配网/热点模式**: 支持 STA 连接路由器，未配网时自动创建配网热点
+- **Web控制面板**: 通过浏览器远程控制，支持灯光、电池、WiFi 配网和 OTA 升级
 - **多通道RGB控制**: 支持4通道WS2812独立控制
 - **多种灯光效果**: 静态颜色、彩虹、呼吸、跑马灯、闪烁、波浪等
 - **电池管理系统**: 电量显示、充电状态监控、充电动画
-- **HTTP API控制**: 完整的RESTful API接口
+- **HTTP/TCP API控制**: 支持 RESTful HTTP API 和 `8267` 端口 TCP JSON 控制
 
 ### 🌟 技术亮点
 - **动态充电动画**: 进度条基于设定电量动态增长的视觉效果
 - **双模式管理**: 自动检测与手动控制的灵活切换
-- **跨平台控制**: 支持串口命令、Web界面、HTTP API多种控制方式
+- **跨平台控制**: 支持串口命令、Web界面、HTTP API、TCP JSON 多种控制方式
 - **实时状态同步**: UI界面与后端状态实时同步更新
 - **模块化设计**: 清晰的代码结构，易于扩展和维护
 
@@ -123,15 +132,19 @@ idf.py monitor
 ```
 
 ### 2. WiFi连接
-- **热点名称**: `ESP32_Light_XXXX`（`XXXX` 为本芯片 MAC 后 2 字节大写十六进制，烧录后可在串口日志 `WiFi AP initialized. SSID: ...` 中查看；同一芯片固定不变）
+- **首次配网热点**: `ESP32_Light_XXXX`（`XXXX` 为本芯片 MAC 后 2 字节大写十六进制；同一芯片固定不变）
 - **连接密码**: `12345678`
-- **网关地址**: `192.168.4.1`
+- **配网页地址**: 首次连接热点后访问 `http://192.168.4.1/wifi`，扫描并保存路由器 WiFi；设备重启后进入 STA 模式
+- **STA 控制地址**: 配网成功后访问 `http://<设备IP>/` 打开 Web 控制端，也可访问 `http://<设备IP>/wifi` 重新配网/清除凭据
+- **终端查看 IP**: STA 联网成功后，串口日志会打印 `WiFi connected, device IP: <设备IP>`，同时列出 Web、WiFi、OTA 和 TCP 调试地址
+- **屏幕查看 IP**: 在没有 TCP 客户端连接且没有 UART JSON 输入时，LCD 会显示 `IP: <设备IP>`，方便脱离串口调试
 
 ### 3. Web控制
-1. 连接到ESP32的WiFi热点
-2. 在浏览器中访问 `http://192.168.4.1`
+1. 首次使用时连接到ESP32的WiFi热点并完成配网，或在未配网时直接使用热点控制
+2. 在浏览器中访问 `http://<设备IP>/`（AP 配网态为 `http://192.168.4.1`）
 3. 使用Web界面控制RGB灯带和电池显示
-4. 支持实时查询电池状态和充电动画控制
+4. 访问 `http://<设备IP>/ota` 可进行 OTA 固件升级
+5. 支持实时查询电池状态和充电动画控制
 
 ## 🧪 功能测试
 
@@ -153,6 +166,17 @@ python test_esp32_functions.py
 - **LCD显示**: 文字显示、图形绘制、界面演示
 - **Web控制测试**: 浏览器端功能完整性测试
 - **兼容命令**: 传统格式命令支持
+
+#### 🧰 图形调试工具
+`tools/debug_tool.py` 支持串口 JSON、RS485-1 / RS485-2 模拟和 TCP JSON 调试：
+
+```bash
+python3 tools/debug_tool.py
+```
+
+- TCP 调试默认端口为 `8267`，填入设备 IP 后点击「连接 TCP」；
+- JSON 页发送命令时优先走 TCP，未连接 TCP 时走串口；
+- TCP 连接成功后日志会显示设备返回的 `ready` 信息和后续 JSON 执行结果。
 
 #### 📖 详细使用说明
 参见 [测试工具使用指南](TEST_USAGE.md)
@@ -219,6 +243,7 @@ python test_esp32_functions.py
 - **POST** `/api/control` - RGB灯带控制
 - **POST** `/api/test` - 灯光测试
 - **POST** `/api/simple` - 简单测试
+- **TCP** `<设备IP>:8267` - 发送一行 JSON 指令控制灯光 / 电池显示 / 电压状态，返回 JSON 执行结果
 
 ### 🔋 电池管理接口
 - **GET** `/api/battery/status` - 查询电池状态
@@ -253,11 +278,34 @@ python test_esp32_functions.py
 ### 电池控制参数
 ```json
 {
+  "voltage": 24.0,         // 设置电池电压显示
   "battery": 75,          // 设置电池电量百分比 (0-100)
   "charging": true,       // 设置充电状态 (true/false)
   "auto_mode": true,      // 恢复自动电池检测模式
-  "auto_charging": true   // 恢复自动充电状态检测
+  "auto_charging": true,  // 恢复自动充电状态检测
+  "battery_channel": 0    // 设置电量显示通道，0-3；也可传 255 禁用电量显示
 }
+```
+
+### TCP JSON 调试
+RGB / Web 模式下，设备会监听 TCP `8267` 端口。连接成功后设备先返回：
+
+```json
+{"status":"ready","protocol":"ws2812-json"}
+```
+
+之后每条 JSON 以换行结尾发送，支持灯光和电池控制字段：
+
+```json
+{"channel":0,"mode":1,"brightness":128,"color":{"r":255,"g":0,"b":0}}
+{"voltage":24.0,"battery":50,"charging":true}
+{"battery_channel":0}
+```
+
+返回示例：
+
+```json
+{"status":"success","message":"命令执行成功"}
 ```
 
 ### 电池状态查询响应
@@ -315,6 +363,7 @@ python test_esp32_functions.py
 │   └── Lib/                # 第三方库
 ├── components/             # ESP-IDF组件
 ├── tools/
+│   ├── debug_tool.py                  # 调试工具：串口 JSON / RS485 模拟 / TCP JSON 调试
 │   ├── claude_status_ble_bridge.py    # PC -> BLE 桥接守护脚本
 │   ├── claude_status_wifi_bridge.py   # PC -> WiFi 桥接守护脚本 (UDP 发现 + TCP 长连接)
 │   ├── claude_hook_post.py            # Claude Code 钩子助手

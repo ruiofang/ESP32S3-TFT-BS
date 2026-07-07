@@ -22,7 +22,7 @@
 - OTA 后端 API：`/api/ota/status` 查询状态与进度，`/api/ota/check_now` 触发检查，`/api/ota/confirm` 确认升级，`/api/ota/upload` 本地上传固件；
 - OTA 下载改用多步 API（`esp_https_ota_begin/perform/finish`），支持实时进度反馈（每 5% 打印日志，15 秒无进展告警）；
 - 固件版本号从 `CMakeLists.txt` 的 `PROJECT_VER` 自动读取，`tools/make_release.sh` 一键构建发布包；
-- 默认 OTA 升级地址：`http://120.27.145.121:8091/ESP32S3-TFT-BS/releases/main/latest.json`（清单）/ `http://120.27.145.121:8091/ESP32S3-TFT-BS/releases/main/panda.bin`（固件）；
+- 默认 OTA 升级地址：`http://120.27.145.121:8090/ESP32S3-TFT-BS/releases/main/latest.json`（清单）/ `http://120.27.145.121:8090/ESP32S3-TFT-BS/releases/main/panda.bin`（固件）；
 - 支持断点续传：下载中断后恢复，避免重复下载；
 - 升级完成自动重启，rollback 定时器确认镜像有效后提交；
 - 网页 OTA 页面 BODY_BUF 扩展至 6144 字节，适配完整 JS 脚本；
@@ -404,7 +404,7 @@ RGB / Web 模式下，设备会监听 TCP `8267` 端口。连接成功后设备�
 
 ### 升级地址配置
 - 网页 `/ota` 页面可修改主/备升级地址，保存到 NVS；
-- 默认主地址：`http://120.27.145.121:8091/ESP32S3-TFT-BS/releases/main/latest.json`；
+- 默认主地址：`http://120.27.145.121:8090/ESP32S3-TFT-BS/releases/main/latest.json`；
 - 默认备地址：`https://github.com/ruiofang/ESP32S3-TFT-BS/releases/download/latest/latest.json`。
 
 ## CLAUDE 状态模式 (test3+)

@@ -8,7 +8,7 @@
 # Bump the version manually in CMakeLists.txt before running this script.
 #
 # After it finishes, upload build/panda.bin + build/latest.json to the
-# release server at http://120.27.145.121:8091/ESP32S3-TFT-BS/releases/main/.
+# release server at http://120.27.145.121:8090/ESP32S3-TFT-BS/releases/main/.
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ VERSION=$(grep -oP 'set\(PROJECT_VER "\K[0-9]+\.[0-9]+\.[0-9]+' "$CMAKE")
 echo "[make_release] PROJECT_VER = $VERSION"
 
 # --- URLs ---
-RELEASE_BASE_URL="http://120.27.145.121:8091/ESP32S3-TFT-BS/releases/main"
+RELEASE_BASE_URL="http://120.27.145.121:8090/ESP32S3-TFT-BS/releases/main"
 MANIFEST_URL="$RELEASE_BASE_URL/latest.json"
 DOWNLOAD_URL="$RELEASE_BASE_URL/panda.bin"
 

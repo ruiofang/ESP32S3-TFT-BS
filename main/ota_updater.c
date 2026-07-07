@@ -66,7 +66,7 @@ typedef enum {
 
 #ifndef OTA_MANIFEST_URL
 #define OTA_MANIFEST_URL \
-    "http://120.27.145.121:8091/ESP32S3-TFT-BS/releases/main/latest.json"
+    "http://120.27.145.121:8090/ESP32S3-TFT-BS/releases/main/latest.json"
 #endif
 
 #ifndef OTA_MANIFEST_URL_BACKUP
